@@ -1,0 +1,213 @@
+package identity
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// Lease is a short-lived signed statement that the authority observed the
+// holder of an endpoint key and was itself able to operate at IssuedAt. It
+// carries no revocation information and must never be used as authority
+// health or access state beyond its Expires time.
+type Lease struct {
+	// Nonce is the client-generated nonce bound into the lease.
+	Nonce string
+	// RemoteUserID is the owner the leased endpoint belongs to.
+	RemoteUserID string
+	// DeviceID is the endpoint the lease was issued for.
+	DeviceID string
+	// CertificateHash is the unpadded base64url SHA-256 of the presented
+	// certificate, binding the lease to that exact certificate string.
+	CertificateHash string
+	// IssuedAt is when the authority issued the lease.
+	IssuedAt time.Time
+	// Expires is when the lease stops being valid.
+	Expires time.Time
+}
+
+// IssueLease signs a liveness lease for an already verified principal. The
+// lifetime is capped at MaxLeaseLifetime and at the certificate's own expiry,
+// so a lease can never outlive the identity it attests.
+func (s *Signer) IssueLease(principal Principal, certificate, nonce string, now time.Time, ttl time.Duration) (string, time.Time, error) {
+	if ttl <= 0 || ttl > MaxLeaseLifetime {
+		return "", time.Time{}, fmt.Errorf("%w: lease ttl %s must be in (0, %s]", ErrCertificateLifetime, ttl, MaxLeaseLifetime)
+	}
+	if !validNonce(nonce) {
+		return "", time.Time{}, fmt.Errorf("%w: nonce must be 16..64 base64url bytes", ErrLeaseMalformed)
+	}
+	remoteUserID := principal.RemoteUserID()
+	if principal.DeviceID == "" || principal.Subject == "" {
+		return "", time.Time{}, fmt.Errorf("%w: incomplete principal", ErrLeaseMalformed)
+	}
+	if certificate == "" || len(certificate) > maxCertificateSize {
+		return "", time.Time{}, fmt.Errorf("%w: certificate binding", ErrLeaseMalformed)
+	}
+	now = now.UTC()
+	expires := now.Add(ttl)
+	if !principal.Expires.IsZero() && principal.Expires.Before(expires) {
+		expires = principal.Expires
+	}
+	if !expires.After(now) {
+		return "", time.Time{}, fmt.Errorf("%w: certificate already expired", ErrLeaseExpired)
+	}
+	hash := sha256.Sum256([]byte(certificate))
+	header := certificateHeader{Alg: "EdDSA", Typ: "vanl+v1", Kid: s.keyID}
+	claims := leaseClaims{
+		Version:         leaseVersion,
+		Audience:        CertificateAudience,
+		RemoteUserID:    remoteUserID,
+		DeviceID:        principal.DeviceID,
+		CertificateHash: base64.RawURLEncoding.EncodeToString(hash[:]),
+		Nonce:           nonce,
+		IssuedAt:        now.Unix(),
+		ExpiresAt:       expires.Unix(),
+	}
+	token, err := signToken(LeasePrefix, s.privateKey, header, claims)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return token, expires, nil
+}
+
+type leaseClaims struct {
+	Version         int    `json:"v"`
+	Audience        string `json:"aud"`
+	RemoteUserID    string `json:"uid"`
+	DeviceID        string `json:"dev"`
+	CertificateHash string `json:"ch"`
+	Nonce           string `json:"n"`
+	IssuedAt        int64  `json:"iat"`
+	ExpiresAt       int64  `json:"exp"`
+}
+
+// VerifyLease checks the lease signature, audience, validity window and claim
+// shapes and returns the parsed lease.
+func VerifyLease(token string, trusted ed25519.PublicKey, now time.Time) (Lease, error) {
+	payload, err := verifyTokenSignature(token, LeasePrefix, trusted, maxLeaseSize)
+	if err != nil {
+		return Lease{}, mapLeaseError(err)
+	}
+	var claims leaseClaims
+	if err := json.Unmarshal(payload.Claims, &claims); err != nil {
+		return Lease{}, fmt.Errorf("%w: claims: %v", ErrLeaseMalformed, err)
+	}
+	if claims.Version != leaseVersion {
+		return Lease{}, fmt.Errorf("%w: version %d", ErrLeaseMalformed, claims.Version)
+	}
+	if claims.Audience != CertificateAudience {
+		return Lease{}, fmt.Errorf("%w: audience %q", ErrLeaseMalformed, claims.Audience)
+	}
+	if !validRemoteUserID(claims.RemoteUserID) {
+		return Lease{}, fmt.Errorf("%w: remote user id", ErrLeaseMalformed)
+	}
+	if !validDeviceID(claims.DeviceID) {
+		return Lease{}, fmt.Errorf("%w: device id", ErrLeaseMalformed)
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(claims.CertificateHash); err != nil {
+		return Lease{}, fmt.Errorf("%w: certificate hash", ErrLeaseMalformed)
+	}
+	if !validNonce(claims.Nonce) {
+		return Lease{}, fmt.Errorf("%w: nonce", ErrLeaseMalformed)
+	}
+	issuedAt := time.Unix(claims.IssuedAt, 0).UTC()
+	expires := time.Unix(claims.ExpiresAt, 0).UTC()
+	if claims.IssuedAt == 0 || claims.ExpiresAt == 0 || !expires.After(issuedAt) {
+		return Lease{}, fmt.Errorf("%w: invalid validity window", ErrLeaseMalformed)
+	}
+	if expires.Sub(issuedAt) > MaxLeaseLifetime {
+		return Lease{}, fmt.Errorf("%w: %s", ErrLeaseMalformed, expires.Sub(issuedAt))
+	}
+	if issuedAt.After(now.Add(clockSkew)) {
+		return Lease{}, fmt.Errorf("%w: issued in the future", ErrLeaseMalformed)
+	}
+	if !expires.Add(clockSkew).After(now) {
+		return Lease{}, fmt.Errorf("%w: expired at %s", ErrLeaseExpired, expires.Format(time.RFC3339))
+	}
+	return Lease{
+		Nonce:           claims.Nonce,
+		RemoteUserID:    claims.RemoteUserID,
+		DeviceID:        claims.DeviceID,
+		CertificateHash: claims.CertificateHash,
+		IssuedAt:        issuedAt,
+		Expires:         expires,
+	}, nil
+}
+
+// VerifyEndpointLease verifies a lease and every binding that ties it to a
+// specific endpoint and certificate. It returns the lease expiry. Callers must
+// also have verified certificate themselves and pass the resulting principal.
+func VerifyEndpointLease(token string, trusted ed25519.PublicKey, now time.Time, certificate string, principal Principal) (time.Time, error) {
+	if principal.Subject == "" || !validDeviceID(principal.DeviceID) {
+		return time.Time{}, fmt.Errorf("%w: incomplete principal", ErrLeaseMalformed)
+	}
+	lease, err := VerifyLease(token, trusted, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if subtle.ConstantTimeCompare([]byte(lease.RemoteUserID), []byte(principal.RemoteUserID())) != 1 {
+		return time.Time{}, fmt.Errorf("%w: remote user binding", ErrLeaseMalformed)
+	}
+	if subtle.ConstantTimeCompare([]byte(lease.DeviceID), []byte(principal.DeviceID)) != 1 {
+		return time.Time{}, fmt.Errorf("%w: device binding", ErrLeaseMalformed)
+	}
+	expectedHash := sha256.Sum256([]byte(certificate))
+	if subtle.ConstantTimeCompare([]byte(lease.CertificateHash), []byte(base64.RawURLEncoding.EncodeToString(expectedHash[:]))) != 1 {
+		return time.Time{}, fmt.Errorf("%w: certificate binding", ErrLeaseMalformed)
+	}
+	return lease.Expires, nil
+}
+
+func mapLeaseError(err error) error {
+	switch {
+	case errors.Is(err, ErrCertificateSignature):
+		return fmt.Errorf("%w: %v", ErrLeaseSignature, err)
+	case errors.Is(err, ErrCertificateMalformed):
+		return fmt.Errorf("%w: %v", ErrLeaseMalformed, err)
+	default:
+		return err
+	}
+}
+
+func validRemoteUserID(id string) bool {
+	rest, ok := cutPrefix(id, remoteUserIDPrefix)
+	if !ok || len(rest) != 26 {
+		return false
+	}
+	_, err := base32NoPad.DecodeString(toUpperASCII(rest))
+	return err == nil
+}
+
+func validNonce(nonce string) bool {
+	if len(nonce) < 22 || len(nonce) > 128 {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	if err != nil {
+		return false
+	}
+	return len(decoded) >= 16 && len(decoded) <= 64
+}
+
+// cutPrefix and toUpperASCII avoid pulling extra allocations into hot paths.
+func cutPrefix(s, prefix string) (string, bool) {
+	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
+		return s, false
+	}
+	return s[len(prefix):], true
+}
+
+func toUpperASCII(s string) string {
+	out := []byte(s)
+	for i, c := range out {
+		if c >= 'a' && c <= 'z' {
+			out[i] = c - 'a' + 'A'
+		}
+	}
+	return string(out)
+}

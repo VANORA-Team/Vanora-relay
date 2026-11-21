@@ -1,0 +1,10 @@
+/identity-signing-key
+/identity-signing-key.pub
+/.env
+/relay.exe
+/relay-identity.exe
+/relay
+/relay-identity
+/dist/
+/vanora-desktop
+/vanora-desktop.exe
