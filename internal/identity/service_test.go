@@ -995,3 +995,77 @@ func TestServiceDisableRefreshScope(t *testing.T) {
 		t.Fatalf("renewal allowed while refresh is disabled")
 	}
 }
+
+func TestServiceMultipleRedirectURIsAndLoopbackPorts(t *testing.T) {
+	env := newTestEnvironment(t, func(cfg *Config) {
+		cfg.OIDCRedirectURI = "com.vanora.app:/oauth/callback"
+		cfg.OIDCRedirectURIs = []string{
+			"http://127.0.0.1/oauth/callback",
+			"https://app.example.com/oauth/callback",
+		}
+	})
+
+	// Exact custom scheme (default when omitted).
+	status, body := env.post(t, "/v1/identity/challenges", challengeRequest{
+		Purpose:   "enroll",
+		PublicKey: base64.RawURLEncoding.EncodeToString(env.public),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("default redirect status %d: %s", status, body)
+	}
+	var ch challengeResponse
+	if err := json.Unmarshal(body, &ch); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(ch.AuthorizationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Query().Get("redirect_uri"); got != "com.vanora.app:/oauth/callback" {
+		t.Fatalf("default redirect_uri = %q", got)
+	}
+
+	// RFC 8252 ephemeral loopback port matches portless allowlist entry and exchanges code with exact URI.
+	loopbackURI := "http://127.0.0.1:45678/oauth/callback"
+	status, body = env.post(t, "/v1/identity/challenges", challengeRequest{
+		Purpose:     "enroll",
+		PublicKey:   base64.RawURLEncoding.EncodeToString(env.public),
+		RedirectURI: loopbackURI,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("loopback redirect status %d: %s", status, body)
+	}
+	var chLoop challengeResponse
+	if err := json.Unmarshal(body, &chLoop); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err = url.Parse(chLoop.AuthorizationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Query().Get("redirect_uri"); got != loopbackURI {
+		t.Fatalf("loopback redirect_uri = %q, want %q", got, loopbackURI)
+	}
+	code, _ := env.authorize(t, chLoop)
+	status, body = env.enroll(t, chLoop, code, "enroll")
+	if status != http.StatusOK {
+		t.Fatalf("enroll with loopback redirect status %d: %s", status, body)
+	}
+
+	// Reject unlisted redirect URIs or wrong loopback path.
+	for _, bad := range []string{
+		"http://127.0.0.1:45678/other",
+		"http://localhost:45678/oauth/callback",
+		"https://evil.example.com/oauth/callback",
+		"com.evil.app:/oauth/callback",
+	} {
+		status, body = env.post(t, "/v1/identity/challenges", challengeRequest{
+			Purpose:     "enroll",
+			PublicKey:   base64.RawURLEncoding.EncodeToString(env.public),
+			RedirectURI: bad,
+		})
+		if status != http.StatusBadRequest || errorCode(t, body) != "invalid_redirect_uri" {
+			t.Fatalf("redirect %q status %d: %s", bad, status, body)
+		}
+	}
+}

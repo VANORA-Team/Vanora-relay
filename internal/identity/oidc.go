@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,13 +52,14 @@ type providerMetadata struct {
 // against one configured external issuer. JOSE parsing and key handling are
 // delegated to github.com/coreos/go-oidc and github.com/go-jose/go-jose.
 type oidcProvider struct {
-	issuer       string
-	clientID     string
-	clientSecret string
-	redirectURI  string
-	scopes       []string
-	httpClient   *http.Client
-	now          func() time.Time
+	issuer             string
+	clientID           string
+	clientSecret       string
+	defaultRedirectURI string
+	allowedRedirects   []string
+	scopes             []string
+	httpClient         *http.Client
+	now                func() time.Time
 
 	mu       sync.Mutex
 	provider *oidc.Provider
@@ -79,7 +81,8 @@ func newOIDCProvider(cfg Config) (*oidcProvider, error) {
 	if cfg.OIDCClientSecret != "" && len(cfg.OIDCClientSecret) > 1024 {
 		return nil, fmt.Errorf("identity: OIDC client secret is too long")
 	}
-	if err := validateRedirectURI(cfg.OIDCRedirectURI); err != nil {
+	allowedRedirects, err := normalizeRedirectURIs(cfg.OIDCRedirectURI, cfg.OIDCRedirectURIs)
+	if err != nil {
 		return nil, fmt.Errorf("identity: OIDC redirect uri: %w", err)
 	}
 	scopes, err := normalizeScopes(cfg.OIDCScopes, !cfg.DisableRefresh)
@@ -95,14 +98,87 @@ func newOIDCProvider(cfg Config) (*oidcProvider, error) {
 		now = time.Now
 	}
 	return &oidcProvider{
-		issuer:       strings.TrimSuffix(cfg.OIDCIssuer, "/"),
-		clientID:     cfg.OIDCClientID,
-		clientSecret: cfg.OIDCClientSecret,
-		redirectURI:  cfg.OIDCRedirectURI,
-		scopes:       scopes,
-		httpClient:   httpClient,
-		now:          now,
+		issuer:             strings.TrimSuffix(cfg.OIDCIssuer, "/"),
+		clientID:           cfg.OIDCClientID,
+		clientSecret:       cfg.OIDCClientSecret,
+		defaultRedirectURI: allowedRedirects[0],
+		allowedRedirects:   allowedRedirects,
+		scopes:             scopes,
+		httpClient:         httpClient,
+		now:                now,
 	}, nil
+}
+
+func normalizeRedirectURIs(primary string, extras []string) ([]string, error) {
+	seen := make(map[string]bool, 1+len(extras))
+	out := make([]string, 0, 1+len(extras))
+	add := func(raw string) error {
+		if err := validateRedirectURI(raw); err != nil {
+			return err
+		}
+		if !seen[raw] {
+			seen[raw] = true
+			out = append(out, raw)
+		}
+		return nil
+	}
+	if primary != "" {
+		if err := add(primary); err != nil {
+			return nil, err
+		}
+	}
+	for _, uri := range extras {
+		if uri == "" {
+			continue
+		}
+		if err := add(uri); err != nil {
+			return nil, err
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("must be 1..2048 characters")
+	}
+	return out, nil
+}
+
+func (p *oidcProvider) resolveRedirectURI(requested string) (string, error) {
+	if requested == "" {
+		return p.defaultRedirectURI, nil
+	}
+	if err := validateRedirectURI(requested); err != nil {
+		return "", err
+	}
+	for _, allowed := range p.allowedRedirects {
+		if matchesRedirectURI(allowed, requested) {
+			return requested, nil
+		}
+	}
+	return "", fmt.Errorf("redirect uri is not in allowlist")
+}
+
+// matchesRedirectURI checks exact equality or RFC 8252 Section 7.3 dynamic
+// loopback port matching when the allowlist entry omits the port on an http
+// loopback URI (for example http://127.0.0.1/oauth/callback).
+func matchesRedirectURI(allowed, requested string) bool {
+	if allowed == requested {
+		return true
+	}
+	ap, errA := url.Parse(allowed)
+	rp, errR := url.Parse(requested)
+	if errA != nil || errR != nil {
+		return false
+	}
+	if ap.Scheme != "http" || rp.Scheme != "http" || ap.Port() != "" {
+		return false
+	}
+	if !isLoopbackHost(ap.Hostname()) || !strings.EqualFold(ap.Hostname(), rp.Hostname()) {
+		return false
+	}
+	if ap.Path != rp.Path || ap.RawQuery != "" || rp.RawQuery != "" {
+		return false
+	}
+	port, err := strconv.Atoi(rp.Port())
+	return err == nil && port >= 1 && port <= 65535
 }
 
 // load returns a discovered provider whose metadata is at most discoveryTTL
@@ -203,10 +279,14 @@ func (p *oidcProvider) authorizationURL(metadata providerMetadata, ch *challenge
 		// validateProviderMetadata guarantees this cannot happen.
 		return ""
 	}
+	redirectURI := ch.redirectURI
+	if redirectURI == "" {
+		redirectURI = p.defaultRedirectURI
+	}
 	query := parsed.Query()
 	query.Set("response_type", "code")
 	query.Set("client_id", p.clientID)
-	query.Set("redirect_uri", p.redirectURI)
+	query.Set("redirect_uri", redirectURI)
 	query.Set("scope", strings.Join(p.scopes, " "))
 	query.Set("state", ch.state)
 	query.Set("nonce", ch.nonce)
@@ -225,11 +305,14 @@ type tokenResult struct {
 // exchangeCode redeems an authorization code with the verifier the authority
 // generated for the challenge. The code is never accepted from a client
 // without the matching verifier.
-func (p *oidcProvider) exchangeCode(ctx context.Context, tokenEndpoint, code, codeVerifier string) (tokenResult, error) {
+func (p *oidcProvider) exchangeCode(ctx context.Context, tokenEndpoint, code, codeVerifier, redirectURI string) (tokenResult, error) {
+	if redirectURI == "" {
+		redirectURI = p.defaultRedirectURI
+	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
-	form.Set("redirect_uri", p.redirectURI)
+	form.Set("redirect_uri", redirectURI)
 	form.Set("client_id", p.clientID)
 	form.Set("code_verifier", codeVerifier)
 	return p.tokenRequest(ctx, tokenEndpoint, form)

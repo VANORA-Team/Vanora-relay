@@ -34,6 +34,9 @@ type Client struct {
 	socket        *transport.Client
 	peer          transport.Peer
 	device, owner string
+	connState     string
+	connPath      string
+	connErr       string
 	pending       map[string]chan reply
 	subscriptions map[string]*cursor
 	events        []event
@@ -71,15 +74,113 @@ func NewClient(identityURL, signalURL, publicKeyHex string, store Store) (*Clien
 
 func newClient(signalURL string, source transport.IdentitySource) *Client {
 	ctx, stop := context.WithCancel(context.Background())
-	c := &Client{url: signalURL, source: source, ctx: ctx, stop: stop, pending: make(map[string]chan reply), subscriptions: make(map[string]*cursor), ready: make(chan struct{}, 1), retry: make(chan struct{}, 1)}
+	c := &Client{
+		url:           signalURL,
+		source:        source,
+		ctx:           ctx,
+		stop:          stop,
+		connState:     "disconnected",
+		pending:       make(map[string]chan reply),
+		subscriptions: make(map[string]*cursor),
+		ready:         make(chan struct{}, 1),
+		retry:         make(chan struct{}, 1),
+	}
 	go c.recoverConnection()
 	return c
 }
 
-func (c *Client) BeginLogin() (string, error)          { return c.identity.Begin(c.ctx) }
+func (c *Client) BeginLogin() (string, error) { return c.identity.Begin(c.ctx) }
+
+// BeginLoginWithRedirect starts browser enrollment with an explicit allowlisted
+// callback URI (such as a custom app scheme or universal link).
+func (c *Client) BeginLoginWithRedirect(redirectURI string) (string, error) {
+	return c.identity.BeginWithRedirect(c.ctx, redirectURI)
+}
+
 func (c *Client) FinishLogin(code, state string) error { return c.identity.Finish(c.ctx, code, state) }
-func (c *Client) UserID() string                       { return c.identity.UserID() }
-func (c *Client) DeviceID() string                     { return c.identity.DeviceID() }
+func (c *Client) UserID() string {
+	if c.identity == nil {
+		return ""
+	}
+	return c.identity.UserID()
+}
+func (c *Client) DeviceID() string {
+	if c.identity == nil {
+		return ""
+	}
+	return c.identity.DeviceID()
+}
+
+// Reset disconnects from any desktop and clears the locally enrolled account,
+// replacing the endpoint key so the user can sign into a different account.
+func (c *Client) Reset() error {
+	c.Disconnect()
+	if c.identity == nil {
+		return errors.New("no account configured")
+	}
+	return c.identity.Reset()
+}
+
+// ConnectionState returns a JSON snapshot of the client's current connection
+// state, active WebRTC transport path ("direct", "relay", or "unknown"), and
+// enrolled identity identifiers.
+func (c *Client) ConnectionState() string {
+	c.mu.Lock()
+	state := c.connState
+	path := c.connPath
+	errMsg := c.connErr
+	device := c.device
+	owner := c.owner
+	p := c.peer
+	c.mu.Unlock()
+	if state == "connected" && p != nil {
+		if live := peerPath(p); live != "" {
+			path = live
+		}
+	}
+	b, _ := json.Marshal(map[string]string{
+		"state":          state,
+		"device_id":      device,
+		"owner":          owner,
+		"path":           path,
+		"error":          errMsg,
+		"user_id":        c.UserID(),
+		"self_device_id": c.DeviceID(),
+	})
+	return string(b)
+}
+
+// Reconnect drops the current transport link while preserving the selected
+// desktop and active session cursors, then immediately dials again. Call this
+// when the device switches networks (e.g. Wi-Fi <-> cellular) or returns to the
+// foreground.
+func (c *Client) Reconnect() error {
+	c.op.Lock()
+	defer c.op.Unlock()
+	c.mu.Lock()
+	if c.device == "" {
+		c.mu.Unlock()
+		return errors.New("no desktop selected")
+	}
+	oldPeer := c.peer
+	c.detachLocked()
+	c.setStateLocked("reconnecting", "", "")
+	c.mu.Unlock()
+	if oldPeer != nil {
+		oldPeer.Close()
+	}
+	if c.socket != nil {
+		c.socket.Close()
+		c.socket = nil
+	}
+	err := c.connectLocked()
+	if err != nil {
+		if !c.handleAuthError(err) {
+			signal(c.retry)
+		}
+	}
+	return err
+}
 
 func (c *Client) dial() (*transport.Client, error) {
 	if err := c.ctx.Err(); err != nil {
@@ -156,9 +257,14 @@ func (c *Client) Connect(deviceID, ownerID string) error {
 	if old != nil {
 		old.Close()
 	}
+	c.mu.Lock()
+	c.setStateLocked("connecting", "", "")
+	c.mu.Unlock()
 	err := c.connectLocked()
 	if err != nil {
-		signal(c.retry)
+		if !c.handleAuthError(err) {
+			signal(c.retry)
+		}
 	}
 	return err
 }
@@ -172,21 +278,29 @@ func (c *Client) connectLocked() error {
 	}
 	s, err := c.dial()
 	if err != nil {
+		c.mu.Lock()
+		c.setStateLocked("reconnecting", "", err.Error())
+		c.mu.Unlock()
 		return err
 	}
 	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
 	defer stop()
 	p, err := s.Connect(ctx, d, o)
 	if err != nil {
+		c.mu.Lock()
+		c.setStateLocked("reconnecting", "", err.Error())
+		c.mu.Unlock()
 		return err
 	}
 	c.mu.Lock()
 	if !p.Allows(true) {
+		c.setStateLocked("reconnecting", "", "desktop authorization expired")
 		c.mu.Unlock()
 		p.Close()
 		return errors.New("desktop authorization expired")
 	}
 	c.peer = p
+	c.setStateLocked("connected", peerPath(p), "")
 	resume := make(map[string]int64, len(c.subscriptions))
 	for id, cur := range c.subscriptions {
 		resume[id] = cur.applied
@@ -232,7 +346,7 @@ func (c *Client) recoverConnection() {
 				err = c.connectLocked()
 			}
 			c.op.Unlock()
-			if err == nil {
+			if err == nil || c.handleAuthError(err) {
 				break
 			}
 		}
@@ -249,6 +363,7 @@ func (c *Client) disconnect() {
 	c.detachLocked()
 	clear(c.subscriptions)
 	c.events = nil
+	c.setStateLocked("disconnected", "", "")
 	c.mu.Unlock()
 	if p != nil {
 		p.Close()
@@ -266,11 +381,65 @@ func (c *Client) detachLocked() {
 		ch <- reply{err: errors.New("connection lost")}
 		delete(c.pending, id)
 	}
-	c.events = nil
+	c.events = slices.DeleteFunc(c.events, func(e event) bool { return e.session != "" })
 	for _, cur := range c.subscriptions {
 		cur.queued = cur.applied
 		cur.delivered = cur.applied
 	}
+}
+
+func (c *Client) setStateLocked(state, path, errMsg string) {
+	if c.connState == state && c.connPath == path && c.connErr == errMsg {
+		return
+	}
+	c.connState = state
+	c.connPath = path
+	c.connErr = errMsg
+	if len(c.events) >= 256 {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"type":      "connection.state",
+		"state":     state,
+		"device_id": c.device,
+		"owner":     c.owner,
+		"path":      path,
+		"error":     errMsg,
+	})
+	c.enqueueLocked(event{payload: string(payload)})
+}
+
+func (c *Client) handleAuthError(err error) bool {
+	if !isLoginRequiredError(err) {
+		return false
+	}
+	c.mu.Lock()
+	c.setStateLocked("disconnected", "", err.Error())
+	if len(c.events) < 256 {
+		payload, _ := json.Marshal(map[string]string{
+			"type":  "auth.state",
+			"state": "login_required",
+			"error": err.Error(),
+		})
+		c.enqueueLocked(event{payload: string(payload)})
+	}
+	c.mu.Unlock()
+	return true
+}
+
+func isLoginRequiredError(err error) bool {
+	return errors.Is(err, account.ErrNotEnrolled) ||
+		errors.Is(err, account.ErrExpired) ||
+		errors.Is(err, account.ErrCredential) ||
+		errors.Is(err, account.ErrStateInvalid) ||
+		errors.Is(err, account.ErrAuthorityChanged)
+}
+
+func peerPath(p transport.Peer) string {
+	if pr, ok := p.(transport.PathReporter); ok {
+		return pr.Path()
+	}
+	return "unknown"
 }
 
 func signal(ch chan struct{}) {
@@ -295,7 +464,12 @@ func (h *handler) Closed(p transport.Peer) {
 	defer c.mu.Unlock()
 	if c.peer == p {
 		c.detachLocked()
-		signal(c.retry)
+		if c.device != "" {
+			c.setStateLocked("reconnecting", "", "connection lost")
+			signal(c.retry)
+		} else {
+			c.setStateLocked("disconnected", "", "")
+		}
 	}
 }
 func (h *handler) Message(p transport.Peer, b []byte) {

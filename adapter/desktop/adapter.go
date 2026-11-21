@@ -3,6 +3,7 @@ package desktop
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,9 @@ import (
 
 	"vanora-relay/adapter/transport"
 )
+
+//go:embed guard/approval-guard.mjs
+var embeddedApprovalGuard []byte
 
 const (
 	peerQueueSize      = 1024
@@ -54,6 +59,7 @@ type Adapter struct {
 	now             func() time.Time
 	buildCommand    func(*normalizedSession) (*exec.Cmd, error)
 	logger          *slog.Logger
+	observer        func(map[string]any)
 	maxRequestBytes int
 }
 
@@ -83,10 +89,31 @@ type delivery struct {
 	data           []byte
 	requiresOnline bool
 	sessionID      string
+	visibility     string
+	approvalUser   string
+	seq            int64
 	// listRequestID, when set, means the session list must be rebuilt under
 	// the current ACL at delivery time. This prevents a list snapshot queued
 	// before ReloadACL from disclosing sessions the user can no longer read.
 	listRequestID string
+}
+
+// SetObserver installs an optional callback for host lifecycle notifications
+// (such as sidecar JSONL events). The callback is invoked without holding
+// Adapter.mu.
+func (a *Adapter) SetObserver(fn func(map[string]any)) {
+	a.mu.Lock()
+	a.observer = fn
+	a.mu.Unlock()
+}
+
+func (a *Adapter) emitObserve(ev map[string]any) {
+	a.mu.Lock()
+	fn := a.observer
+	a.mu.Unlock()
+	if fn != nil {
+		fn(ev)
+	}
 }
 
 type sessionRuntime struct {
@@ -169,6 +196,39 @@ func New(cfg *Config, statePath string) (*Adapter, error) {
 			runs:     make(map[string]*run),
 		}
 	}
+	for id, rec := range st.CreatedSessions {
+		if _, exists := a.sessions[id]; exists {
+			continue
+		}
+		w := nc.workspacesByID[rec.WorkspaceID]
+		if w == nil || rec.Owner != w.owner {
+			continue
+		}
+		sessionFile, err := resolveSessionFile(rec.SessionFile, w.workDir)
+		if err != nil {
+			continue
+		}
+		messages, stamp, err := loadSessionMessages(sessionFile)
+		if err != nil {
+			continue
+		}
+		ps := st.Sessions[id]
+		if ps == nil {
+			ps = newPersistedSession()
+			st.Sessions[id] = ps
+		}
+		if err := ps.validateAndNormalize(); err != nil {
+			return nil, err
+		}
+		a.sessions[id] = &sessionRuntime{
+			cfg:      sessionFromWorkspace(w, rec, sessionFile),
+			ps:       ps,
+			messages: messages,
+			stamp:    stamp,
+			loaded:   true,
+			runs:     make(map[string]*run),
+		}
+	}
 	a.recoverRunRecordsLocked()
 	if err := a.saveLocked(); err != nil {
 		return nil, err
@@ -178,8 +238,71 @@ func New(cfg *Config, statePath string) (*Adapter, error) {
 	return a, nil
 }
 
+func sessionFromWorkspace(w *normalizedWorkspace, rec createdSessionRecord, sessionFile string) *normalizedSession {
+	grants := make(map[string]Grant, len(w.grants))
+	for k, v := range w.grants {
+		grants[k] = v
+	}
+	title := rec.Title
+	if title == "" {
+		title = rec.ID
+	}
+	return &normalizedSession{
+		id:             rec.ID,
+		workspaceID:    w.id,
+		title:          title,
+		workDir:        w.workDir,
+		sessionFile:    sessionFile,
+		owner:          w.owner,
+		tools:          slices.Clone(w.tools),
+		arguments:      slices.Clone(w.arguments),
+		showThinking:   w.showThinking,
+		showTools:      w.showTools,
+		approvalPolicy: w.approvalPolicy,
+		grants:         grants,
+	}
+}
+
+func (a *Adapter) ensureApprovalExtension() (string, error) {
+	if a.cfg.approvalExtension != "" {
+		return a.cfg.approvalExtension, nil
+	}
+	if a.stateDir == "" {
+		return "", nil
+	}
+	target := filepath.Join(a.stateDir, "approval-guard.mjs")
+	if existing, err := os.ReadFile(target); err == nil && string(existing) == string(embeddedApprovalGuard) {
+		return target, nil
+	}
+	tmp, err := os.CreateTemp(a.stateDir, ".approval-guard-*.mjs")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.Write(embeddedApprovalGuard); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
 func (a *Adapter) defaultCommand(s *normalizedSession) (*exec.Cmd, error) {
-	args := make([]string, 0, len(a.cfg.launcherArgs)+len(a.cfg.arguments)+len(s.arguments)+12)
+	args := make([]string, 0, len(a.cfg.launcherArgs)+len(a.cfg.arguments)+len(s.arguments)+14)
 	args = append(args, a.cfg.launcherArgs...)
 	args = append(args, a.cfg.arguments...)
 	args = append(args, s.arguments...)
@@ -192,8 +315,17 @@ func (a *Adapter) defaultCommand(s *normalizedSession) (*exec.Cmd, error) {
 		// disabled so they cannot reintroduce tools or interactive work.
 		args = append(args, "--no-tools")
 	}
+	args = append(args, "--no-extensions")
+	if s.remoteApproval() && len(s.tools) > 0 {
+		guardPath, err := a.ensureApprovalExtension()
+		if err != nil {
+			return nil, err
+		}
+		if guardPath != "" {
+			args = append(args, "-e", guardPath)
+		}
+	}
 	args = append(args,
-		"--no-extensions",
 		"--no-mcp",
 		"--no-skills",
 		"--no-prompt-templates",
@@ -229,6 +361,7 @@ func (a *Adapter) Open(peer transport.Peer) {
 	a.peers[peer] = ps
 	a.wg.Add(1)
 	a.mu.Unlock()
+	a.emitObserve(map[string]any{"type": "peer.connected", "user_id": peer.UserID()})
 	go a.peerWriter(ps)
 }
 
@@ -252,6 +385,7 @@ func (a *Adapter) Closed(peer transport.Peer) {
 	a.mu.Unlock()
 	if ps != nil {
 		ps.close()
+		a.emitObserve(map[string]any{"type": "peer.disconnected", "user_id": peer.UserID()})
 	}
 }
 
@@ -286,18 +420,42 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 		a.mu.Unlock()
 		return
 	}
+	payload := d.data
 	if d.sessionID != "" {
 		sr := a.sessions[d.sessionID]
-		if sr == nil || !sr.cfg.canRead(ps.peer.UserID()) {
+		user := ps.peer.UserID()
+		if sr == nil || !sr.cfg.canRead(user) {
 			a.mu.Unlock()
 			return
+		}
+		if d.visibility != "" {
+			allowed := sr.cfg.canSeeEvent(user, d.visibility)
+			if allowed && d.visibility == visApproval && d.approvalUser != "" && user != sr.cfg.owner && user != d.approvalUser {
+				allowed = false
+			}
+			if !allowed {
+				if d.seq <= 0 {
+					a.mu.Unlock()
+					return
+				}
+				syncWire, err := json.Marshal(wireEvent{
+					Type:      "event",
+					SessionID: d.sessionID,
+					Seq:       d.seq,
+					Kind:      kindSync,
+				})
+				if err != nil {
+					a.mu.Unlock()
+					return
+				}
+				payload = syncWire
+			}
 		}
 	}
 	if d.requiresOnline && !a.effectiveOnlineLocked() {
 		a.mu.Unlock()
 		return
 	}
-	payload := d.data
 	if d.listRequestID != "" {
 		wire, err := json.Marshal(resultEnvelope{
 			Type:      "result",
@@ -391,6 +549,7 @@ func (a *Adapter) Close() error {
 		if r.stopReason == "" {
 			r.stopReason = "shutdown"
 		}
+		_ = a.cancelRunPendingUILocked(r, "cancelled")
 	}
 	firstErr := a.saveLocked()
 	a.mu.Unlock()
@@ -440,7 +599,49 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		a.mu.Unlock()
 		return errClosed
 	}
+	// Snapshot dynamically created sessions for reloading against updated workspaces.
+	createdRecords := make([]createdSessionRecord, 0, len(a.state.CreatedSessions))
+	for _, rec := range a.state.CreatedSessions {
+		createdRecords = append(createdRecords, rec)
+	}
+	a.mu.Unlock()
+
+	type preloadedCreated struct {
+		cfg      *normalizedSession
+		messages []Message
+		stamp    fileStamp
+	}
+	createdPreload := make(map[string]preloadedCreated)
+	for _, rec := range createdRecords {
+		if _, shadowed := nc.byID[rec.ID]; shadowed {
+			continue
+		}
+		w := nc.workspacesByID[rec.WorkspaceID]
+		if w == nil || rec.Owner != w.owner {
+			continue
+		}
+		sessionFile, err := resolveSessionFile(rec.SessionFile, w.workDir)
+		if err != nil {
+			continue
+		}
+		messages, stamp, err := loadSessionMessages(sessionFile)
+		if err != nil {
+			continue
+		}
+		createdPreload[rec.ID] = preloadedCreated{
+			cfg:      sessionFromWorkspace(w, rec, sessionFile),
+			messages: messages,
+			stamp:    stamp,
+		}
+	}
+
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return errClosed
+	}
 	var stops []*run
+	var uiCancels []uiCancelAction
 	stopRun := func(r *run, reason string) {
 		if r.terminal || r.status == statusCancelling {
 			return
@@ -448,11 +649,11 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		r.status = statusCancelling
 		r.stopReason = reason
 		r.stopFlag.Store(true)
+		uiCancels = append(uiCancels, a.cancelRunPendingUILocked(r, "cancelled")...)
 		stops = append(stops, r)
 	}
-	next := make(map[string]*sessionRuntime, len(nc.sessions))
-	for _, s := range nc.sessions {
-		data := preload[s.id]
+	next := make(map[string]*sessionRuntime, len(nc.sessions)+len(createdPreload))
+	attachSession := func(s *normalizedSession, data loadedSession) error {
 		sr := a.sessions[s.id]
 		if sr == nil {
 			ps := a.state.Sessions[s.id]
@@ -461,7 +662,6 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 				a.state.Sessions[s.id] = ps
 			}
 			if err := ps.validateAndNormalize(); err != nil {
-				a.mu.Unlock()
 				return err
 			}
 			sr = &sessionRuntime{cfg: s, ps: ps, runs: make(map[string]*run)}
@@ -478,11 +678,25 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 			sr.stamp = data.stamp
 			sr.loaded = true
 		} else {
-			// A cancelled process still owns the old file for a moment. Force a
-			// fresh parse after it exits instead of showing mixed snapshots.
 			sr.loaded = false
 		}
 		next[s.id] = sr
+		return nil
+	}
+	for _, s := range nc.sessions {
+		if err := attachSession(s, preload[s.id]); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+	}
+	for id, pc := range createdPreload {
+		if _, shadowed := next[id]; shadowed {
+			continue
+		}
+		if err := attachSession(pc.cfg, loadedSession{messages: pc.messages, stamp: pc.stamp}); err != nil {
+			a.mu.Unlock()
+			return err
+		}
 	}
 	for id, sr := range a.sessions {
 		if _, keep := next[id]; keep {
@@ -512,14 +726,22 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 				delete(ps.subscriptions, id)
 			}
 		}
-		anyReadable := false
-		for _, s := range nc.sessions {
-			if s.canRead(user) {
-				anyReadable = true
+		anyVisible := false
+		for _, sr := range next {
+			if sr.cfg.canRead(user) {
+				anyVisible = true
 				break
 			}
 		}
-		if !anyReadable || ps.pendingLists.Load() > 0 {
+		if !anyVisible {
+			for _, w := range nc.workspaces {
+				if w.owner == user {
+					anyVisible = true
+					break
+				}
+			}
+		}
+		if !anyVisible || ps.pendingLists.Load() > 0 {
 			// Invalidate queued work before the new ACL is published. The
 			// peer is closed after the lock is released; Deliveries check
 			// aclStale while holding the lock and drop stale list replies.
@@ -532,6 +754,7 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	a.maxRequestBytes = max(64<<10, nc.maxText+16<<10)
 	a.mu.Unlock()
 
+	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
 	}
@@ -547,6 +770,7 @@ func sameExecution(a, b *normalizedSession) bool {
 	}
 	return a.workDir == b.workDir &&
 		a.sessionFile == b.sessionFile &&
+		a.approvalPolicy == b.approvalPolicy &&
 		slices.Equal(a.tools, b.tools) &&
 		slices.Equal(a.arguments, b.arguments)
 }
@@ -567,8 +791,9 @@ func (a *Adapter) AuthorityLost() {
 		a.authorityTimer.Stop()
 		a.authorityTimer = nil
 	}
-	stops := a.stopAllRunsLocked("authority_lost")
+	stops, uiCancels := a.stopAllRunsLocked("authority_lost")
 	a.mu.Unlock()
+	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
 	}
@@ -634,8 +859,9 @@ func (a *Adapter) AuthorityUntil(until time.Time) {
 	now := a.now()
 	if until.IsZero() || !now.Before(until) {
 		a.authorityOnline = false
-		stops := a.stopAllRunsLocked("authority_lost")
+		stops, uiCancels := a.stopAllRunsLocked("authority_lost")
 		a.mu.Unlock()
+		flushUICancels(uiCancels)
 		for _, r := range stops {
 			r.stop(0)
 		}
@@ -659,8 +885,9 @@ func (a *Adapter) expireAuthority(gen uint64, until time.Time) {
 		return
 	}
 	a.authorityOnline = false
-	stops := a.stopAllRunsLocked("authority_lost")
+	stops, uiCancels := a.stopAllRunsLocked("authority_lost")
 	a.mu.Unlock()
+	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
 	}
@@ -687,6 +914,7 @@ func (a *Adapter) checkRuns() {
 		return
 	}
 	var stops []*run
+	var uiCancels []uiCancelAction
 	now := a.now()
 	online := a.effectiveOnlineLocked()
 	for _, r := range a.runs {
@@ -711,16 +939,19 @@ func (a *Adapter) checkRuns() {
 		r.status = statusCancelling
 		r.stopReason = reason
 		r.stopFlag.Store(true)
+		uiCancels = append(uiCancels, a.cancelRunPendingUILocked(r, "cancelled")...)
 		stops = append(stops, r)
 	}
 	a.mu.Unlock()
+	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
 	}
 }
 
-func (a *Adapter) stopAllRunsLocked(reason string) []*run {
+func (a *Adapter) stopAllRunsLocked(reason string) ([]*run, []uiCancelAction) {
 	var stops []*run
+	var uiCancels []uiCancelAction
 	for _, r := range a.runs {
 		if r.terminal || r.status == statusCancelling {
 			continue
@@ -728,9 +959,10 @@ func (a *Adapter) stopAllRunsLocked(reason string) []*run {
 		r.status = statusCancelling
 		r.stopReason = reason
 		r.stopFlag.Store(true)
+		uiCancels = append(uiCancels, a.cancelRunPendingUILocked(r, "cancelled")...)
 		stops = append(stops, r)
 	}
-	return stops
+	return stops, uiCancels
 }
 
 func (a *Adapter) effectiveOnlineLocked() bool {
@@ -770,6 +1002,10 @@ func (a *Adapter) saveLocked() error {
 }
 
 func (a *Adapter) appendEventLocked(sr *sessionRuntime, runID, kind string, data any, requiresOnline bool) *storedEvent {
+	return a.appendEventVisibleLocked(sr, runID, kind, data, requiresOnline, visAll, "")
+}
+
+func (a *Adapter) appendEventVisibleLocked(sr *sessionRuntime, runID, kind string, data any, requiresOnline bool, visibility, approvalUser string) *storedEvent {
 	var raw json.RawMessage
 	if data != nil {
 		encoded, err := json.Marshal(data)
@@ -785,6 +1021,7 @@ func (a *Adapter) appendEventLocked(sr *sessionRuntime, runID, kind string, data
 		Kind:           kind,
 		Data:           raw,
 		RequiresOnline: requiresOnline,
+		Visibility:     visibility,
 	}
 	sr.ps.appendEvent(e)
 	sr.ps.trim(a.cfg.retention)
@@ -808,10 +1045,43 @@ func (a *Adapter) appendEventLocked(sr *sessionRuntime, runID, kind string, data
 		if _, subscribed := ps.subscriptions[sr.cfg.id]; !subscribed {
 			continue
 		}
-		a.enqueueLocked(ps, delivery{data: wire, requiresOnline: requiresOnline, sessionID: sr.cfg.id})
+		a.enqueueLocked(ps, delivery{
+			data:           wire,
+			requiresOnline: requiresOnline,
+			sessionID:      sr.cfg.id,
+			visibility:     visibility,
+			approvalUser:   approvalUser,
+			seq:            e.Seq,
+		})
 	}
 	a.markDirtyLocked()
 	return &e
+}
+
+func (a *Adapter) orderedSessionsLocked() []*sessionRuntime {
+	seen := make(map[string]bool, len(a.sessions))
+	out := make([]*sessionRuntime, 0, len(a.sessions))
+	for _, s := range a.cfg.sessions {
+		if sr := a.sessions[s.id]; sr != nil {
+			out = append(out, sr)
+			seen[s.id] = true
+		}
+	}
+	var extras []*sessionRuntime
+	for id, sr := range a.sessions {
+		if !seen[id] {
+			extras = append(extras, sr)
+		}
+	}
+	sort.Slice(extras, func(i, j int) bool {
+		ci := a.state.CreatedSessions[extras[i].cfg.id].Created
+		cj := a.state.CreatedSessions[extras[j].cfg.id].Created
+		if ci == cj {
+			return extras[i].cfg.id < extras[j].cfg.id
+		}
+		return ci < cj
+	})
+	return append(out, extras...)
 }
 
 func (sr *sessionRuntime) syncLocked(a *Adapter) {

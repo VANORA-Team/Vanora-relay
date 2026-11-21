@@ -956,3 +956,32 @@ func (p *peer) Send(data []byte, requiresOnline bool) error {
 }
 
 func (p *peer) Close() { p.link.close(ErrPeerClosed, true) }
+
+// Path reports whether the active WebRTC connection uses a direct path or TURN relay.
+func (p *peer) Path() string {
+	pc := p.link.connection()
+	if pc == nil {
+		return "unknown"
+	}
+	sctp := pc.SCTP()
+	if sctp == nil {
+		return "unknown"
+	}
+	dtls := sctp.Transport()
+	if dtls == nil {
+		return "unknown"
+	}
+	iceTransport := dtls.ICETransport()
+	if iceTransport == nil {
+		return "unknown"
+	}
+	pair, err := iceTransport.GetSelectedCandidatePair()
+	if err != nil || pair == nil {
+		return "unknown"
+	}
+	if (pair.Local != nil && pair.Local.Typ == webrtc.ICECandidateTypeRelay) ||
+		(pair.Remote != nil && pair.Remote.Typ == webrtc.ICECandidateTypeRelay) {
+		return "relay"
+	}
+	return "direct"
+}

@@ -25,6 +25,7 @@ type challenge struct {
 	state        string
 	codeVerifier string
 	purpose      string
+	redirectURI  string
 	publicKey    ed25519.PublicKey
 	expires      time.Time
 }

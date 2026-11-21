@@ -271,13 +271,20 @@ func (a *Account) Reset() error {
 	return nil
 }
 
-// Begin requests a fresh enrollment challenge and returns the authorization
-// URL to open in the system browser. The endpoint key is created and persisted
-// on the first call, so an interrupted sign-in reuses the same device identity
-// next time. Begin is also used to reauthenticate an existing account, for
-// example after its certificate expired or its renewal handle was revoked; the
-// verified identity must still match the stored account.
+// Begin requests a fresh enrollment challenge using the authority's default
+// redirect URI and returns the authorization URL to open in the system browser.
 func (a *Account) Begin(ctx context.Context) (string, error) {
+	return a.BeginWithRedirect(ctx, "")
+}
+
+// BeginWithRedirect requests a fresh enrollment challenge using the supplied
+// redirect URI (or the authority's default when empty). The endpoint key is
+// created and persisted on the first call, so an interrupted sign-in reuses
+// the same device identity next time. BeginWithRedirect is also used to
+// reauthenticate an existing account, for example after its certificate expired
+// or its renewal handle was revoked; the verified identity must still match
+// the stored account.
+func (a *Account) BeginWithRedirect(ctx context.Context, redirectURI string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -295,7 +302,11 @@ func (a *Account) Begin(ctx context.Context) (string, error) {
 
 	publicKey := base64.RawURLEncoding.EncodeToString(a.key.Public().(ed25519.PublicKey))
 	var resp challengeResponse
-	if err := a.post(ctx, challengePath, challengeRequest{Purpose: "enroll", PublicKey: publicKey}, &resp); err != nil {
+	if err := a.post(ctx, challengePath, challengeRequest{
+		Purpose:     "enroll",
+		PublicKey:   publicKey,
+		RedirectURI: strings.TrimSpace(redirectURI),
+	}, &resp); err != nil {
 		return "", err
 	}
 	now := a.now()
@@ -311,6 +322,12 @@ func (a *Account) Begin(ctx context.Context) (string, error) {
 	}
 	if err := checkAuthorizationURL(resp.AuthorizationURL); err != nil {
 		return "", err
+	}
+	if wantRedirect := strings.TrimSpace(redirectURI); wantRedirect != "" {
+		parsed, err := url.Parse(resp.AuthorizationURL)
+		if err != nil || parsed.Query().Get("redirect_uri") != wantRedirect {
+			return "", fmt.Errorf("%w: authority returned an unexpected redirect URI", ErrCredential)
+		}
 	}
 	a.pending = &login{
 		challengeID: resp.ChallengeID,
@@ -796,8 +813,9 @@ func (a *Account) restore(raw string) error {
 }
 
 type challengeRequest struct {
-	Purpose   string `json:"purpose"`
-	PublicKey string `json:"public_key"`
+	Purpose     string `json:"purpose"`
+	PublicKey   string `json:"public_key"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
 }
 
 type challengeResponse struct {

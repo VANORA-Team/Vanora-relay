@@ -73,9 +73,13 @@ export VANORA_IDENTITY_SIGNING_KEY_FILE=identity-signing-key
 export VANORA_IDENTITY_OIDC_ISSUER=https://auth.example.com/realms/vanora
 export VANORA_IDENTITY_OIDC_CLIENT_ID=vanora-native
 export VANORA_IDENTITY_OIDC_REDIRECT_URI=com.vanora.app:/oauth/callback
+export VANORA_IDENTITY_OIDC_REDIRECT_URIS=http://127.0.0.1/oauth/callback
 
 go run ./cmd/relay-identity serve
 ```
+
+> [!TIP]
+> 同时配置 `VANORA_IDENTITY_OIDC_REDIRECT_URI`（手机自定义 Scheme）与 `VANORA_IDENTITY_OIDC_REDIRECT_URIS`（如 `http://127.0.0.1/oauth/callback`，不写端口即按 RFC 8252 自动匹配桌面临时回环端口），即可让手机和电脑 Sidecar 都自动完成浏览器回调登录，无需手动复制回调链接。
 
 全部环境变量（监听地址、TLS、证书 / 挑战 / 租约 TTL 等）见 [internal/identity/README.md](internal/identity/README.md)。
 
@@ -171,31 +175,47 @@ Content-Type: application/json
 go build -o vanora-desktop ./cmd/vanora-desktop
 ./vanora-desktop login \
   -identity https://identity.example.com \
-  -ca identity-signing-key.pub
+  -ca identity-signing-key.pub \
+  -redirect-uri http://127.0.0.1:0/oauth/callback
 ```
 
 - **Windows**：可将产物名设为 `vanora-desktop.exe`。
-- **登录回调**：`login` 会打开系统浏览器完成 OIDC 登录，成功后输出 `user_id` 与 `device_id`。
-  - 配置为回环 HTTP 回调时，程序自动监听并接收 `code` 和 `state`。
-  - 配置为自定义 URI Scheme 时，按终端提示粘贴完整回调地址即可。
+- **无感回调登录**：传入 `-redirect-uri http://127.0.0.1:0/oauth/callback` 会自动绑定本机临时回环端口并接收 `code` 和 `state`；配置为自定义 URI Scheme 时按提示粘贴回调地址。传 `-no-browser -json` 可交由宿主 UI 展示/打开登录链接。
+- **账号管理子命令**：支持 `whoami` / `status`（查看当前 `enrolled`、`user_id`、`device_id`）与 `logout`（安全重置本地设备密钥与绑定）。
+- **Sidecar 内嵌模式**：将 `vanora-desktop` 作为子进程嵌入 Vanora 时，可在构建期用 `-ldflags "-X main.defaultIdentityURL=... -X main.defaultSignalURL=... -X main.defaultCAHex=..."` 注入默认服务配置（运行时仍可用 `-identity` / `-signal` / `-ca` / `-ca-hex` 或环境变量覆盖）；以 `serve -sidecar` 启动后会向 `stdout` 输出 JSON-lines 状态事件（`ready`、`online`、`offline`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等），支持通过 `stdin` 发送 `{"type":"reload"|"status"|"shutdown"}`，并在父进程退出（`stdin` EOF）时自动干净退出。
 - **凭据与状态目录**：可通过 `-state-dir` 指定配置档目录，默认位于当前用户配置目录下的 `Vanora/relay`。端点私钥保存在系统凭据库中，运行 `serve` 时须使用同一桌面用户身份。
 
-### 2. 编写会话配置（`desktop.json`）
+### 2. 编写会话与工作区配置（`desktop.json`）
 
-先在本地 Vanora 中创建会话，再编写配置文件，并将所有路径替换为本机真实**绝对路径**（Windows 可使用正斜杠 `/`）：
+`sessions` 与 `workspaces` 均可按需配置（允许 `0` 个预置会话启动，配合 `workspaces` 由手机远程新建会话）。所有路径须为本机真实**绝对路径**（Windows 可使用正斜杠 `/`）：
 
 ```json
 {
   "executable": "node",
   "launcher_args": ["/abs/path/to/vanora/packages/coding-agent/dist/cli.js"],
-  "sessions": [
+  "workspaces": [
     {
       "id": "project",
-      "title": "项目对话",
+      "title": "项目工作区",
+      "working_dir": "/abs/path/to/project",
+      "owner": "本机登录输出的 user_id",
+      "tools": ["read", "edit", "write", "bash", "ask"],
+      "show_thinking": true,
+      "show_tools": true,
+      "approval_policy": "remote"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "existing",
+      "title": "已有对话",
       "working_dir": "/abs/path/to/project",
       "session_file": "/abs/path/to/sessions/project.jsonl",
       "owner": "本机登录输出的 user_id",
-      "tools": [],
+      "tools": ["read", "bash"],
+      "show_thinking": true,
+      "show_tools": true,
+      "approval_policy": "remote",
       "users": [
         { "user_id": "访客手机登录后的 user_id", "read": true, "tools": false }
       ]
@@ -207,10 +227,13 @@ go build -o vanora-desktop ./cmd/vanora-desktop
 **字段与权限说明：**
 
 - **`executable` / `launcher_args`**：直接运行本机 Vanora 可执行文件时，仅填 `executable` 并省略 `launcher_args`；通过 Node 启动 `dist/cli.js` 时按上方示例配置。
+- **`workspaces`**：远程新建会话的白名单工作目录。手机端只能选择已授权的 `workspace_id`，无法传入任意本机路径；默认按 Vanora 原生目录 `~/.vanora/agent/sessions/--<path>--/` 写入 v3 JSONL 会话文件（与终端 `vanora --resume` 直接互通），也可通过 `session_dir` 覆盖。
 - **`working_dir` / `session_file`**：均须为绝对路径，且 `working_dir` 必须与会话 JSONL 首行记录的 `cwd` 一致。
 - **`owner`**：填写 `login` 输出的 `user_id`；同账号手机自动享有主人权限。
-- **`users`**：显式授权的访客列表。`read: true` 允许读取历史与实时输出；`tools: true` 允许提交提示词（需同时开启 `read`）。
+- **`users`**：显式授权的访客列表。`read: true` 允许读取文本消息；`tools: true` 允许提交提示词（需同时开启 `read`）；访客默认**不**可见思考过程、工具调用详情与审批弹窗，除非显式设置 `show_thinking` / `show_tools` / `approve`。
 - **`tools`**：决定本机 Vanora 实际启用的本地工具白名单；空数组 `[]` 表示运行纯文本对话。
+- **`show_thinking` / `show_tools`**：是否向主人展示模型思考过程及工具调用/执行输出（默认关闭，开启后仅对具备对应权限的查看者下发，未授权访客收到无信息泄露的 `sync` 占位序号）。
+- **`approval_policy`**：`"none"`（默认，本地自动取消所有交互弹窗）或 `"remote"`（自动通过 `--no-extensions -e <guard>` 加载内置审批守卫扩展，仅拦截写入/破坏性/开放世界工具并通过加密通道推送给手机确认，同时支持 Vanora 内置 `ask` 提问弹窗；超时或租约失联自动拒绝）。可通过顶层 `approval_extension` 指定自定义 `.mjs`/`.js` 守卫脚本。
 - **模型凭据**：沿用当前桌面用户本机的 Vanora 配置。
 
 ### 3. 启动服务
@@ -253,16 +276,22 @@ val store = org.vanora.relay.AndroidAccountStore(applicationContext, "primary")
 val client = mobile.Mobile.newClient(identityUrl, signalUrl, pinnedPublicKeyHex, store)
 
 // 1. 在系统浏览器打开登录地址，回调中提取 code 与 state
-val loginUrl = client.beginLogin()
+val loginUrl = client.beginLoginWithRedirect("com.vanora.app:/oauth/callback")
 client.finishLogin(code, state)
 
 // 2. 获取已验证的设备目录并连接目标桌面端
 val directory = client.devices() // JSON 包含已验证的 device_id、owner、name
 client.connect(selectedDeviceID, selectedOwnerID)
+val connState = client.connectionState() // state + direct/relay path
 
-// 3. 列出会话并拉取快照
+// 3. 列出工作区/会话，按需新建会话并拉取快照
+val workspaces = client.listWorkspaces()
+val created = client.createSession(selectedWorkspaceID, mobile.Mobile.newRequestID(), "新对话")
 val sessions = client.listSessions()
 val snapshot = client.openSession(selectedSessionID)
+
+// 4. 响应远程工具审批或 ask 提问弹窗
+client.respondUI(selectedSessionID, runID, uiID, """{"confirmed":true}""")
 ```
 
 ### iOS
@@ -283,7 +312,8 @@ go tool gomobile bind -target=ios,iossimulator -o dist/Mobile.xcframework ./mobi
 ### 客户端持久化与事件循环约定
 
 - **幂等提交提示词**：调用 `startRun(sessionID, requestID, text)` 前，先持久化 `Mobile.newRequestID()` 与提示词正文；网络中断后重试必须复用两者。
-- **单消费者事件循环**：`nextEvent(timeoutMillis)` 仅允许一个消费者读取；每应用一条事件并保存本地快照后，调用 `acknowledge(sessionID, seq)` 更新游标。
+- **单消费者事件循环**：`nextEvent(timeoutMillis)` 仅允许一个消费者读取；除业务 `event`（带 `seq`）外，还会推送 `connection.state`（`connecting`/`connected`/`reconnecting`/`disconnected` 与 `direct`/`relay` 路径）、`auth.state`（`login_required`）和 `subscription.error`。每应用一条带 `seq` 的业务事件并保存本地快照后，调用 `acknowledge(sessionID, seq)` 更新游标。
+- **网络切换与账号重置**：切网或从后台恢复时可调用 `reconnect()` 主动重连并续订游标；切换账号或注销时调用 `reset()` 安全重置本地设备密钥。
 - **进程重启恢复**：使用本地保存的 `device_id` 与 `owner` 重新 `connect`，再调用 `resume(sessionID, lastAppliedSeq)` 续读事件。
 - **快照重建**：收到 `snapshot_required` 时，调用 `openSession(sessionID)` 重新拉取完整快照。
 - **退出清理**：切换或退出账号配置档时，务必关闭 `client`。
@@ -352,10 +382,13 @@ AI 正文只在加密 DataChannel 与本机 Vanora 之间流转。`vanora-deskto
 
 | `type` | 请求字段 | 成功返回 `data` | 说明 |
 | --- | --- | --- | --- |
-| `session.list` | 无 | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`（能否提交提示词）、`tools_enabled`（本机是否启用工具） |
-| `session.open` | `session_id` | `messages`、`last_seq` | 返回同一时点的可见消息快照与最新序号 |
+| `workspace.list` | 无 | `workspaces[]` | 返回当前账号可远程新建会话的白名单工作区列表 |
+| `session.create` | `workspace_id`、`title`（可选） | 新会话摘要 | 在指定白名单工作区创建 Vanora 原生 v3 JSONL 会话（按 `request_id` 幂等） |
+| `session.list` | 无 | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`、`tools_enabled` 及可见性/审批能力标识 |
+| `session.open` | `session_id` | `messages`、`last_seq`、`pending_ui`（可选） | 按查看者权限返回可见消息快照、最新序号及当前待审批弹窗列表 |
 | `run.start` | `session_id`、`text` | `run_id` | 保留期内同 `request_id` + 同正文返回原 `run_id`，正文不同返回 `request_conflict`（每会话默认保留最近 4096 条） |
 | `run.cancel` | `session_id`、`run_id` | `run_id`、`status` | 校验运行归属该会话且访问者有取消权限 |
+| `ui.respond` | `session_id`、`run_id`、`ui_id`、`confirmed`/`value`/`answers`/`cancelled` | `ui_id`、`status` | 响应远程工具审批（`confirm`/`select`）或 `ask`/`input`/`editor` 弹窗 |
 | `events.resume` | `session_id`、`after_seq` | `session_id`、`after_seq` | 随后补发 `seq > after_seq` 的事件并接续实时流；游标超出保留窗口返回 `snapshot_required` |
 
 #### 交互示例与错误码
@@ -371,7 +404,12 @@ AI 正文只在加密 DataChannel 与本机 Vanora 之间流转。`vanora-deskto
 {"type":"event","session_id":"s2","run_id":"r5","seq":18,"kind":"text.delta","data":{"text":"修改了"}}
 ```
 
-- **运行终止事件**：`kind` 为 `run.completed`、`run.cancelled` 或 `run.failed`。
+- **流式与交互事件 `kind`**：
+  - 文本与思考：`text.delta`、`thinking.delta`（需具备思考可见权限）
+  - 工具调用：`tool.call`、`tool.start`、`tool.update`、`tool.end`（需具备工具可见权限）
+  - 远程审批与提问：`ui.request`、`ui.resolved`（需开启 `approval_policy: "remote"` 且具备审批权限）
+  - 权限占位：`sync`（混合权限会话中用于保持未授权查看者序号连续，不携带任何正文）
+  - 运行终止：`run.completed`、`run.cancelled` 或 `run.failed`
 - **常见错误码**：
   - `unavailable`：资源不可见、不存在或当前不可用（统一返回）。
   - `tool_denied`：缺少提示词 / 工具执行权限（或触发被禁用的斜杠命令）。

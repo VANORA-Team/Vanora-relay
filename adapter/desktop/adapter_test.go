@@ -36,8 +36,9 @@ func TestFakeVanora(t *testing.T) {
 func runFakeVanora() error {
 	delay := envInt("FAKE_DELAY_MS", 0)
 	deltas := envInt("FAKE_DELTAS", 1)
-	ext := os.Getenv("FAKE_EXTENSION") == "1"
-	handled := os.Getenv("FAKE_HANDLED") == "1"
+	ext := os.Getenv("FAKE_EXTENSION") == "1" || os.Getenv("FAKE_EXTENSION") == "true"
+	extMode := os.Getenv("FAKE_EXTENSION_MODE")
+	handled := os.Getenv("FAKE_HANDLED") == "1" || os.Getenv("FAKE_HANDLED") == "true"
 
 	rd := bufio.NewReader(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
@@ -80,31 +81,64 @@ func runFakeVanora() error {
 			_ = enc.Encode(map[string]any{"type": "agent_settled", "aborted": false})
 			continue
 		}
-		if ext {
-			if err := enc.Encode(map[string]any{
-				"type":   "extension_ui_request",
-				"id":     "ext-1",
-				"method": "confirm",
-				"title":  "Allow?",
-			}); err != nil {
+		if ext || extMode != "" {
+			req := map[string]any{
+				"type":    "extension_ui_request",
+				"id":      "ext-1",
+				"method":  "confirm",
+				"title":   "Allow?",
+				"message": "Run bash?",
+			}
+			if extMode == "ask" {
+				req = map[string]any{
+					"type":   "extension_ui_request",
+					"id":     "ext-1",
+					"method": "ask",
+					"questions": []map[string]any{{
+						"question": "Which DB?",
+						"header":   "DB",
+						"options":  []map[string]any{{"label": "SQLite"}, {"label": "Postgres"}},
+					}},
+				}
+			}
+			if err := enc.Encode(req); err != nil {
 				return err
 			}
 			for {
 				responseLine, err := rd.ReadString('\n')
 				if err != nil {
-					return errors.New("extension dialog was not cancelled")
+					return errors.New("extension dialog was not answered")
 				}
 				var response struct {
-					Type      string `json:"type"`
-					ID        string `json:"id"`
-					Cancelled bool   `json:"cancelled"`
+					Type      string     `json:"type"`
+					ID        string     `json:"id"`
+					Confirmed *bool      `json:"confirmed"`
+					Answers   [][]string `json:"answers"`
+					Cancelled bool       `json:"cancelled"`
 				}
 				if err := json.Unmarshal([]byte(responseLine), &response); err != nil {
 					return err
 				}
 				if response.Type == "extension_ui_response" && response.ID == "ext-1" {
-					if !response.Cancelled {
-						return errors.New("extension dialog received an answer")
+					switch extMode {
+					case "confirm":
+						if response.Confirmed == nil || !*response.Confirmed {
+							return errors.New("confirm dialog was not approved")
+						}
+					case "ask":
+						if len(response.Answers) != 1 || len(response.Answers[0]) != 1 || response.Answers[0][0] != "Postgres" {
+							return fmt.Errorf("unexpected ask answers: %v", response.Answers)
+						}
+					case "expect_cancel":
+						if !response.Cancelled {
+							return errors.New("expected cancelled dialog")
+						}
+						_ = enc.Encode(map[string]any{"type": "agent_settled", "aborted": true})
+						return nil
+					default:
+						if !response.Cancelled {
+							return errors.New("extension dialog received an answer")
+						}
 					}
 					break
 				}
@@ -142,9 +176,40 @@ func runFakeVanora() error {
 				},
 			})
 			_ = enc.Encode(map[string]any{
-				"type":     "tool_execution_start",
-				"toolName": "secret_tool",
-				"args":     map[string]any{"token": "SECRET-TOOL"},
+				"type": "message_update",
+				"assistantMessageEvent": map[string]any{
+					"type": "toolcall_end",
+					"toolCall": map[string]any{
+						"id":        "call-1",
+						"name":      "secret_tool",
+						"arguments": map[string]any{"token": "SECRET-TOOL"},
+					},
+				},
+			})
+			_ = enc.Encode(map[string]any{
+				"type":       "tool_execution_start",
+				"toolCallId": "call-1",
+				"toolName":   "secret_tool",
+				"args":       map[string]any{"token": "SECRET-TOOL"},
+			})
+			_ = enc.Encode(map[string]any{
+				"type":       "tool_execution_update",
+				"toolCallId": "call-1",
+				"toolName":   "secret_tool",
+				"partialResult": map[string]any{
+					"updateMode": "delta",
+					"content":    []map[string]any{{"type": "text", "text": "SECRET-STREAM"}},
+				},
+			})
+			_ = enc.Encode(map[string]any{
+				"type":       "tool_execution_end",
+				"toolCallId": "call-1",
+				"toolName":   "secret_tool",
+				"result": map[string]any{
+					"content": []map[string]any{{"type": "text", "text": "SECRET-RESULT"}},
+				},
+				"isError":    false,
+				"durationMs": 12,
 			})
 		}
 		text := ""
@@ -158,7 +223,7 @@ func runFakeVanora() error {
 				"content": []any{
 					map[string]any{"type": "thinking", "thinking": "SECRET-THINKING"},
 					map[string]any{"type": "text", "text": text},
-					map[string]any{"type": "toolCall", "name": "secret_tool", "arguments": map[string]any{"token": "SECRET-TOOL"}},
+					map[string]any{"type": "toolCall", "id": "call-1", "name": "secret_tool", "arguments": map[string]any{"token": "SECRET-TOOL"}},
 				},
 				"timestamp":  3,
 				"stopReason": "stop",
@@ -242,6 +307,7 @@ type testEnv struct {
 	delay     int
 	deltas    int
 	extension bool
+	extMode   string
 	handled   bool
 }
 
@@ -308,6 +374,7 @@ func newTestAdapter(t *testing.T, env *testEnv, user string) (*Adapter, *fakePee
 			fmt.Sprintf("FAKE_DELAY_MS=%d", env.delay),
 			fmt.Sprintf("FAKE_DELTAS=%d", env.deltas),
 			fmt.Sprintf("FAKE_EXTENSION=%t", env.extension),
+			fmt.Sprintf("FAKE_EXTENSION_MODE=%s", env.extMode),
 			fmt.Sprintf("FAKE_HANDLED=%t", env.handled),
 		)
 		return cmd, nil
@@ -941,4 +1008,393 @@ func TestUnknownSessionErrorIsDelivered(t *testing.T) {
 	if _, attached := frame["session_id"]; attached {
 		t.Fatalf("error disclosed session id: %v", frame)
 	}
+}
+
+func TestZeroSessionsAndApprovalGuardCommand(t *testing.T) {
+	dir := t.TempDir()
+	work := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Executable: os.Args[0],
+		Workspaces: []WorkspaceConfig{{
+			ID:             "proj",
+			Title:          "Project",
+			WorkingDir:     work,
+			SessionDir:     filepath.Join(dir, "sessions"),
+			Owner:          "owner",
+			Tools:          []string{"read", "bash"},
+			ShowThinking:   true,
+			ShowTools:      true,
+			ApprovalPolicy: "remote",
+		}},
+	}
+	a, err := New(cfg, filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("zero-session config rejected: %v", err)
+	}
+	defer a.Close()
+
+	// Create a session through the workspace and inspect defaultCommand.
+	a.AuthorityUntil(time.Now().Add(time.Hour))
+	p := newFakePeer("owner")
+	a.Open(p)
+	defer a.Closed(p)
+	createID := sendRequest(t, a, p, map[string]any{
+		"type":         "session.create",
+		"workspace_id": "proj",
+		"title":        "New Chat",
+	})
+	data := resultData(t, p.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == createID
+	}))
+	sid, _ := data["session_id"].(string)
+	if sid == "" {
+		t.Fatalf("missing session_id: %v", data)
+	}
+	a.mu.Lock()
+	sr := a.sessions[sid]
+	a.mu.Unlock()
+	cmd, err := a.defaultCommand(sr.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxExt := slices.Index(cmd.Args, "-e")
+	if idxExt < 0 || idxExt+1 >= len(cmd.Args) || !strings.HasSuffix(cmd.Args[idxExt+1], "approval-guard.mjs") {
+		t.Fatalf("expected embedded approval-guard.mjs in args: %v", cmd.Args)
+	}
+	if _, err := os.Stat(cmd.Args[idxExt+1]); err != nil {
+		t.Fatalf("materialized guard extension missing: %v", err)
+	}
+	if cmd.Args[len(cmd.Args)-2] != "--session" || cmd.Args[len(cmd.Args)-1] != sr.cfg.sessionFile {
+		t.Fatalf("--session must remain last: %v", cmd.Args)
+	}
+}
+
+func TestWorkspaceCreatePersistenceAndReload(t *testing.T) {
+	dir := t.TempDir()
+	work := filepath.Join(dir, "proj")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Executable: os.Args[0],
+		Workspaces: []WorkspaceConfig{{
+			ID:         "proj",
+			Title:      "Project",
+			WorkingDir: work,
+			SessionDir: filepath.Join(dir, "vanora-sessions"),
+			Owner:      "owner",
+			Tools:      []string{"read"},
+		}},
+	}
+	stateDir := filepath.Join(dir, "state")
+	a, err := New(cfg, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	a.AuthorityUntil(time.Now().Add(time.Hour))
+
+	owner := newFakePeer("owner")
+	guest := newFakePeer("guest")
+	a.Open(owner)
+	a.Open(guest)
+
+	// Owner sees workspace, guest sees none.
+	wOwner := sendRequest(t, a, owner, map[string]any{"type": "workspace.list"})
+	wData := resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == wOwner
+	}))
+	if list, _ := wData["workspaces"].([]any); len(list) != 1 {
+		t.Fatalf("owner workspaces = %v", wData)
+	}
+	wGuest := sendRequest(t, a, guest, map[string]any{"type": "workspace.list"})
+	wgData := resultData(t, guest.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == wGuest
+	}))
+	if list, _ := wgData["workspaces"].([]any); len(list) != 0 {
+		t.Fatalf("guest workspaces = %v", wgData)
+	}
+
+	// Guest cannot create session.
+	gCreate := sendRequest(t, a, guest, map[string]any{
+		"type": "session.create", "workspace_id": "proj", "title": "Nope",
+	})
+	gErr := guest.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "error" && f["request_id"] == gCreate
+	})
+	if gErr["code"] != codeUnavailable {
+		t.Fatalf("guest create = %v", gErr)
+	}
+
+	// Owner creates session with idempotency and conflict check.
+	c1 := sendRequest(t, a, owner, map[string]any{
+		"type": "session.create", "request_id": "create-1", "workspace_id": "proj", "title": "Sprint 1",
+	})
+	c1Data := resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == c1
+	}))
+	sid, _ := c1Data["session_id"].(string)
+	if sid == "" || c1Data["title"] != "Sprint 1" {
+		t.Fatalf("unexpected create result: %v", c1Data)
+	}
+	c2 := sendRequest(t, a, owner, map[string]any{
+		"type": "session.create", "request_id": "create-1", "workspace_id": "proj", "title": "Sprint 1",
+	})
+	c2Data := resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == c2
+	}))
+	if c2Data["session_id"] != sid {
+		t.Fatalf("idempotent create returned %v, want %v", c2Data["session_id"], sid)
+	}
+	cConflict := sendRequest(t, a, owner, map[string]any{
+		"type": "session.create", "request_id": "create-1", "workspace_id": "proj", "title": "Other",
+	})
+	conflictFrame := owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "error" && f["request_id"] == cConflict
+	})
+	if conflictFrame["code"] != codeRequestConflict {
+		t.Fatalf("conflict = %v", conflictFrame)
+	}
+	a.Closed(owner)
+	a.Closed(guest)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart adapter and verify created session persisted and is listed.
+	a2, err := New(cfg, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Close()
+	a2.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	a2.AuthorityUntil(time.Now().Add(time.Hour))
+	owner2 := newFakePeer("owner")
+	a2.Open(owner2)
+	defer a2.Closed(owner2)
+	listID := sendRequest(t, a2, owner2, map[string]any{"type": "session.list"})
+	listData := resultData(t, owner2.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == listID
+	}))
+	sessions, _ := listData["sessions"].([]any)
+	if len(sessions) != 1 {
+		t.Fatalf("expected persisted session after restart, got %v", listData)
+	}
+
+	// Removing workspace via ReloadACL removes created session.
+	cfgNoWS := &Config{Executable: os.Args[0]}
+	if err := a2.ReloadACL(cfgNoWS); err != nil {
+		t.Fatal(err)
+	}
+	a2.mu.Lock()
+	remaining := len(a2.sessions)
+	a2.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("created session survived workspace removal: %d", remaining)
+	}
+}
+
+func TestRichThinkingToolsAndMixedGuestIsolation(t *testing.T) {
+	env := newTestEnv(t, []Grant{{UserID: "guest", Read: true}}, []string{"read"})
+	env.cfg.Sessions[0].ShowThinking = true
+	env.cfg.Sessions[0].ShowTools = true
+	a, owner := newTestAdapter(t, env, "owner")
+	guest := newFakePeer("guest")
+	a.Open(guest)
+	defer a.Closed(guest)
+
+	subscribeSession(t, a, owner)
+	subscribeSession(t, a, guest)
+
+	startID := sendRequest(t, a, owner, map[string]any{
+		"type": "run.start", "session_id": "main", "text": "inspect",
+	})
+	runID, _ := resultData(t, owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == startID
+	}))["run_id"].(string)
+
+	owner.waitFrame(t, 5*time.Second, func(f map[string]any) bool {
+		return f["type"] == "event" && f["kind"] == kindRunCompleted && f["run_id"] == runID
+	})
+	guest.waitFrame(t, 5*time.Second, func(f map[string]any) bool {
+		return f["type"] == "event" && f["kind"] == kindRunCompleted && f["run_id"] == runID
+	})
+
+	// Owner saw thinking + tool lifecycle events.
+	ownerKinds := map[string]bool{}
+	owner.mu.Lock()
+	for _, raw := range owner.frames {
+		var f map[string]any
+		if json.Unmarshal(raw, &f) == nil && f["type"] == "event" {
+			ownerKinds[fmt.Sprint(f["kind"])] = true
+		}
+	}
+	owner.mu.Unlock()
+	for _, want := range []string{kindThinkingDelta, kindToolCall, kindToolStart, kindToolUpdate, kindToolEnd, kindTextDelta, kindRunCompleted} {
+		if !ownerKinds[want] {
+			t.Fatalf("owner missing event kind %q; saw %v", want, ownerKinds)
+		}
+	}
+
+	// Guest saw ZERO secret content and strictly contiguous seq numbers (1..N).
+	var lastSeq int64
+	guest.mu.Lock()
+	for _, raw := range guest.frames {
+		if strings.Contains(string(raw), "SECRET") || strings.Contains(string(raw), "secret_tool") {
+			guest.mu.Unlock()
+			t.Fatalf("guest frame leaked internal data: %s", raw)
+		}
+		var f struct {
+			Type string `json:"type"`
+			Seq  int64  `json:"seq"`
+		}
+		if json.Unmarshal(raw, &f) == nil && f.Type == "event" {
+			if f.Seq != lastSeq+1 {
+				guest.mu.Unlock()
+				t.Fatalf("guest seq gap: got %d after %d", f.Seq, lastSeq)
+			}
+			lastSeq = f.Seq
+		}
+	}
+	guest.mu.Unlock()
+
+	// Snapshots also respect visibility: owner gets thinking + tools, guest gets text only.
+	oOpen := sendRequest(t, a, owner, map[string]any{"type": "session.open", "session_id": "main"})
+	oSnap := resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == oOpen
+	}))
+	oBlob, _ := json.Marshal(oSnap)
+	if !strings.Contains(string(oBlob), "SECRET-THINKING") || !strings.Contains(string(oBlob), "SECRET-RESULT") {
+		t.Fatalf("owner snapshot missing thinking/tool result: %s", oBlob)
+	}
+
+	gOpen := sendRequest(t, a, guest, map[string]any{"type": "session.open", "session_id": "main"})
+	gSnap := resultData(t, guest.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+		return f["type"] == "result" && f["request_id"] == gOpen
+	}))
+	gBlob, _ := json.Marshal(gSnap)
+	if strings.Contains(string(gBlob), "SECRET") {
+		t.Fatalf("guest snapshot leaked internal content: %s", gBlob)
+	}
+}
+
+func TestRemoteApprovalAndAskDialogFlow(t *testing.T) {
+	t.Run("confirm approved by owner and rejected for guest", func(t *testing.T) {
+		env := newTestEnv(t, []Grant{{UserID: "guest", Read: true, Tools: true}}, []string{"bash"})
+		env.cfg.Sessions[0].ApprovalPolicy = "remote"
+		env.extMode = "confirm"
+		a, owner := newTestAdapter(t, env, "owner")
+		guest := newFakePeer("guest")
+		a.Open(guest)
+		defer a.Closed(guest)
+		subscribeSession(t, a, owner)
+
+		startID := sendRequest(t, a, owner, map[string]any{
+			"type": "run.start", "session_id": "main", "text": "run cmd",
+		})
+		runID, _ := resultData(t, owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == startID
+		}))["run_id"].(string)
+
+		reqFrame := owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindUIRequest && f["run_id"] == runID
+		})
+		reqData, _ := reqFrame["data"].(map[string]any)
+		if reqData["ui_id"] != "ext-1" || reqData["method"] != "confirm" {
+			t.Fatalf("unexpected ui.request: %v", reqFrame)
+		}
+
+		// Reopening session while pending includes pending_ui for owner, not guest.
+		oOpen := sendRequest(t, a, owner, map[string]any{"type": "session.open", "session_id": "main"})
+		oSnap := resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == oOpen
+		}))
+		if pui, _ := oSnap["pending_ui"].([]any); len(pui) != 1 {
+			t.Fatalf("owner snapshot missing pending_ui: %v", oSnap)
+		}
+		gOpen := sendRequest(t, a, guest, map[string]any{"type": "session.open", "session_id": "main"})
+		gSnap := resultData(t, guest.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == gOpen
+		}))
+		if _, leaked := gSnap["pending_ui"]; leaked {
+			t.Fatalf("guest snapshot leaked pending_ui: %v", gSnap)
+		}
+
+		// Guest without approve grant cannot respond.
+		gResp := sendRequest(t, a, guest, map[string]any{
+			"type": "ui.respond", "session_id": "main", "run_id": runID, "ui_id": "ext-1", "confirmed": true,
+		})
+		gErr := guest.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+			return f["type"] == "error" && f["request_id"] == gResp
+		})
+		if gErr["code"] != codeUnavailable {
+			t.Fatalf("guest respond = %v", gErr)
+		}
+
+		// Owner approves and run completes.
+		okID := sendRequest(t, a, owner, map[string]any{
+			"type": "ui.respond", "session_id": "main", "run_id": runID, "ui_id": "ext-1", "confirmed": true,
+		})
+		_ = resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == okID
+		}))
+		owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindUIResolved && f["run_id"] == runID
+		})
+		owner.waitFrame(t, 5*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindRunCompleted && f["run_id"] == runID
+		})
+	})
+
+	t.Run("ask dialog answered remotely", func(t *testing.T) {
+		env := newTestEnv(t, nil, []string{"ask"})
+		env.cfg.Sessions[0].ApprovalPolicy = "remote"
+		env.extMode = "ask"
+		a, owner := newTestAdapter(t, env, "owner")
+		subscribeSession(t, a, owner)
+
+		startID := sendRequest(t, a, owner, map[string]any{
+			"type": "run.start", "session_id": "main", "text": "pick db",
+		})
+		runID, _ := resultData(t, owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == startID
+		}))["run_id"].(string)
+
+		owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindUIRequest && f["run_id"] == runID
+		})
+		ansID := sendRequest(t, a, owner, map[string]any{
+			"type": "ui.respond", "session_id": "main", "run_id": runID, "ui_id": "ext-1",
+			"answers": [][]string{{"Postgres"}},
+		})
+		_ = resultData(t, owner.waitFrame(t, 2*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == ansID
+		}))
+		owner.waitFrame(t, 5*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindRunCompleted && f["run_id"] == runID
+		})
+	})
+
+	t.Run("authority loss cancels pending approval", func(t *testing.T) {
+		env := newTestEnv(t, nil, []string{"bash"})
+		env.cfg.Sessions[0].ApprovalPolicy = "remote"
+		env.extMode = "expect_cancel"
+		a, owner := newTestAdapter(t, env, "owner")
+		subscribeSession(t, a, owner)
+
+		startID := sendRequest(t, a, owner, map[string]any{
+			"type": "run.start", "session_id": "main", "text": "danger",
+		})
+		runID, _ := resultData(t, owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "result" && f["request_id"] == startID
+		}))["run_id"].(string)
+		owner.waitFrame(t, 3*time.Second, func(f map[string]any) bool {
+			return f["type"] == "event" && f["kind"] == kindUIRequest && f["run_id"] == runID
+		})
+		a.AuthorityLost()
+		waitRunStatus(t, a, runID, statusCancelled)
+	})
 }

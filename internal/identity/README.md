@@ -56,7 +56,8 @@ account. The process refuses to overwrite existing files.
 | `VANORA_IDENTITY_OIDC_ISSUER` | yes | – | exact issuer URL; must be https except loopback development |
 | `VANORA_IDENTITY_OIDC_CLIENT_ID` | yes | – | native public client id |
 | `VANORA_IDENTITY_OIDC_CLIENT_SECRET` | no | – | only for a confidential client; sent with the token request |
-| `VANORA_IDENTITY_OIDC_REDIRECT_URI` | yes | – | registered callback: https, loopback http, or a custom app scheme |
+| `VANORA_IDENTITY_OIDC_REDIRECT_URI` | yes* | – | default registered callback: https, loopback http, or a custom app scheme (`*` required unless `VANORA_IDENTITY_OIDC_REDIRECT_URIS` is set) |
+| `VANORA_IDENTITY_OIDC_REDIRECT_URIS` | no | – | comma/space list of additional allowed callbacks (e.g. `http://127.0.0.1/oauth/callback` alongside a mobile scheme; an `http` loopback entry without a port allows any ephemeral loopback port per RFC 8252) |
 | `VANORA_IDENTITY_OIDC_SCOPES` | no | `openid, offline_access` | comma/space list; `openid` is always added |
 | `VANORA_IDENTITY_DISABLE_REFRESH` | no | off | do not request `offline_access` and refuse renewal; unattended clients must sign in again when certificates expire |
 | `VANORA_IDENTITY_CERT_TTL` | no | `10m` | certificate lifetime, `0 < ttl <= 15m` |
@@ -136,10 +137,10 @@ returned by enrollment with the values it expects.
 `POST /v1/identity/challenges`
 
 ```json
-{"purpose": "enroll", "public_key": "<base64url 32-byte Ed25519 public key>"}
+{"purpose": "enroll", "public_key": "<base64url 32-byte Ed25519 public key>", "redirect_uri": "http://127.0.0.1:45678/oauth/callback"}
 ```
 
-`purpose` is `enroll` or `renew` (default `enroll`). Success (`200`):
+`purpose` is `enroll` or `renew` (default `enroll`). `redirect_uri` is optional; when omitted, `VANORA_IDENTITY_OIDC_REDIRECT_URI` (or the first entry of `VANORA_IDENTITY_OIDC_REDIRECT_URIS`) is used. When provided, it must match the configured allowlist (or an ephemeral port on a portless `http` loopback entry). Success (`200`):
 
 ```json
 {

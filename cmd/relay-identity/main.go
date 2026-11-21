@@ -128,6 +128,7 @@ type serveConfig struct {
 	clientID       string
 	clientSecret   string
 	redirectURI    string
+	redirectURIs   []string
 	scopes         []string
 	certTTL        time.Duration
 	challengeTTL   time.Duration
@@ -165,6 +166,7 @@ func runServe(args []string) error {
 		OIDCClientID:     cfg.clientID,
 		OIDCClientSecret: cfg.clientSecret,
 		OIDCRedirectURI:  cfg.redirectURI,
+		OIDCRedirectURIs: cfg.redirectURIs,
 		OIDCScopes:       cfg.scopes,
 		DisableRefresh:   cfg.disableRefresh,
 		Signer:           signer,
@@ -234,7 +236,8 @@ func loadServeConfig() (serveConfig, error) {
 	cfg.issuer = os.Getenv("VANORA_IDENTITY_OIDC_ISSUER")
 	cfg.clientID = os.Getenv("VANORA_IDENTITY_OIDC_CLIENT_ID")
 	cfg.clientSecret = os.Getenv("VANORA_IDENTITY_OIDC_CLIENT_SECRET")
-	cfg.redirectURI = os.Getenv("VANORA_IDENTITY_OIDC_REDIRECT_URI")
+	cfg.redirectURI = strings.TrimSpace(os.Getenv("VANORA_IDENTITY_OIDC_REDIRECT_URI"))
+	cfg.redirectURIs = splitList(os.Getenv("VANORA_IDENTITY_OIDC_REDIRECT_URIS"))
 	cfg.tlsCertFile = os.Getenv("VANORA_IDENTITY_TLS_CERT")
 	cfg.tlsKeyFile = os.Getenv("VANORA_IDENTITY_TLS_KEY")
 	cfg.scopes = splitList(os.Getenv("VANORA_IDENTITY_OIDC_SCOPES"))
@@ -253,8 +256,8 @@ func loadServeConfig() (serveConfig, error) {
 	if cfg.clientID == "" {
 		errs = append(errs, "VANORA_IDENTITY_OIDC_CLIENT_ID is required")
 	}
-	if cfg.redirectURI == "" {
-		errs = append(errs, "VANORA_IDENTITY_OIDC_REDIRECT_URI is required")
+	if cfg.redirectURI == "" && len(cfg.redirectURIs) == 0 {
+		errs = append(errs, "VANORA_IDENTITY_OIDC_REDIRECT_URI or VANORA_IDENTITY_OIDC_REDIRECT_URIS is required")
 	}
 	if (cfg.tlsCertFile == "") != (cfg.tlsKeyFile == "") {
 		errs = append(errs, "VANORA_IDENTITY_TLS_CERT and VANORA_IDENTITY_TLS_KEY must be set together")

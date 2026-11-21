@@ -24,6 +24,12 @@ type Peer interface {
 	Close()
 }
 
+// PathReporter is an optional interface a Peer may implement to report whether
+// the active WebRTC transport is using a direct path or a TURN relay.
+type PathReporter interface {
+	Path() string
+}
+
 // Handler receives lifecycle and business messages for connected peers.
 //
 // Open, Message, and Closed for one peer are serialized by the caller. They

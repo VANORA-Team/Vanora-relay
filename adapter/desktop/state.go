@@ -12,10 +12,23 @@ import (
 const (
 	stateVersion = 1
 
-	kindTextDelta    = "text.delta"
-	kindRunCompleted = "run.completed"
-	kindRunCancelled = "run.cancelled"
-	kindRunFailed    = "run.failed"
+	kindTextDelta     = "text.delta"
+	kindThinkingDelta = "thinking.delta"
+	kindToolCall      = "tool.call"
+	kindToolStart     = "tool.start"
+	kindToolUpdate    = "tool.update"
+	kindToolEnd       = "tool.end"
+	kindUIRequest     = "ui.request"
+	kindUIResolved    = "ui.resolved"
+	kindSync          = "sync"
+	kindRunCompleted  = "run.completed"
+	kindRunCancelled  = "run.cancelled"
+	kindRunFailed     = "run.failed"
+
+	visAll      = ""
+	visThinking = "thinking"
+	visTools    = "tools"
+	visApproval = "approval"
 
 	statusRunning    = "running"
 	statusCancelling = "cancelling"
@@ -25,8 +38,26 @@ const (
 )
 
 type persistedState struct {
-	Version  int                          `json:"version"`
-	Sessions map[string]*persistedSession `json:"sessions"`
+	Version         int                             `json:"version"`
+	Sessions        map[string]*persistedSession    `json:"sessions"`
+	CreatedSessions map[string]createdSessionRecord `json:"created_sessions,omitempty"`
+	CreateRequests  map[string]createRequestRecord  `json:"create_requests,omitempty"`
+}
+
+type createdSessionRecord struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	Title       string `json:"title"`
+	WorkingDir  string `json:"working_dir"`
+	SessionFile string `json:"session_file"`
+	Owner       string `json:"owner"`
+	Created     int64  `json:"created"`
+}
+
+type createRequestRecord struct {
+	SessionID string `json:"session_id"`
+	TitleSHA  string `json:"title_sha"`
+	Created   int64  `json:"created"`
 }
 
 type persistedSession struct {
@@ -45,6 +76,7 @@ type storedEvent struct {
 	Kind           string          `json:"kind"`
 	Data           json.RawMessage `json:"data,omitempty"`
 	RequiresOnline bool            `json:"requires_online,omitempty"`
+	Visibility     string          `json:"visibility,omitempty"`
 }
 
 type requestRecord struct {
@@ -64,6 +96,55 @@ type textDeltaData struct {
 	Text string `json:"text"`
 }
 
+type thinkingDeltaData struct {
+	Text string `json:"text"`
+}
+
+type toolCallData struct {
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	ToolName   string `json:"tool_name"`
+	Arguments  string `json:"arguments,omitempty"`
+}
+
+type toolStartData struct {
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	ToolName   string `json:"tool_name"`
+	Args       string `json:"args,omitempty"`
+}
+
+type toolUpdateData struct {
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	ToolName   string `json:"tool_name"`
+	Text       string `json:"text"`
+	Delta      bool   `json:"delta,omitempty"`
+}
+
+type toolEndData struct {
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	ToolName   string `json:"tool_name"`
+	Text       string `json:"text,omitempty"`
+	IsError    bool   `json:"is_error,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+}
+
+type uiRequestData struct {
+	UIID        string          `json:"ui_id"`
+	RunID       string          `json:"run_id,omitempty"`
+	Method      string          `json:"method"`
+	Title       string          `json:"title,omitempty"`
+	Message     string          `json:"message,omitempty"`
+	Options     []string        `json:"options,omitempty"`
+	Questions   json.RawMessage `json:"questions,omitempty"`
+	Placeholder string          `json:"placeholder,omitempty"`
+	Prefill     string          `json:"prefill,omitempty"`
+	ExpiresAt   int64           `json:"expires_at,omitempty"`
+}
+
+type uiResolvedData struct {
+	UIID   string `json:"ui_id"`
+	Status string `json:"status"`
+}
+
 type runCancelledData struct {
 	Reason string `json:"reason"`
 }
@@ -73,7 +154,12 @@ type runFailedData struct {
 }
 
 func newPersistedState() *persistedState {
-	return &persistedState{Version: stateVersion, Sessions: make(map[string]*persistedSession)}
+	return &persistedState{
+		Version:         stateVersion,
+		Sessions:        make(map[string]*persistedSession),
+		CreatedSessions: make(map[string]createdSessionRecord),
+		CreateRequests:  make(map[string]createRequestRecord),
+	}
 }
 
 func newPersistedSession() *persistedSession {
@@ -114,6 +200,12 @@ func loadState(dir string) (*persistedState, error) {
 	}
 	if st.Sessions == nil {
 		st.Sessions = make(map[string]*persistedSession)
+	}
+	if st.CreatedSessions == nil {
+		st.CreatedSessions = make(map[string]createdSessionRecord)
+	}
+	if st.CreateRequests == nil {
+		st.CreateRequests = make(map[string]createRequestRecord)
 	}
 	for id, ps := range st.Sessions {
 		if ps == nil {

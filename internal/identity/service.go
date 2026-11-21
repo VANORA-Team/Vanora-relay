@@ -43,8 +43,13 @@ type Config struct {
 	OIDCClientID string
 	// OIDCClientSecret is optional and only needed for a confidential client.
 	OIDCClientSecret string
-	// OIDCRedirectURI is the registered callback the native client receives.
+	// OIDCRedirectURI is the default registered callback the native client receives.
 	OIDCRedirectURI string
+	// OIDCRedirectURIs lists additional allowed callback URIs (such as a
+	// desktop loopback callback alongside a mobile custom scheme). An http
+	// loopback URI without a port permits any ephemeral loopback port on the
+	// same host and path (RFC 8252).
+	OIDCRedirectURIs []string
 	// OIDCScopes defaults to ["openid", "offline_access"]. "openid" is always
 	// added; "offline_access" is added unless DisableRefresh is set.
 	OIDCScopes []string
@@ -141,8 +146,9 @@ func (s *Server) Handler() http.Handler {
 }
 
 type challengeRequest struct {
-	Purpose   string `json:"purpose"`
-	PublicKey string `json:"public_key"`
+	Purpose     string `json:"purpose"`
+	PublicKey   string `json:"public_key"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
 }
 
 type challengeResponse struct {
@@ -241,6 +247,11 @@ func (s *Server) handleChallenges(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_public_key")
 		return
 	}
+	redirectURI, err := s.oidc.resolveRedirectURI(req.RedirectURI)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_redirect_uri")
+		return
+	}
 
 	_, metadata, err := s.oidc.load(r.Context())
 	if err != nil {
@@ -280,6 +291,7 @@ func (s *Server) handleChallenges(w http.ResponseWriter, r *http.Request) {
 		state:        state,
 		codeVerifier: codeVerifier,
 		purpose:      purpose,
+		redirectURI:  redirectURI,
 		publicKey:    publicKey,
 		expires:      now.Add(s.challengeTTL),
 	}
@@ -348,7 +360,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "provider_unavailable")
 		return
 	}
-	tokens, err := s.oidc.exchangeCode(r.Context(), metadata.TokenEndpoint, req.Code, ch.codeVerifier)
+	tokens, err := s.oidc.exchangeCode(r.Context(), metadata.TokenEndpoint, req.Code, ch.codeVerifier, ch.redirectURI)
 	if err != nil {
 		s.logFailure("authorization code exchange failed", err)
 		if errors.Is(err, ErrCodeRejected) {

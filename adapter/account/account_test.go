@@ -187,8 +187,9 @@ func (f *fakeAuthority) handleChallenge(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
-		Purpose   string `json:"purpose"`
-		PublicKey string `json:"public_key"`
+		Purpose     string `json:"purpose"`
+		PublicKey   string `json:"public_key"`
+		RedirectURI string `json:"redirect_uri"`
 	}
 	if !decodeBody(f.t, w, r, &req) {
 		return
@@ -230,13 +231,17 @@ func (f *fakeAuthority) handleChallenge(w http.ResponseWriter, r *http.Request) 
 	}
 	f.mu.Unlock()
 
+	authURL := "https://idp.example/authorize?state=" + url.QueryEscape(state)
+	if req.RedirectURI != "" {
+		authURL += "&redirect_uri=" + url.QueryEscape(req.RedirectURI)
+	}
 	writeJSON(f.t, w, http.StatusOK, map[string]any{
 		"challenge_id":          id,
 		"nonce":                 nonce,
 		"state":                 state,
 		"code_challenge":        "challenge",
 		"code_challenge_method": "S256",
-		"authorization_url":     "https://idp.example/authorize?state=" + url.QueryEscape(state),
+		"authorization_url":     authURL,
 		"expires_at":            now.Add(5 * time.Minute).Unix(),
 	})
 }
@@ -1317,5 +1322,22 @@ func TestCurrentSerializesConcurrentCallers(t *testing.T) {
 	}
 	if _, _, leases, _ := f.calls(); leases != 1 {
 		t.Fatalf("concurrent callers issued %d leases, want 1", leases)
+	}
+}
+
+func TestBeginWithRedirect(t *testing.T) {
+	f := newFakeAuthority(t)
+	a := newTestAccount(t, f, &memStore{})
+	want := "http://127.0.0.1:43210/oauth/callback"
+	raw, err := a.BeginWithRedirect(context.Background(), want)
+	if err != nil {
+		t.Fatalf("BeginWithRedirect: %v", err)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Query().Get("redirect_uri"); got != want {
+		t.Fatalf("redirect_uri = %q, want %q", got, want)
 	}
 }

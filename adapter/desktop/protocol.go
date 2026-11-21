@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,12 +22,19 @@ const (
 )
 
 type wireRequest struct {
-	Type      string `json:"type"`
-	RequestID string `json:"request_id"`
-	SessionID string `json:"session_id"`
-	Text      string `json:"text"`
-	RunID     string `json:"run_id"`
-	AfterSeq  *int64 `json:"after_seq"`
+	Type        string     `json:"type"`
+	RequestID   string     `json:"request_id"`
+	SessionID   string     `json:"session_id"`
+	WorkspaceID string     `json:"workspace_id"`
+	Title       string     `json:"title"`
+	Text        string     `json:"text"`
+	RunID       string     `json:"run_id"`
+	UIID        string     `json:"ui_id"`
+	Confirmed   *bool      `json:"confirmed"`
+	Value       *string    `json:"value"`
+	Answers     [][]string `json:"answers"`
+	Cancelled   bool       `json:"cancelled"`
+	AfterSeq    *int64     `json:"after_seq"`
 }
 
 type resultEnvelope struct {
@@ -51,23 +59,47 @@ type wireEvent struct {
 }
 
 type sessionSummary struct {
-	SessionID string `json:"session_id"`
-	Title     string `json:"title"`
+	SessionID   string `json:"session_id"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	Title       string `json:"title"`
 	// CanRunTools is the wire-compatible name for "this user may start a
 	// run". A tools grant with an empty local Tools list still allows a
 	// text-only run, so ToolsEnabled separately reports whether local tools
 	// are actually available.
-	CanRunTools  bool `json:"can_run_tools"`
-	ToolsEnabled bool `json:"tools_enabled"`
+	CanRunTools    bool   `json:"can_run_tools"`
+	ToolsEnabled   bool   `json:"tools_enabled"`
+	ShowThinking   bool   `json:"show_thinking,omitempty"`
+	ShowTools      bool   `json:"show_tools,omitempty"`
+	ApprovalPolicy string `json:"approval_policy,omitempty"`
+	HasActiveRun   bool   `json:"has_active_run,omitempty"`
 }
 
 type sessionListResult struct {
 	Sessions []sessionSummary `json:"sessions"`
 }
 
+type workspaceSummary struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Title          string `json:"title"`
+	ToolsEnabled   bool   `json:"tools_enabled"`
+	ShowThinking   bool   `json:"show_thinking,omitempty"`
+	ShowTools      bool   `json:"show_tools,omitempty"`
+	ApprovalPolicy string `json:"approval_policy,omitempty"`
+}
+
+type workspaceListResult struct {
+	Workspaces []workspaceSummary `json:"workspaces"`
+}
+
+type uiRespondResult struct {
+	UIID   string `json:"ui_id"`
+	Status string `json:"status"`
+}
+
 type snapshotResult struct {
-	Messages []Message `json:"messages"`
-	LastSeq  int64     `json:"last_seq"`
+	Messages  []Message       `json:"messages"`
+	LastSeq   int64           `json:"last_seq"`
+	PendingUI []uiRequestData `json:"pending_ui,omitempty"`
 }
 
 type runStartedResult struct {
@@ -106,6 +138,10 @@ func (a *Adapter) handleData(ps *peerState, data []byte) {
 		return
 	}
 	switch req.Type {
+	case "workspace.list":
+		a.handleWorkspaceList(ps, req)
+	case "session.create":
+		a.handleSessionCreate(ps, req)
 	case "session.list":
 		a.handleSessionList(ps, req)
 	case "session.open":
@@ -116,6 +152,8 @@ func (a *Adapter) handleData(ps *peerState, data []byte) {
 		a.handleRunStart(ps, req)
 	case "run.cancel":
 		a.handleRunCancel(ps, req)
+	case "ui.respond":
+		a.handleUIRespond(ps, req)
 	default:
 		a.sendError(ps, req.RequestID, codeInvalidRequest)
 	}
@@ -137,18 +175,171 @@ func (a *Adapter) handleSessionList(ps *peerState, req wireRequest) {
 	a.enqueueLocked(ps, delivery{listRequestID: req.RequestID})
 }
 
-func (a *Adapter) sessionListLocked(user string) sessionListResult {
-	out := sessionListResult{Sessions: make([]sessionSummary, 0, len(a.cfg.sessions))}
-	for _, s := range a.cfg.sessions {
-		if !s.canRead(user) {
+func (a *Adapter) handleWorkspaceList(ps *peerState, req wireRequest) {
+	user := ps.peer.UserID()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := workspaceListResult{Workspaces: make([]workspaceSummary, 0, len(a.cfg.workspaces))}
+	for _, w := range a.cfg.workspaces {
+		if w.owner != user {
 			continue
 		}
-		out.Sessions = append(out.Sessions, sessionSummary{
-			SessionID:    s.id,
-			Title:        s.title,
-			CanRunTools:  s.canRun(user),
-			ToolsEnabled: s.canRun(user) && len(s.tools) > 0,
+		policy := ""
+		if w.approvalPolicy == approvalRemote {
+			policy = approvalRemote
+		}
+		out.Workspaces = append(out.Workspaces, workspaceSummary{
+			WorkspaceID:    w.id,
+			Title:          w.title,
+			ToolsEnabled:   len(w.tools) > 0,
+			ShowThinking:   w.showThinking,
+			ShowTools:      w.showTools,
+			ApprovalPolicy: policy,
 		})
+	}
+	a.sendResultLocked(ps, req.RequestID, out, "", false)
+}
+
+func (a *Adapter) handleSessionCreate(ps *peerState, req wireRequest) {
+	user := ps.peer.UserID()
+	wsID := strings.TrimSpace(req.WorkspaceID)
+	if wsID == "" {
+		a.sendError(ps, req.RequestID, codeInvalidRequest)
+		return
+	}
+	title := strings.TrimSpace(req.Title)
+	if len(title) > 200 || hasControl(title) {
+		a.sendError(ps, req.RequestID, codeInvalidRequest)
+		return
+	}
+	key := requestHash(user, wsID, req.RequestID)
+	titleSHA := payloadHash(title)
+
+	a.mu.Lock()
+	if a.closed || !a.effectiveOnlineLocked() || !ps.peer.Allows(true) || ps.closed.Load() {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	w := a.cfg.workspacesByID[wsID]
+	if w == nil || w.owner != user {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	if prev, exists := a.state.CreateRequests[key]; exists {
+		if prev.TitleSHA != titleSHA {
+			a.mu.Unlock()
+			a.sendError(ps, req.RequestID, codeRequestConflict)
+			return
+		}
+		if sr := a.sessions[prev.SessionID]; sr != nil {
+			summary := a.sessionSummaryLocked(sr, user)
+			a.mu.Unlock()
+			a.sendResult(ps, req.RequestID, summary, prev.SessionID, true)
+			return
+		}
+	}
+	sessionID, err := newSessionID()
+	if err != nil {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	if title == "" {
+		title = w.title
+	}
+	now := a.now()
+	sessionFile, err := createVanoraSessionFile(w.sessionDir, w.workDir, sessionID, now)
+	if err != nil {
+		a.logger.Error("create session file", "workspace", w.id, "error", err)
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	messages, stamp, err := loadSessionMessages(sessionFile)
+	if err != nil {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	rec := createdSessionRecord{
+		ID:          sessionID,
+		WorkspaceID: w.id,
+		Title:       title,
+		WorkingDir:  w.workDir,
+		SessionFile: sessionFile,
+		Owner:       w.owner,
+		Created:     now.UnixMilli(),
+	}
+	sCfg := sessionFromWorkspace(w, rec, sessionFile)
+	psState := newPersistedSession()
+	sr := &sessionRuntime{
+		cfg:      sCfg,
+		ps:       psState,
+		messages: messages,
+		stamp:    stamp,
+		loaded:   true,
+		runs:     make(map[string]*run),
+	}
+	a.sessions[sessionID] = sr
+	a.state.Sessions[sessionID] = psState
+	a.state.CreatedSessions[sessionID] = rec
+	a.state.CreateRequests[key] = createRequestRecord{
+		SessionID: sessionID,
+		TitleSHA:  titleSHA,
+		Created:   now.UnixMilli(),
+	}
+	trimMap(a.state.CreateRequests, a.cfg.retention.MaxRequests, func(r createRequestRecord) int64 { return r.Created })
+	if err := a.saveLocked(); err != nil {
+		delete(a.sessions, sessionID)
+		delete(a.state.Sessions, sessionID)
+		delete(a.state.CreatedSessions, sessionID)
+		delete(a.state.CreateRequests, key)
+		a.mu.Unlock()
+		a.logger.Error("persist created session", "session", sessionID, "error", err)
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	summary := a.sessionSummaryLocked(sr, user)
+	a.mu.Unlock()
+	a.emitObserve(map[string]any{
+		"type":         "session.created",
+		"session_id":   sessionID,
+		"workspace_id": w.id,
+		"title":        title,
+		"session_file": sessionFile,
+	})
+	a.sendResult(ps, req.RequestID, summary, sessionID, true)
+}
+
+func (a *Adapter) sessionSummaryLocked(sr *sessionRuntime, user string) sessionSummary {
+	s := sr.cfg
+	policy := ""
+	if s.canApprove(user) {
+		policy = approvalRemote
+	}
+	return sessionSummary{
+		SessionID:      s.id,
+		WorkspaceID:    s.workspaceID,
+		Title:          s.title,
+		CanRunTools:    s.canRun(user),
+		ToolsEnabled:   s.canRun(user) && len(s.tools) > 0,
+		ShowThinking:   s.canSeeThinking(user),
+		ShowTools:      s.canSeeTools(user),
+		ApprovalPolicy: policy,
+		HasActiveRun:   sr.active != nil,
+	}
+}
+
+func (a *Adapter) sessionListLocked(user string) sessionListResult {
+	ordered := a.orderedSessionsLocked()
+	out := sessionListResult{Sessions: make([]sessionSummary, 0, len(ordered))}
+	for _, sr := range ordered {
+		if !sr.cfg.canRead(user) {
+			continue
+		}
+		out.Sessions = append(out.Sessions, a.sessionSummaryLocked(sr, user))
 	}
 	return out
 }
@@ -166,18 +357,32 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		return
 	}
 	sr.syncLocked(a)
-	snapshot := snapshotResult{
-		Messages: append([]Message(nil), sr.messages...),
-		LastSeq:  sr.ps.LastSeq,
-	}
-	if sr.active != nil && sr.active.pending.Len() > 0 {
+	rawMsgs := append([]Message(nil), sr.messages...)
+	if sr.active != nil && (sr.active.pending.Len() > 0 || sr.active.pendingThinking.Len() > 0 || len(sr.active.pendingToolCalls) > 0) {
 		// session.open and last_seq are read under the same lock, so an event
 		// accepted after this point has a sequence greater than LastSeq.
-		snapshot.Messages = append(snapshot.Messages, Message{
+		rawMsgs = append(rawMsgs, Message{
 			Role:      "assistant",
 			Text:      sr.active.pending.String(),
+			Thinking:  sr.active.pendingThinking.String(),
+			ToolCalls: append([]ToolCallSummary(nil), sr.active.pendingToolCalls...),
 			Timestamp: sr.active.pendingTimestamp,
 		})
+	}
+	visibleMsgs := filterMessagesForViewer(rawMsgs, sr.cfg.canSeeThinking(user), sr.cfg.canSeeTools(user))
+	snapshot := snapshotResult{
+		Messages: visibleMsgs,
+		LastSeq:  sr.ps.LastSeq,
+	}
+	if sr.active != nil && sr.cfg.canApprove(user) && (user == sr.cfg.owner || user == sr.active.userID) && len(sr.active.pendingUI) > 0 {
+		pending := make([]uiRequestData, 0, len(sr.active.pendingUI))
+		for _, pui := range sr.active.pendingUI {
+			if !pui.resolved {
+				pending = append(pending, pui.info)
+			}
+		}
+		sort.Slice(pending, func(i, j int) bool { return pending[i].UIID < pending[j].UIID })
+		snapshot.PendingUI = pending
 	}
 	if snapshot.Messages == nil {
 		snapshot.Messages = []Message{}
@@ -245,19 +450,130 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 		if e.Seq <= after {
 			continue
 		}
-		wire, err := json.Marshal(wireEvent{
-			Type:      "event",
-			SessionID: req.SessionID,
-			RunID:     e.RunID,
-			Seq:       e.Seq,
-			Kind:      e.Kind,
-			Data:      e.Data,
-		})
+		var wire []byte
+		var err error
+		if sr.cfg.canSeeEvent(user, e.Visibility) {
+			wire, err = json.Marshal(wireEvent{
+				Type:      "event",
+				SessionID: req.SessionID,
+				RunID:     e.RunID,
+				Seq:       e.Seq,
+				Kind:      e.Kind,
+				Data:      e.Data,
+			})
+		} else {
+			wire, err = json.Marshal(wireEvent{
+				Type:      "event",
+				SessionID: req.SessionID,
+				Seq:       e.Seq,
+				Kind:      kindSync,
+			})
+		}
 		if err != nil {
 			continue
 		}
-		a.enqueueLocked(ps, delivery{data: wire, requiresOnline: e.RequiresOnline, sessionID: req.SessionID})
+		a.enqueueLocked(ps, delivery{
+			data:           wire,
+			requiresOnline: e.RequiresOnline,
+			sessionID:      req.SessionID,
+			visibility:     e.Visibility,
+			seq:            e.Seq,
+		})
 	}
+}
+
+func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
+	user := ps.peer.UserID()
+	if req.SessionID == "" || req.RunID == "" || req.UIID == "" {
+		a.sendError(ps, req.RequestID, codeInvalidRequest)
+		return
+	}
+	a.mu.Lock()
+	if a.closed || !a.effectiveOnlineLocked() || !ps.peer.Allows(true) || ps.closed.Load() {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	sr, ok := a.sessions[req.SessionID]
+	if !ok || !sr.cfg.canApprove(user) {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	r := sr.runs[req.RunID]
+	if r == nil || r.terminal {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	if user != sr.cfg.owner && user != r.userID {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	pui := r.pendingUI[req.UIID]
+	if pui == nil || pui.resolved {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	reply := map[string]any{
+		"type": "extension_ui_response",
+		"id":   req.UIID,
+	}
+	status := "responded"
+	if req.Cancelled {
+		reply["cancelled"] = true
+		status = "cancelled"
+	} else {
+		switch pui.info.Method {
+		case "confirm":
+			if req.Confirmed == nil {
+				a.mu.Unlock()
+				a.sendError(ps, req.RequestID, codeInvalidRequest)
+				return
+			}
+			reply["confirmed"] = *req.Confirmed
+		case "select", "input", "editor":
+			if req.Value == nil {
+				a.mu.Unlock()
+				a.sendError(ps, req.RequestID, codeInvalidRequest)
+				return
+			}
+			reply["value"] = *req.Value
+		case "ask":
+			if req.Answers == nil {
+				a.mu.Unlock()
+				a.sendError(ps, req.RequestID, codeInvalidRequest)
+				return
+			}
+			reply["answers"] = req.Answers
+		default:
+			a.mu.Unlock()
+			a.sendError(ps, req.RequestID, codeUnavailable)
+			return
+		}
+	}
+	pui.resolved = true
+	if pui.timer != nil {
+		pui.timer.Stop()
+	}
+	delete(r.pendingUI, req.UIID)
+	a.appendEventVisibleLocked(sr, r.id, kindUIResolved, uiResolvedData{UIID: req.UIID, Status: status}, true, visApproval, r.userID)
+	a.mu.Unlock()
+
+	if err := r.writeJSON(reply); err != nil {
+		a.sendError(ps, req.RequestID, codeUnavailable)
+		return
+	}
+	a.emitObserve(map[string]any{
+		"type":       "ui.resolved",
+		"session_id": req.SessionID,
+		"run_id":     req.RunID,
+		"ui_id":      req.UIID,
+		"status":     status,
+	})
+	a.sendResult(ps, req.RequestID, uiRespondResult{UIID: req.UIID, Status: status}, req.SessionID, true)
 }
 
 func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
@@ -296,14 +612,17 @@ func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
 	}
 	status := r.status
 	transitioned := status == statusRunning
+	var uiCancels []uiCancelAction
 	if transitioned {
 		r.status = statusCancelling
 		r.stopReason = "requested"
 		r.stopFlag.Store(true)
+		uiCancels = a.cancelRunPendingUILocked(r, "cancelled")
 		status = statusCancelling
 	}
 	a.sendResultLocked(ps, req.RequestID, runStatusResult{RunID: r.id, Status: status}, req.SessionID, r.tools)
 	a.mu.Unlock()
+	flushUICancels(uiCancels)
 	if transitioned {
 		// Give upstream a moment to finish the current model step cleanly;
 		// authority loss and shutdown use an immediate kill instead.
@@ -397,6 +716,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		status:           statusRunning,
 		authorityUntil:   a.authorityUntil,
 		pendingTimestamp: a.now().UnixMilli(),
+		pendingUI:        make(map[string]*pendingUIRequest),
 		done:             make(chan struct{}),
 	}
 	discardRun := func() {
