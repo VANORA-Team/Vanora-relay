@@ -1,133 +1,429 @@
 # Vanora Relay
 
-原生手机 App 通过 WebRTC 连接电脑上的 Vanora。`relay` 提供设备发现、签名信令、STUN 和按会员权益授权的 TURN。`relay-identity` 独立运行，消费外部 OpenID Connect 服务，为端点公钥签发短期证书。模型 API Key 无需进入这两个进程。
+让原生手机 App 通过 WebRTC 安全连接本机电脑上的 [Vanora](https://github.com/VANORA-Team/vanora)。
 
-## 启动
+本仓库包含四个核心部分：独立身份签发服务（`relay-identity`）、信令与 STUN/TURN 中继服务（`relay`）、桌面端适配器（`vanora-desktop`），以及面向 Android / iOS 的移动端原生 SDK（`mobile` / `native`）。
 
-需要 Go 1.25 或更高版本。两个命令可分别部署。首次生成密钥时，把私钥保存到独立身份服务主机，只分发公钥给 relay 和端点。以下为 Bash 示例。
+- **模型密钥不上云**：模型 API Key 仅保留在本地电脑的 Vanora 配置中，无需进入 `relay` 或 `relay-identity`。
+- **独立身份信任根**：端点签名私钥仅由 `relay-identity` 持有，信令与权益服务均无法伪造端点身份。
+- **直连优先、按需中继**：优先通过 STUN 建立端到端直连，具备中继权益时自动支持 TURN 转发；AI 对话正文只在两端加密 DataChannel 内流转。
+
+> **快速导航**
+> [架构概览](#架构概览) · [部署服务端](#部署服务端) · [权益校验接口](#权益校验接口turn-授权) · [运行桌面适配器](#运行桌面适配器) · [接入手机应用](#接入手机应用) · [协议与接入参考](#协议与接入参考) · [测试与验证](#测试与验证) · [目录结构](#目录结构)
+
+---
+
+## 架构概览
+
+```mermaid
+flowchart LR
+    Mobile["原生手机 App (Android / iOS)"]
+    Desktop["vanora-desktop 桌面适配器"]
+    Vanora["本机 Vanora CLI"]
+    Identity["relay-identity 独立身份服务"]
+    IdP["外部 OIDC 提供方 (如 Keycloak)"]
+    Relay["relay 信令 + STUN/TURN"]
+    Entitlement["权益校验服务 (HTTP API)"]
+
+    Mobile -- "OIDC 登录 / 签发证书与租约" --> Identity
+    Desktop -- "OIDC 登录 / 签发证书与租约" --> Identity
+    Identity -- "验证 ID Token" --> IdP
+    Mobile -- "WSS 签名信令" --> Relay
+    Desktop -- "WSS 签名信令" --> Relay
+    Relay -- "校验手机账号中继权益" --> Entitlement
+    Mobile <-- "WebRTC DataChannel (直连或 TURN 加密转发)" --> Desktop
+    Desktop <-- "本机 RPC" --> Vanora
+```
+
+| 组件 | 职责 | 安全边界与说明 |
+| --- | --- | --- |
+| `relay-identity` | 对接外部 OIDC 提供方，为端点公钥签发短期证书与活性租约 | 独立部署，**唯一持有**端点签名私钥的组件 |
+| `relay` | 设备发现、签名信令路由、STUN 及按权益授权的 TURN | 仅持身份服务公钥，无签名私钥，不接触 AI 对话正文 |
+| `vanora-desktop` | 启动并托管本机 Vanora RPC 进程、执行会话与工具 ACL | 端点私钥存于系统凭据库；模型凭据沿用本机 Vanora 配置 |
+| `mobile` / `native` | 封装登录、信令、WebRTC 传输与会话恢复状态机 | 提供 Android AAR 与 iOS XCFramework 绑定 |
+
+更多设计细节：[架构设计与验收场景](DESIGN.md) · [身份协议与配置](internal/identity/README.md) · [STUN / TURN 详细配置](internal/ice/README.md)
+
+---
+
+## 部署服务端
+
+需要 **Go 1.25** 或更高版本。`relay-identity` 与 `relay` 可独立部署，以下均为 Bash 示例。
+
+### 1. 构建并生成身份签名密钥
 
 ```sh
 go build ./cmd/...
 go run ./cmd/relay-identity keygen -out identity-signing-key -public-out identity-signing-key.pub
 ```
 
-Vanora 的独立 OAuth 系统使用 Keycloak。将 `VANORA_IDENTITY_OIDC_ISSUER` 设为会员后端 `VANORA_OIDC_ISSUER` 使用的完整 realm URL。在同一 realm 单独注册原生应用 client，启用 Standard Flow 和 PKCE S256，登记精确回调地址，并允许 `openid offline_access`。端点在系统浏览器里登录。电脑无人值守续期要求 refresh grant 返回可验证的 ID token。
+> [!IMPORTANT]
+> 私钥（`identity-signing-key`）只保存在独立部署的 `relay-identity` 主机上（权限 `0600`），不要分发给信令、权益后端或客户端；仅将公钥（`identity-signing-key.pub`）分发给 `relay` 与各端点。
+
+### 2. 配置 OIDC 并启动 `relay-identity`
+
+`relay-identity` 支持任意符合标准 Discovery / JWKS 规范的 OIDC 提供方（如 Keycloak），配置需满足：
+
+- 单独注册一个原生应用 Client：启用 **Authorization Code（Standard Flow）** 与 **PKCE S256**，登记精确回调地址，并允许 `openid offline_access`。
+- 若配合外部权益服务校验中继权限，`VANORA_IDENTITY_OIDC_ISSUER` 须与权益服务使用的完整 issuer URL（例如 Keycloak 的完整 realm URL）一致，且同一账号在两个端应返回相同的 `sub`。
+- 端点在系统浏览器中完成登录；电脑端无人值守自动续期要求 OIDC 的 refresh grant 返回可验证的 ID token（如提供方不支持，可设置 `VANORA_IDENTITY_DISABLE_REFRESH=1`，证书过期后需重新登录）。
 
 ```sh
 export VANORA_IDENTITY_SIGNING_KEY_FILE=identity-signing-key
 export VANORA_IDENTITY_OIDC_ISSUER=https://auth.example.com/realms/vanora
 export VANORA_IDENTITY_OIDC_CLIENT_ID=vanora-native
 export VANORA_IDENTITY_OIDC_REDIRECT_URI=com.vanora.app:/oauth/callback
+
 go run ./cmd/relay-identity serve
 ```
 
-在信令主机提供 `RELAY_MEMBERSHIP_TOKEN`，与 Vanora_web 后端的 `RELAY_SERVICE_TOKEN` 使用同一个随机服务密钥（至少 32 字节）。`RELAY_MEMBERSHIP_URL` 需指向能访问内部权益路由的 HTTPS 后端，也支持本机回环 HTTP。Vanora_web 默认云网关只代理公共路径，跨主机部署时需为该内部路由配置私有 HTTPS 入口。`TURN_PUBLIC_IP` 填本机或 NAT 对外公布的可达 IPv4。开发时可用 `127.0.0.1`。
+全部环境变量（监听地址、TLS、证书 / 挑战 / 租约 TTL 等）见 [internal/identity/README.md](internal/identity/README.md)。
+
+### 3. 启动 `relay`（信令 + STUN / TURN）
+
+| 环境变量 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `RELAY_IDENTITY_PUBLIC_KEY` | 是 | — | `relay-identity keygen` 生成的 Ed25519 公钥（hex） |
+| `RELAY_MEMBERSHIP_URL` | 是 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP） |
+| `RELAY_MEMBERSHIP_TOKEN` | 是 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
+| `TURN_PUBLIC_IP` | 是 | — | 本机或 NAT 对外公布的可达 IPv4（本地开发可用 `127.0.0.1`） |
+| `RELAY_ADDR` | 否 | `127.0.0.1:8787` | 信令监听地址；非回环监听须配置 TLS |
+| `RELAY_TLS_CERT` / `RELAY_TLS_KEY` | 否 | — | 信令直接启用 TLS 时的证书与私钥（成对设置） |
+
+> [!NOTE]
+> `RELAY_MEMBERSHIP_URL` 指向的权益路由属于内部服务接口，跨主机部署时建议通过私有网络与 HTTPS 入口暴露。完整 `TURN_*` 配置（端口范围、绑定网卡、并发上限等）见 [internal/ice/README.md](internal/ice/README.md)。
 
 ```sh
 export RELAY_IDENTITY_PUBLIC_KEY="$(cat identity-signing-key.pub)"
-export RELAY_MEMBERSHIP_URL=https://membership.internal.example.com
+export RELAY_MEMBERSHIP_URL=https://entitlement.internal.example.com
+export RELAY_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
 export TURN_PUBLIC_IP=127.0.0.1
+
 go run ./cmd/relay
 ```
 
-| 服务 | 默认监听 | 部署要求 |
-| --- | --- | --- |
-| 信令 | `127.0.0.1:8787` | 代理 HTTPS 和 WebSocket 升级到 `/v1/signal`，或设置 `RELAY_ADDR`、`RELAY_TLS_CERT`、`RELAY_TLS_KEY` 直接监听 TLS。`GET /healthz` 为进程探针 |
-| 身份 | `127.0.0.1:8090` | 使用独立发布权限与 TLS。`GET /readyz` 检查外部 IdP discovery 和 JWKS 可用性。客户端通过 HTTPS 调用 `/v1/identity/*` |
-| STUN / TURN | `0.0.0.0:3478` UDP、TCP | 开放 `TURN_PORT` 对应的控制端口与 `TURN_RELAY_MIN_PORT` 至 `TURN_RELAY_MAX_PORT` 的 UDP 转发端口，默认 `49152–65535`。NAT 须保持公告端口映射。可分别设置 `TURN_BIND_IP` 和 `TURN_RELAY_BIND_IP` |
+### 4. 端口、探针与运维说明
 
-首版单实例、单区域。重启信令或 TURN 后端点重新上线并协商。访问者中继字节数随 grant 结束写入服务日志，部署时收集日志以保留历史。中继权益到期或撤权会关闭活跃 relay socket。公网部署默认过滤私网和回环目标。TURN 支持 UDP、TCP 控制传输和 UDP relay；只放行 HTTPS 的网络仍可能连不上。
+| 服务 | 默认监听 | 健康探针 | 部署与防火墙要求 |
+| --- | --- | --- | --- |
+| 信令（`relay`） | `127.0.0.1:8787` | `GET /healthz` | 经反代暴露 HTTPS 并支持 `/v1/signal` WebSocket 升级，或设置 `RELAY_ADDR`、`RELAY_TLS_CERT`、`RELAY_TLS_KEY` 直接监听 TLS |
+| 身份（`relay-identity`） | `127.0.0.1:8090` | `GET /readyz` | 独立发布权限与 TLS；`/readyz` 检查外部 IdP discovery 与 JWKS 可达性；客户端经 HTTPS 调用 `/v1/identity/*` |
+| STUN / TURN（`relay`） | `0.0.0.0:3478`（UDP / TCP） | — | 放行 `TURN_PORT`（UDP + TCP）及 `TURN_RELAY_MIN_PORT`–`TURN_RELAY_MAX_PORT` UDP 端口（默认 `49152–65535`）；NAT 需保持公告端口映射；可按需设置 `TURN_BIND_IP`、`TURN_RELAY_BIND_IP` |
 
-## 接入 Vanora_web
+**运行时行为与限制：**
 
-配套后端提供 `POST /internal/v1/relay/entitlement`。在 **Vanora_web API** 配置 `RELAY_SERVICE_TOKEN`。启用会员站的第一方 OIDC 配置后，权益查询按该 Keycloak realm 已有的 `(issuer, subject)` 账号绑定查找会员。缺少绑定或本地账号停用时拒绝中继。手机和会员站应收到同一账号的相同 `sub`，部署时用同一测试账号验证两个 client 的声明。其他身份提供者可通过 `RELAY_ISSUER_PROVIDERS` 把精确 issuer 映射到已绑定账号的 OAuth provider 名称或 slug。会员管理员需要在目标套餐上启用 `relay_allowed`，旧套餐迁移时默认关闭。
+- **单实例、单区域**：首版不跨节点同步状态；重启信令或 TURN 后，端点会自动重新上线并重新协商连接。
+- **流量统计日志**：访问者的中继字节数在 grant 结束时输出到服务日志，如需留存历史账单请在部署侧收集日志。
+- **实时断流**：中继权益到期或被撤权时，服务端会立即关闭对应活跃的 relay socket。
+- **目标地址过滤**：公网部署默认拒绝私网、回环、保留段等非公网单播目标 IP。
+- **受限网络说明**：TURN 支持 UDP / TCP 控制传输与 UDP relay；仅放行 HTTPS 的网络环境仍可能无法连通。
 
-信令使用服务 bearer 和 `{ "issuer": "…", "subject": "…" }` 查询**发起访问的手机账号**。返回 `data.relay_allowed` 和 `data.valid_until`（Unix 秒）。只有有效权益才发 TURN 凭证，接口超时、拒绝或无绑定都降级为 STUN。单个连接的 TURN 授权还受端点证书有效期约束。会员系统没有端点签名私钥。
+---
 
-## 原生端点接入顺序
+## 权益校验接口（TURN 授权）
 
-1. 在系统密钥存储生成并保留 Ed25519 端点密钥。按身份协议走 `/challenges`、`/enroll`，取得证书；用 `/lease` 取得最长 60 秒的签名租约。无人值守续期走 `/renew`，原子替换返回的刷新句柄。端点内置独立发布的身份公钥。[身份协议与配置](internal/identity/README.md)
-2. 打开 `wss://<relay>/v1/signal`。收到 `auth.challenge` 后用 `endpoint.OpenCredentials`、`Credentials.Login` 签名响应。收到 `auth.ok` 后，电脑调用 `Credentials.Online(name, guests)` 发布签名设备卡及本机允许访问的远程账号列表。收到 `device.registered` 即上线。权限变更马上更新本机 ACL 并重新发布完整列表。
-3. 手机发 `{"type":"devices.list"}`。`data` 为签名设备卡数组。用 `endpoint.VerifyDevice` 验证名称、设备 ID 和所属账号，展示可辨认的所有者。手机应按预期所有者选机，复连时使用已保存的设备 ID 与 owner。对初次邀请，主人账号须来自已验证的邀请或用户独立选择的身份；任意信令目录都能隐藏条目或展示攻击者自己的真实设备。
-4. 手机以 `Credentials.Request(deviceID, owner)` 请求连接。电脑用 `Credentials.Accept` 核验签名并再次检查本机 ACL。手机用 `Session.Accepted` 校验设备与新鲜连接随机数。任何一方被撤权或失联时，信令回送 `connect.closed`。错误事件为 `error`，其 `data` 为错误码。
-5. `ice.config.data` 是标准 `RTCIceServer[]`。两端同时收集服务器允许的候选，使用常规 ICE 优先级优先直连。有权限时允许中继先连通。移动网络切换时可以 ICE restart，保留业务会话 ID。实际切换时机由端点 WebRTC 栈决定。手机可发送 `ice.refresh` 加 `connection_id` 重新核验套餐与更新 grant，两次至少间隔 10 秒；建议每 30 秒及证书更新后刷新。
-6. 手机发 `rtc.offer`，电脑回 `rtc.answer`，双方可发 `rtc.candidate`。将 SDP 描述或 candidate JSON 交给 `Session.Seal`，接收方用 `Session.Open` 取得已验证的原文，之后才能调用 WebRTC 的远端描述或候选 API。连接 ID、端点身份、轮次、序号和电脑随机数共同绑定协商。单个连接的信令回调须串行处理。WebRTC DataChannel 使用可靠有序模式。[可运行的两端示例](internal/signal/integration_test.go)
-7. 在证书和租约到期前，向信令发 `auth.lease`，`data` 包含 `lease`，更新证书时同传 `certificate`。两端另在已验证的 DataChannel 内交换 `endpoint.LeaseProof`，通过 `Session.Access().Update` 验证自己直接取得的租约及对端租约。第一份证明核验完成前禁止业务消息。电脑检测到身份服务失联，立即调用 `AuthorityLost()`；新会话或带工具的访问使用 `Allows(now, true, resourceGranted)`，既有只读访问使用 `Allows(now, false, resourceGranted)`。每次调用、输出投递及授权截止时都执行检查。手机失联期间暂停交付远程输出，电脑按本地任务授权继续处理，重连后重新核验。
+`relay` 不内置订阅数据库，而是通过一个简单的 HTTP 内部接口向外部权益服务（可对接自建后端或会员系统）查询**发起访问的手机账号**是否允许使用 TURN 中继。
 
-非 Go 客户端按 `protocol/wire.go` 实现 Ed25519 签名。签名输入为 UTF-8 的八个字段，以 LF 连接，无尾换行：`vanora-relay/v1`、`type`、`connection_id`、`from`、`to`、十进制 `round`、十进制 `seq`、无填充 base64url 的 `body`。缺省数字写 `0`。`proof` 为无填充 base64url 的 Ed25519 签名。证书和签名设备卡的具体解析规则见 [端点代码](endpoint/session.go) 和 [设备发现](endpoint/discovery.go)。
+```http
+POST /internal/v1/relay/entitlement
+Authorization: Bearer <RELAY_MEMBERSHIP_TOKEN>
+Content-Type: application/json
+```
 
-## 电脑端业务边界
+> 若 `RELAY_MEMBERSHIP_URL` 未以 `/internal/v1/relay/entitlement` 结尾，客户端会自动拼接该路径；请求不跟随 HTTP 重定向。
 
-AI 正文在 DataChannel 和本机 Vanora 之间流转。`vanora-desktop` 启动本机 Vanora RPC 进程，按对话过滤请求和事件。手机断线时，已启动的任务继续运行。重新连接后，手机可以按事件序号续读，重发同一请求键也能取得原来的运行编号。桌面机上删除访客权限会取消该访客受影响的运行。[产品设计和验收场景](DESIGN.md)
+**请求体：**
 
-DataChannel 标签为 `vanora`。首帧是 `{ "certificate", "lease" }` 证明，续租时重复该帧。业务层使用 UTF-8 JSON。传输层直接发送不超过 16 KiB 的消息，更大的消息通过有序二进制分片传送，每个分片包含 `00 56 4e 46`、三个大端 uint32（消息编号、从零开始的分片索引、总片数）和有效载荷。单条业务消息上限为 64 MiB。手机请求携带 `type`、`request_id` 和该操作的字段。电脑响应携带相同的 `request_id`，`type` 为 `result` 或 `error`，分别返回 `data` 或 `code`。访问者身份取自已验证的连接。
+```json
+{
+  "issuer": "https://auth.example.com/realms/vanora",
+  "subject": "<OIDC sub>"
+}
+```
 
-| 请求 | 请求字段 | 成功返回的 `data` |
-| --- | --- | --- |
-| `session.list` | 无 | `sessions` 数组，每项含 `session_id`、`title`、访问者能否提交提示词的 `can_run_tools`、会话是否启用本地工具的 `tools_enabled` |
-| `session.open` | `session_id` | 当前可见的 `messages` 快照与 `last_seq`，两者对应同一时点 |
-| `run.start` | `session_id`、`text` | `run_id`。在请求历史保留期内，重发相同 `request_id` 和正文返回原运行编号，正文不同则返回 `request_conflict`。每个会话默认保留最近 4096 条请求 |
-| `run.cancel` | `session_id`、`run_id` | `run_id`、`status`。验证运行属于指定会话，且访问者有取消权限 |
-| `events.resume` | `session_id`、`after_seq` | `session_id`、`after_seq`。随后发送 `seq > after_seq` 的事件并接续实时流。游标超出保留范围时返回 `snapshot_required`，手机重新 `session.open` |
+**响应体：**
 
-例如，手机发送 `{"type":"run.start","request_id":"q7","session_id":"s2","text":"解释这次修改"}`，电脑返回 `{"type":"result","request_id":"q7","data":{"run_id":"r5"}}`。流式输出示例为 `{"type":"event","session_id":"s2","run_id":"r5","seq":18,"kind":"text.delta","data":{"text":"修改了"}}`。`seq` 是会话级递增整数，手机记录最后已应用的序号。`run.completed`、`run.cancelled` 或 `run.failed` 标志运行结束。不可见资源和未知资源统一返回 `unavailable`，工具权限不足返回 `tool_denied`。
+```json
+{
+  "success": true,
+  "data": {
+    "relay_allowed": true,
+    "valid_until": 1767225600
+  }
+}
+```
+
+`valid_until` 为权益截止的 Unix 秒级时间戳。实现与对接时须遵循以下约定：
+
+- **按访问者判权**：查询身份始终是发起连接的手机账号，电脑主人的中继权益不能替访客解锁 TURN。
+- **身份一致性**：权益后端按 `(issuer, subject)` 定位已绑定账号；请使用同一测试账号验证原生端与账户系统拿到的 `sub` 一致。
+- **显式授权**：建议由套餐或订阅状态显式控制 `relay_allowed`（默认关闭）。
+- **失败降级（Fail-Closed）**：只有返回 `success: true`、`relay_allowed: true` 且 `valid_until` 在未来时才会下发 TURN 凭证；账号未绑定、已停用、请求超时或接口报错均自动降级为仅 STUN。
+- **有效期叠加**：单次连接的 TURN 授权同时受端点证书有效期约束；权益服务不持有端点签名私钥。
+
+---
 
 ## 运行桌面适配器
 
+### 1. 构建与登录
+
 ```sh
 go build -o vanora-desktop ./cmd/vanora-desktop
-./vanora-desktop login -identity https://identity.example.com -ca identity-signing-key.pub
-./vanora-desktop serve -identity https://identity.example.com -ca identity-signing-key.pub -signal wss://relay.example.com/v1/signal -config desktop.json -name Office
+./vanora-desktop login \
+  -identity https://identity.example.com \
+  -ca identity-signing-key.pub
 ```
 
-Windows 可将输出名设为 `vanora-desktop.exe`。`login` 用系统浏览器打开独立 OAuth 服务，完成后输出 `user_id` 和 `device_id`。使用已注册的回环 HTTP 回调时，程序自动接收 `code` 和 `state`。使用自定义 URI 时，桌面命令可读取用户粘贴的完整回调地址。`-state-dir` 指定配置档目录，默认使用当前用户配置目录下的 `Vanora/relay`。身份密钥由系统凭据库保护。`serve` 需要以能访问该凭据库和项目的同一桌面用户身份运行。
+- **Windows**：可将产物名设为 `vanora-desktop.exe`。
+- **登录回调**：`login` 会打开系统浏览器完成 OIDC 登录，成功后输出 `user_id` 与 `device_id`。
+  - 配置为回环 HTTP 回调时，程序自动监听并接收 `code` 和 `state`。
+  - 配置为自定义 URI Scheme 时，按终端提示粘贴完整回调地址即可。
+- **凭据与状态目录**：可通过 `-state-dir` 指定配置档目录，默认位于当前用户配置目录下的 `Vanora/relay`。端点私钥保存在系统凭据库中，运行 `serve` 时须使用同一桌面用户身份。
 
-在本地 Vanora 中先创建会话。将下面示例中的路径替换为实际绝对路径，`owner` 填登录输出的 `user_id`，`working_dir` 与会话 JSONL 首行中的 `cwd` 一致。使用本机 Vanora 可执行文件时，可直接填入 `executable` 并省略 `launcher_args`。
+### 2. 编写会话配置（`desktop.json`）
+
+先在本地 Vanora 中创建会话，再编写配置文件，并将所有路径替换为本机真实**绝对路径**（Windows 可使用正斜杠 `/`）：
 
 ```json
 {
   "executable": "node",
-  "launcher_args": ["C:/apps/vanora/packages/coding-agent/dist/cli.js"],
-  "sessions": [{
-    "id": "project", "title": "项目对话",
-    "working_dir": "C:/work/project",
-    "session_file": "C:/work/sessions/project.jsonl",
-    "owner": "本机登录输出的 user_id",
-    "tools": [],
-    "users": [{"user_id": "访客手机登录后的 user_id", "read": true, "tools": false}]
-  }]
+  "launcher_args": ["/abs/path/to/vanora/packages/coding-agent/dist/cli.js"],
+  "sessions": [
+    {
+      "id": "project",
+      "title": "项目对话",
+      "working_dir": "/abs/path/to/project",
+      "session_file": "/abs/path/to/sessions/project.jsonl",
+      "owner": "本机登录输出的 user_id",
+      "tools": [],
+      "users": [
+        { "user_id": "访客手机登录后的 user_id", "read": true, "tools": false }
+      ]
+    }
+  ]
 }
 ```
 
-同账号手机使用主人权限。`users` 中只读访客可看历史和输出，`tools: true` 允许该访客提交提示词。会话级 `tools` 列表决定本机 Vanora 实际启用的工具，空数组运行纯文本对话。`serve` 每秒检查一次配置变更，配置解析失败时关闭服务。请原子替换配置文件。模型凭据沿用桌面用户的 Vanora 配置。
+**字段与权限说明：**
+
+- **`executable` / `launcher_args`**：直接运行本机 Vanora 可执行文件时，仅填 `executable` 并省略 `launcher_args`；通过 Node 启动 `dist/cli.js` 时按上方示例配置。
+- **`working_dir` / `session_file`**：均须为绝对路径，且 `working_dir` 必须与会话 JSONL 首行记录的 `cwd` 一致。
+- **`owner`**：填写 `login` 输出的 `user_id`；同账号手机自动享有主人权限。
+- **`users`**：显式授权的访客列表。`read: true` 允许读取历史与实时输出；`tools: true` 允许提交提示词（需同时开启 `read`）。
+- **`tools`**：决定本机 Vanora 实际启用的本地工具白名单；空数组 `[]` 表示运行纯文本对话。
+- **模型凭据**：沿用当前桌面用户本机的 Vanora 配置。
+
+### 3. 启动服务
+
+```sh
+./vanora-desktop serve \
+  -identity https://identity.example.com \
+  -ca identity-signing-key.pub \
+  -signal wss://relay.example.com/v1/signal \
+  -config desktop.json \
+  -name Office
+```
+
+> [!WARNING]
+> `serve` 每秒检查一次配置文件以热更新本地 ACL；若配置解析失败，服务会**立即退出**以防止权限漂移。更新配置时请使用原子替换（先写入临时文件再重命名）。
+
+---
 
 ## 接入手机应用
 
-Android 使用 JDK、Go、Python 3 及 Android SDK/NDK，在仓库根目录运行 `python native/android/build.py`。通过 `ANDROID_HOME` 指定 SDK，可通过 `ANDROID_NDK_HOME` 选择 NDK。将生成的 `dist/vanora-mobile.aar` 放入应用的 `libs/` 并添加 `implementation(files("libs/vanora-mobile.aar"))`。最低 API 23，包含 arm64-v8a 和 x86_64。宿主在 manifest 声明 `android.permission.INTERNET`，注册与 IdP 配置一致的回调，并在工作线程执行阻塞的 SDK 方法。
+### Android
+
+**环境依赖**：JDK、Go、Python 3、Android SDK（设置 `ANDROID_HOME`）及 NDK（可选设置 `ANDROID_NDK_HOME`）。
+
+在仓库根目录执行构建：
+
+```sh
+python native/android/build.py
+```
+
+输出 `dist/vanora-mobile.aar`（最低 API 23，包含 `arm64-v8a` 与 `x86_64`）：
+
+1. 将 AAR 放入应用模块的 `libs/`，在 Gradle 中添加 `implementation(files("libs/vanora-mobile.aar"))`。
+2. 在 `AndroidManifest.xml` 中声明 `android.permission.INTERNET`，并注册与 OIDC 提供方一致的回调 URI。
+3. 所有阻塞式 SDK 方法须在工作线程中调用。
 
 ```kotlin
 go.Seq.setContext(applicationContext)
 val store = org.vanora.relay.AndroidAccountStore(applicationContext, "primary")
 val client = mobile.Mobile.newClient(identityUrl, signalUrl, pinnedPublicKeyHex, store)
-val loginUrl = client.beginLogin() // 在系统浏览器打开
-// 回调处理程序提取 code 与 state
+
+// 1. 在系统浏览器打开登录地址，回调中提取 code 与 state
+val loginUrl = client.beginLogin()
 client.finishLogin(code, state)
-val directory = client.devices() // JSON 中包含已验证的 device_id、owner、name
+
+// 2. 获取已验证的设备目录并连接目标桌面端
+val directory = client.devices() // JSON 包含已验证的 device_id、owner、name
 client.connect(selectedDeviceID, selectedOwnerID)
+
+// 3. 列出会话并拉取快照
 val sessions = client.listSessions()
 val snapshot = client.openSession(selectedSessionID)
 ```
 
-iOS 可在安装 Xcode 的 macOS 上运行 `go install golang.org/x/mobile/cmd/gobind`，把 `$(go env GOPATH)/bin` 加入 `PATH`，再运行 `mkdir -p dist && go tool gomobile bind -target=ios,iossimulator -o dist/Mobile.xcframework ./mobile`。将 framework 和 `native/ios/VanoraAccountStore.h`、`.m` 加入 App target，启用 ARC，链接 Security.framework。用 `VanoraAccountStore` 作为 `MobileNewClient` 的 store，通过系统浏览器会话传回 `code` 和 `state`。
+### iOS
 
-发送前将 `Mobile.newRequestID()` 与提示词持久化，再调用 `startRun(sessionID, requestID, text)`。网络中断后重试同一条提示词须复用这两项。`nextEvent(timeoutMillis)` 只使用一个消费者；每次应用事件并保存快照后调用 `acknowledge(sessionID, seq)`。进程重启后用保存的设备与主人 ID 重新连接，调用 `resume(sessionID, lastAppliedSeq)`。收到 `snapshot_required` 后用 `openSession` 重建快照。退出账号配置档时关闭 `client`。
+在已安装 Xcode 的 macOS 上执行：
 
-## 验证
+```sh
+go install golang.org/x/mobile/cmd/gobind
+export PATH="$(go env GOPATH)/bin:$PATH"
+mkdir -p dist
+go tool gomobile bind -target=ios,iossimulator -o dist/Mobile.xcframework ./mobile
+```
+
+1. 将 `dist/Mobile.xcframework` 以及 [VanoraAccountStore.h](native/ios/VanoraAccountStore.h)、[VanoraAccountStore.m](native/ios/VanoraAccountStore.m) 加入 App Target。
+2. 启用 ARC，并链接 `Security.framework`。
+3. 以 `VanoraAccountStore` 作为 `MobileNewClient` 的 `store`，通过系统浏览器会话回调传入 `code` 与 `state`。
+
+### 客户端持久化与事件循环约定
+
+- **幂等提交提示词**：调用 `startRun(sessionID, requestID, text)` 前，先持久化 `Mobile.newRequestID()` 与提示词正文；网络中断后重试必须复用两者。
+- **单消费者事件循环**：`nextEvent(timeoutMillis)` 仅允许一个消费者读取；每应用一条事件并保存本地快照后，调用 `acknowledge(sessionID, seq)` 更新游标。
+- **进程重启恢复**：使用本地保存的 `device_id` 与 `owner` 重新 `connect`，再调用 `resume(sessionID, lastAppliedSeq)` 续读事件。
+- **快照重建**：收到 `snapshot_required` 时，调用 `openSession(sessionID)` 重新拉取完整快照。
+- **退出清理**：切换或退出账号配置档时，务必关闭 `client`。
+
+---
+
+## 协议与接入参考
+
+Go 项目可直接复用本仓库的 `endpoint` 与 `adapter/transport` 包；编写其他语言客户端时请参照下方规范。可运行的端到端参考实现见 [internal/signal/integration_test.go](internal/signal/integration_test.go)。
+
+### 1. 原生端点接入顺序
+
+1. **密钥与凭证**：在系统密钥存储生成并保留 Ed25519 私钥，内置独立发布的身份公钥。按 [身份协议](internal/identity/README.md) 调用 `/challenges`、`/enroll` 取得短期证书，调用 `/lease` 取得最长 60 秒的签名租约；无人值守续期调用 `/renew` 并原子替换返回的刷新句柄。
+2. **信令认证与电脑上线**：连接 `wss://<relay>/v1/signal`。收到 `auth.challenge` 后以 `endpoint.OpenCredentials` 与 `Credentials.Login` 签名响应；收到 `auth.ok` 后，电脑调用 `Credentials.Online(name, guests)` 发布签名设备卡及允许访问的远程账号列表，收到 `device.registered` 即上线。权限变更时须立即更新本机 ACL 并重新发布完整列表。
+3. **设备发现与可信选机**：手机发送 `{"type":"devices.list"}` 取得签名设备卡数组，通过 `endpoint.VerifyDevice` 校验名称、设备 ID 与所属账号并展示可辨认的所有者。复连时须使用已保存的 `device_id` 与 `owner`；初次接受分享时，主人账号须来自可信邀请或用户独立选择（任意信令目录都可能隐藏条目或展示攻击者自己的真实设备）。
+4. **发起与接受连接**：手机以 `Credentials.Request(deviceID, owner)` 请求连接；电脑以 `Credentials.Accept` 验签并再次核查本机 ACL；手机以 `Session.Accepted` 校验对端设备与新鲜连接随机数。任一方被撤权或失联时信令回送 `connect.closed`；协议错误事件为 `error`，`data` 为错误码。
+5. **ICE 选路与刷新**：`ice.config.data` 为标准 `RTCIceServer[]`。两端并行收集候选并按常规 ICE 优先级优先直连，有权益时允许中继先行连通。移动网络切换可触发 ICE restart 并保留业务会话 ID（切换时机由端点 WebRTC 栈决定）。手机可发送 `ice.refresh`（附 `connection_id`）重新核验权益并刷新 grant，两次至少间隔 **10 秒**，建议每 **30 秒**及证书更新后刷新。
+6. **签名 WebRTC 协商**：手机发送 `rtc.offer`，电脑回复 `rtc.answer`，双方互发 `rtc.candidate`。发送前须经 `Session.Seal` 签名，接收方须经 `Session.Open` 验签取得原文后再交给 WebRTC API。连接 ID、端点身份、轮次、序号与电脑随机数共同绑定本次协商。**单个连接的信令回调须串行处理**。DataChannel 使用可靠有序模式。
+7. **租约续期与访问控制**：
+   - 证书或租约到期前向信令发送 `auth.lease`（`data` 含 `lease`，换证时同传 `certificate`）。
+   - 两端在已验证的 DataChannel 内交换 `endpoint.LeaseProof`，通过 `Session.Access().Update` 同时验证本端直取租约与对端租约；**首份证明核验完成前禁止业务消息**。
+   - 电脑检测到身份服务失联立即调用 `AuthorityLost()`；新会话或带工具访问检查 `Allows(now, true, resourceGranted)`，既有只读访问检查 `Allows(now, false, resourceGranted)`；每次调用、输出投递及授权截止时均须校验。
+   - 手机失联期间暂停远程输出交付，电脑按本地授权继续执行任务，待手机重连后重新核验再恢复。
+
+### 2. 非 Go 客户端签名规范
+
+参照 [protocol/wire.go](protocol/wire.go)，Ed25519 签名输入由以下 8 个 UTF-8 字段以 LF（`\n`）连接而成，**末尾无换行**：
+
+```text
+vanora-relay/v1
+<type>
+<connection_id>
+<from>
+<to>
+<round>
+<seq>
+<body_base64url>
+```
+
+- `round`、`seq` 为十进制整数，缺省写 `0`。
+- `body` 与签名结果 `proof` 均使用**无填充 base64url** 编码。
+- 证书与签名设备卡的解析和校验规则见 [endpoint/session.go](endpoint/session.go) 与 [endpoint/discovery.go](endpoint/discovery.go)。
+
+### 3. DataChannel 帧格式与电脑端业务协议
+
+AI 正文只在加密 DataChannel 与本机 Vanora 之间流转。`vanora-desktop` 启动本机 Vanora RPC 进程并按会话隔离请求与事件：手机断线时已启动的任务继续运行，重连后可按事件序号 `seq` 续读、重发相同 `request_id` 取回原 `run_id`；桌面端撤回访客权限会取消该访客受影响的运行。完整设计见 [DESIGN.md](DESIGN.md)。
+
+#### 传输层与分片格式
+
+- **DataChannel 标签**：`vanora`（可靠有序）。
+- **首帧证明**：通道建立后的首帧必须是 `{ "certificate": "...", "lease": "..." }`，续租时重复发送。
+- **消息分片**：业务层使用 UTF-8 JSON，单条业务消息上限 **64 MiB**。
+  - `<= 16 KiB`：直接发送原始消息。
+  - `> 16 KiB`：按序拆分发送二进制分片，分片格式如下：
+
+```text
++---------------+-----------------+-----------------+-----------------+-----------+
+| Magic (4 B)   | MsgID (uint32)  | Index (uint32)  | Total (uint32)  | Payload   |
+| 00 56 4E 46   | 大端消息编号     | 大端索引(0起)    | 大端总片数       | 分片字节   |
++---------------+-----------------+-----------------+-----------------+-----------+
+```
+
+#### 业务请求与响应
+
+手机请求携带 `type`、`request_id` 及对应操作字段；电脑响应携带相同 `request_id`，`type` 为 `result`（返回 `data`）或 `error`（返回 `code`）。访问者身份取自已验证的连接。
+
+| `type` | 请求字段 | 成功返回 `data` | 说明 |
+| --- | --- | --- | --- |
+| `session.list` | 无 | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`（能否提交提示词）、`tools_enabled`（本机是否启用工具） |
+| `session.open` | `session_id` | `messages`、`last_seq` | 返回同一时点的可见消息快照与最新序号 |
+| `run.start` | `session_id`、`text` | `run_id` | 保留期内同 `request_id` + 同正文返回原 `run_id`，正文不同返回 `request_conflict`（每会话默认保留最近 4096 条） |
+| `run.cancel` | `session_id`、`run_id` | `run_id`、`status` | 校验运行归属该会话且访问者有取消权限 |
+| `events.resume` | `session_id`、`after_seq` | `session_id`、`after_seq` | 随后补发 `seq > after_seq` 的事件并接续实时流；游标超出保留窗口返回 `snapshot_required` |
+
+#### 交互示例与错误码
+
+```json
+// 1. 手机发起运行
+{"type":"run.start","request_id":"q7","session_id":"s2","text":"解释这次修改"}
+
+// 2. 电脑返回运行编号
+{"type":"result","request_id":"q7","data":{"run_id":"r5"}}
+
+// 3. 电脑推送流式事件（seq 为会话级递增整数）
+{"type":"event","session_id":"s2","run_id":"r5","seq":18,"kind":"text.delta","data":{"text":"修改了"}}
+```
+
+- **运行终止事件**：`kind` 为 `run.completed`、`run.cancelled` 或 `run.failed`。
+- **常见错误码**：
+  - `unavailable`：资源不可见、不存在或当前不可用（统一返回）。
+  - `tool_denied`：缺少提示词 / 工具执行权限（或触发被禁用的斜杠命令）。
+  - `request_conflict`：复用了已有 `request_id` 但正文不一致。
+  - `snapshot_required`：`events.resume` 游标超出保留范围，需重新 `session.open`。
+  - `snapshot_too_large`：会话快照体积超过上限。
+  - `invalid_request`：请求格式或参数无效。
+
+---
+
+## 测试与验证
+
+### 单元与集成测试
 
 ```sh
 go test ./...
 ```
 
-信令集成测试让两个 WebRTC 端点经过真实 WebSocket 完成设备发现、访客授权与签名协商。两个场景分别强制使用会员 TURN 和免费直连，检查最终选中的候选对，在加密 DataChannel 上验证双方租约、发送手机请求和电脑回复，并覆盖签名篡改、重放与撤权。身份测试用测试 IdP 覆盖注册与续期。TURN 测试创建真实 allocation，检查流量和终止时机。公网 NAT 兼容性需要部署到可达节点后用实际手机及家庭网络验收。
+- **信令与 WebRTC 集成**：两个真实 WebRTC 端点经 WebSocket 完成设备发现、访客授权与签名协商；分别覆盖强制 TURN 与免费直连，校验选中候选对、加密 DataChannel 租约验证、业务收发，以及签名篡改、重放与撤权。
+- **身份服务**：通过内置测试 IdP 覆盖注册、签发、续期与防重放。
+- **STUN / TURN**：创建真实 allocation，验证转发流量计数及到期 / 撤权断流时机。
+- **移动端与桌面端适配器**：`go test ./mobile` 覆盖两端适配器间的 WebSocket、WebRTC 与会话权限。
 
-`go test ./mobile` 覆盖两个适配器之间的 WebSocket、WebRTC 和会话权限。将 `VANORA_TEST_CLI` 设置为已构建的 Vanora `packages/coding-agent/dist/cli.js` 绝对路径，再运行 `go test ./mobile -run TestUpstreamVanoraRunAfterNetworkLoss -count=1`，可验证真实 CLI 在手机断线后继续处理提示词、补发事件以及重复请求去重。测试的模型响应来自本机 HTTP 测试服务。
+> [!NOTE]
+> 公网 NAT 穿透兼容性需在部署到公网可达节点后，使用真实手机蜂窝网络与家庭网络进行验收。
+
+### 真实 Vanora CLI 断线恢复验证
+
+将 `VANORA_TEST_CLI` 设为已构建的 Vanora `packages/coding-agent/dist/cli.js` 绝对路径（测试中的模型响应由本机 HTTP 测试服务模拟）：
+
+```sh
+VANORA_TEST_CLI=/abs/path/to/vanora/packages/coding-agent/dist/cli.js \
+  go test ./mobile -run TestUpstreamVanoraRunAfterNetworkLoss -count=1
+```
+
+该测试驱动真实 Vanora CLI 验证：手机断线后本机继续处理提示词、重连后按序号补发事件，以及重复 `request_id` 去重。
+
+---
+
+## 目录结构
+
+| 路径 | 说明 |
+| --- | --- |
+| `cmd/relay-identity` | 独立身份签发服务 CLI（`keygen`、`serve`） |
+| `cmd/relay` | 信令与 STUN/TURN 统一服务端进程 |
+| `cmd/vanora-desktop` | 桌面端适配器 CLI（`login`、`serve`） |
+| `internal/identity` | OIDC 验证、证书 / 租约签发与刷新句柄实现 |
+| `internal/signal` | WebSocket 信令集线器、设备目录与连接路由 |
+| `internal/ice` | STUN/TURN 服务端、grant 生命周期与流量计数 |
+| `internal/membership` | 外部权益校验 HTTP 客户端 |
+| `protocol` | 信令消息格式与 Ed25519 签名 / 验签 |
+| `endpoint` | 端点证书校验、设备卡验证、签名协商与租约访问控制 |
+| `adapter/` | 账号管理（`account`）、WebRTC 传输与分片（`transport`）、桌面业务适配器（`desktop`） |
+| `mobile` | 面向 `gomobile` 绑定的移动端 Go SDK |
+| `native/` | Android AAR 构建脚本与 Keystore 封装、iOS Keychain 封装 |
