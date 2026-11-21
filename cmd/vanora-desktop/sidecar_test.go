@@ -6,14 +6,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +23,7 @@ import (
 
 	"vanora-relay/adapter/account"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/identity/identitytest"
 )
 
 type memVault struct {
@@ -44,178 +43,163 @@ func (m *memVault) Save(v string) error {
 	return nil
 }
 
-func newLoopbackOIDC(t *testing.T) (*httptest.Server, *identity.Signer) {
+func newTestTokenAuthority(t *testing.T, validTokens map[string]string) (*httptest.Server, *identitytest.Authority) {
 	t.Helper()
-	idpPub, idpPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	auth := identitytest.NewAuthority(10 * time.Minute)
+	type chal struct {
+		id, nonce string
+		pub       ed25519.PublicKey
 	}
 	var mu sync.Mutex
-	codes := map[string]struct{ nonce, redirect, challenge string }{}
-	var idp *httptest.Server
+	challenges := map[string]chal{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"issuer":                                idp.URL,
-			"authorization_endpoint":                idp.URL + "/authorize",
-			"token_endpoint":                        idp.URL + "/token",
-			"jwks_uri":                              idp.URL + "/jwks",
-			"response_types_supported":              []string{"code"},
-			"subject_types_supported":               []string{"public"},
-			"id_token_signing_alg_values_supported": []string{"EdDSA"},
-		})
-	})
-	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "OKP", "crv": "Ed25519", "kid": "k1", "alg": "EdDSA", "use": "sig",
-			"x": base64.RawURLEncoding.EncodeToString(idpPub),
-		}}})
-	})
-	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		code := "code-12345"
-		mu.Lock()
-		codes[code] = struct{ nonce, redirect, challenge string }{
-			nonce: q.Get("nonce"), redirect: q.Get("redirect_uri"), challenge: q.Get("code_challenge"),
+	mux.HandleFunc("/v1/identity/challenges", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Purpose   string `json:"purpose"`
+			PublicKey string `json:"public_key"`
 		}
-		mu.Unlock()
-		redir, err := url.Parse(q.Get("redirect_uri"))
-		if err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"body_invalid"}`, 400)
 			return
 		}
-		v := redir.Query()
-		v.Set("code", code)
-		v.Set("state", q.Get("state"))
-		redir.RawQuery = v.Encode()
-		http.Redirect(w, r, redir.String(), http.StatusFound)
-	})
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		code := r.PostForm.Get("code")
+		pub, err := base64.RawURLEncoding.DecodeString(req.PublicKey)
+		if err != nil || len(pub) != ed25519.PublicKeySize {
+			http.Error(w, `{"error":"public_key_invalid"}`, 400)
+			return
+		}
+		var b1, b2 [16]byte
+		_, _ = rand.Read(b1[:])
+		_, _ = rand.Read(b2[:])
+		id := base64.RawURLEncoding.EncodeToString(b1[:])
+		nonce := base64.RawURLEncoding.EncodeToString(b2[:])
 		mu.Lock()
-		entry, ok := codes[code]
-		delete(codes, code)
+		challenges[id] = chal{id: id, nonce: nonce, pub: ed25519.PublicKey(pub)}
 		mu.Unlock()
-		sum := sha256.Sum256([]byte(r.PostForm.Get("code_verifier")))
-		if !ok || r.PostForm.Get("redirect_uri") != entry.redirect ||
-			base64.RawURLEncoding.EncodeToString(sum[:]) != entry.challenge {
-			http.Error(w, `{"error":"invalid_grant"}`, 400)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"challenge_id": id,
+			"nonce":        nonce,
+			"expires_at":   time.Now().Add(5 * time.Minute).Unix(),
+		})
+	})
+	mux.HandleFunc("/v1/identity/enroll", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChallengeID string `json:"challenge_id"`
+			Token       string `json:"token"`
+			Signature   string `json:"signature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"body_invalid"}`, 400)
+			return
+		}
+		mu.Lock()
+		c, ok := challenges[req.ChallengeID]
+		delete(challenges, req.ChallengeID)
+		mu.Unlock()
+		if !ok {
+			http.Error(w, `{"error":"challenge_invalid"}`, 400)
+			return
+		}
+		sig, err := base64.RawURLEncoding.DecodeString(req.Signature)
+		if err != nil || !ed25519.Verify(c.pub, identity.ProofMessage(c.id, c.nonce, "enroll", c.pub), sig) {
+			http.Error(w, `{"error":"proof_invalid"}`, 401)
+			return
+		}
+		sub, ok := validTokens[req.Token]
+		if !ok {
+			http.Error(w, `{"error":"token_rejected"}`, 401)
 			return
 		}
 		now := time.Now()
-		hdr, _ := json.Marshal(map[string]string{"alg": "EdDSA", "kid": "k1", "typ": "JWT"})
-		clm, _ := json.Marshal(map[string]any{
-			"iss": idp.URL, "sub": "sidecar-user", "aud": []string{"vanora-native"},
-			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": entry.nonce,
-		})
-		in := base64.RawURLEncoding.EncodeToString(hdr) + "." + base64.RawURLEncoding.EncodeToString(clm)
-		sig := ed25519.Sign(idpPriv, []byte(in))
+		cert, err := auth.IssueWithKey("https://auth.example.com/realms/vanora", sub, c.pub, now)
+		if err != nil {
+			http.Error(w, `{"error":"issue_failed"}`, 500)
+			return
+		}
+		p, err := identity.VerifyCertificate(cert, auth.PublicKey(), now)
+		if err != nil {
+			http.Error(w, `{"error":"issue_failed"}`, 500)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id_token": in + "." + base64.RawURLEncoding.EncodeToString(sig),
+			"certificate":    cert,
+			"device_id":      p.DeviceID,
+			"remote_user_id": p.RemoteUserID(),
+			"expires_at":     p.Expires.Unix(),
+			"renewable":      false,
 		})
 	})
-	idp = httptest.NewServer(mux)
-	t.Cleanup(idp.Close)
-
-	_, caPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := identity.NewSigner(caPriv, 10*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	idSvc, err := identity.NewServer(identity.Config{
-		OIDCIssuer:       idp.URL,
-		OIDCClientID:     "vanora-native",
-		OIDCRedirectURI:  "com.vanora.app:/oauth/callback",
-		OIDCRedirectURIs: []string{"http://127.0.0.1/oauth/callback"},
-		Signer:           signer,
-		HTTPClient:       idp.Client(),
+	mux.HandleFunc("/v1/identity/lease", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Certificate string `json:"certificate"`
+			Nonce       string `json:"nonce"`
+			Signature   string `json:"signature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"body_invalid"}`, 400)
+			return
+		}
+		now := time.Now()
+		p, err := identity.VerifyCertificate(req.Certificate, auth.PublicKey(), now)
+		if err != nil {
+			http.Error(w, `{"error":"certificate_invalid"}`, 400)
+			return
+		}
+		sig, err := base64.RawURLEncoding.DecodeString(req.Signature)
+		if err != nil || !ed25519.Verify(p.PublicKey, identity.LeaseProofMessage(req.Nonce, req.Certificate), sig) {
+			http.Error(w, `{"error":"proof_invalid"}`, 401)
+			return
+		}
+		lease, exp, err := auth.IssueLease(p, req.Certificate, req.Nonce, now, 45*time.Second)
+		if err != nil {
+			http.Error(w, `{"error":"lease_failed"}`, 500)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"lease":          lease,
+			"device_id":      p.DeviceID,
+			"remote_user_id": p.RemoteUserID(),
+			"issued_at":      now.Unix(),
+			"expires_at":     exp.Unix(),
+		})
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	authSrv := httptest.NewServer(idSvc.Handler())
-	t.Cleanup(authSrv.Close)
-	return authSrv, signer
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, auth
 }
 
-func TestLoginEphemeralLoopbackJSONMode(t *testing.T) {
-	authSrv, signer := newLoopbackOIDC(t)
-	caHex := hex.EncodeToString(signer.PublicKey())
+func TestLoginWithTokenStdinJSONMode(t *testing.T) {
+	authSrv, auth := newTestTokenAuthority(t, map[string]string{"valid-client-token": "sidecar-user"})
+	caHex := hex.EncodeToString(auth.PublicKey())
 	a, err := account.New(authSrv.URL, caHex, &memVault{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pr, pw := io.Pipe()
-	emitter := &jsonEmitter{out: pw}
-	done := make(chan error, 1)
-	go func() {
-		err := login(context.Background(), a, loginOptions{
-			redirectURI: "http://127.0.0.1:0/oauth/callback",
-			noBrowser:   true,
-			emitter:     emitter,
-		})
-		_ = pw.Close()
-		done <- err
-	}()
-
-	scanner := bufio.NewScanner(pr)
-	var sawOK bool
-	for scanner.Scan() {
-		var ev map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
-			t.Fatalf("invalid jsonl: %v", err)
-		}
-		switch ev["type"] {
-		case "login.url":
-			authURL, _ := ev["url"].(string)
-			cb, _ := ev["callback"].(string)
-			if !strings.HasPrefix(cb, "http://127.0.0.1:") || strings.HasPrefix(cb, "http://127.0.0.1:0/") {
-				t.Fatalf("expected ephemeral bound loopback callback, got %q", cb)
-			}
-			// Simulate the browser completing OIDC and following redirect to loopback listener.
-			resp, err := http.Get(authURL)
-			if err != nil {
-				t.Fatalf("follow auth url: %v", err)
-			}
-			resp.Body.Close()
-		case "login.ok":
-			if ev["user_id"] == "" || ev["device_id"] == "" {
-				t.Fatalf("missing ids in login.ok: %v", ev)
-			}
-			sawOK = true
-		}
-	}
-	if err := <-done; err != nil {
+	var out bytes.Buffer
+	err = login(context.Background(), a, loginOptions{
+		tokenStdin: true,
+		in:         strings.NewReader("valid-client-token\n"),
+		emitter:    &jsonEmitter{out: &out},
+	})
+	if err != nil {
 		t.Fatalf("login failed: %v", err)
 	}
-	if !sawOK {
-		t.Fatal("missing login.ok event")
+	var ev map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &ev); err != nil {
+		t.Fatalf("invalid jsonl: %v (%s)", err, out.String())
+	}
+	if ev["type"] != "login.ok" || ev["user_id"] == "" || ev["device_id"] == "" {
+		t.Fatalf("unexpected login.ok: %v", ev)
 	}
 }
 
 func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
-	if os.Getenv("VANORA_SIDECAR_TEST_HELPER") == "1" {
-		if err := run(os.Args[1:]); err != nil {
-			os.Stderr.WriteString(err.Error() + "\n")
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
+	authSrv, auth := newTestTokenAuthority(t, map[string]string{
+		"sidecar-token-1": "sidecar-user",
+		"sidecar-token-2": "sidecar-user",
+	})
+	caHex := hex.EncodeToString(auth.PublicKey())
 
-	// Build a tiny config with 0 sessions and test `whoami -json` with -ca-hex.
-	_, caPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := identity.NewSigner(caPriv, 10*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	binName := "vanora-desktop-test"
 	if runtime.GOOS == "windows" {
@@ -228,7 +212,7 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 	}
 
 	stateDir := filepath.Join(dir, "state")
-	cmd := exec.Command(bin, "whoami", "-identity", "http://127.0.0.1:8090", "-ca-hex", hex.EncodeToString(signer.PublicKey()), "-state-dir", stateDir, "-json")
+	cmd := exec.Command(bin, "whoami", "-identity", authSrv.URL, "-ca-hex", caHex, "-state-dir", stateDir, "-json")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("whoami failed: %v\n%s", err, out)
@@ -241,37 +225,12 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 		t.Fatalf("unexpected whoami: %v", status)
 	}
 
-	// Verify serve -sidecar exits cleanly on stdin EOF after emitting ready + status.
-	authSrv, signer2 := newLoopbackOIDC(t)
-	caHex2 := hex.EncodeToString(signer2.PublicKey())
-	a, err := account.New(authSrv.URL, caHex2, &memVault{})
+	// Enroll using in-memory vault and exercise serve -sidecar control loop.
+	a, err := account.New(authSrv.URL, caHex, &memVault{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Complete enrollment in-memory and test serve() directly with a synthetic config.
-	pr, pw := io.Pipe()
-	doneLogin := make(chan error, 1)
-	go func() {
-		err := login(context.Background(), a, loginOptions{
-			redirectURI: "http://127.0.0.1:0/oauth/callback",
-			noBrowser:   true,
-			emitter:     &jsonEmitter{out: pw},
-		})
-		_ = pw.Close()
-		doneLogin <- err
-	}()
-	sc := bufio.NewScanner(pr)
-	for sc.Scan() {
-		var ev map[string]any
-		if json.Unmarshal(sc.Bytes(), &ev) == nil && ev["type"] == "login.url" {
-			resp, err := http.Get(ev["url"].(string))
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-		}
-	}
-	if err := <-doneLogin; err != nil {
+	if err := a.Enroll(context.Background(), "sidecar-token-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,12 +250,12 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 	outR, outW := io.Pipe()
 	serveDone := make(chan error, 1)
 	go func() {
-		err := serve(context.Background(), a, signer2.PublicKey(), "ws://127.0.0.1:1/v1/signal", "SidecarHost", cfgPath, filepath.Join(dir, "sidecar-state"), true, &jsonEmitter{out: outW})
+		err := serve(context.Background(), a, auth.PublicKey(), "ws://127.0.0.1:1/v1/signal", "SidecarHost", cfgPath, filepath.Join(dir, "sidecar-state"), true, &jsonEmitter{out: outW})
 		_ = outW.Close()
 		serveDone <- err
 	}()
 
-	var sawReady, sawStatus, sawShutdown bool
+	var sawReady, sawAuthOK, sawStatus, sawShutdown bool
 	outScanner := bufio.NewScanner(outR)
 	for outScanner.Scan() {
 		var ev map[string]any
@@ -306,6 +265,9 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 		switch ev["type"] {
 		case "ready":
 			sawReady = true
+			_, _ = inW.Write([]byte("{\"type\":\"auth.token\",\"token\":\"sidecar-token-2\"}\n"))
+		case "auth.ok":
+			sawAuthOK = true
 			_, _ = inW.Write([]byte("{\"type\":\"status\"}\n"))
 		case "status":
 			sawStatus = true
@@ -317,7 +279,7 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 	if err := <-serveDone; err != nil {
 		t.Fatalf("sidecar serve failed: %v", err)
 	}
-	if !sawReady || !sawStatus || !sawShutdown {
-		t.Fatalf("sidecar lifecycle incomplete: ready=%v status=%v shutdown=%v", sawReady, sawStatus, sawShutdown)
+	if !sawReady || !sawAuthOK || !sawStatus || !sawShutdown {
+		t.Fatalf("sidecar lifecycle incomplete: ready=%v auth_ok=%v status=%v shutdown=%v", sawReady, sawAuthOK, sawStatus, sawShutdown)
 	}
 }

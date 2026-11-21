@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/coder/websocket v1.8.14
-	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/gofrs/flock v0.12.1
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v4 v4.1.4
@@ -14,7 +13,6 @@ require (
 
 require (
 	github.com/danieljoos/wincred v1.2.3 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.4 // indirect
@@ -39,7 +37,6 @@ require (
 	golang.org/x/mobile v0.0.0-20260217195705-b56b3793a9c4 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

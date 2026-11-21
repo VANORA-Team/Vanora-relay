@@ -6,7 +6,7 @@ Go 项目可直接复用本仓库的 `endpoint` 与 `adapter/transport` 包；�
 
 ## 1. 原生端点接入顺序
 
-1. **密钥与凭证**：在系统密钥存储生成并保留 Ed25519 私钥，内置独立发布的身份公钥。按 [身份协议](../internal/identity/README.md) 调用 `/challenges`、`/enroll` 取得短期证书，调用 `/lease` 取得最长 60 秒的签名租约；无人值守续期调用 `/renew` 并原子替换返回的刷新句柄。
+1. **密钥与凭证**：在系统密钥存储生成并保留 Ed25519 私钥，内置外部身份后端的公钥。按 [外部身份协议](../internal/identity/README.md) 使用宿主客户端现有认证令牌调用 `/challenges`、`/enroll` 取得短期证书，调用 `/lease` 取得最长 60 秒的签名租约；续期调用 `/renew`（支持直接携带宿主实时令牌或可选刷新句柄）。
 2. **信令认证与电脑上线**：连接 `wss://<relay>/v1/signal`。收到 `auth.challenge` 后以 `endpoint.OpenCredentials` 与 `Credentials.Login` 签名响应；收到 `auth.ok` 后，电脑调用 `Credentials.Online(name, guests)` 发布签名设备卡及允许访问的远程账号列表，收到 `device.registered` 即上线。权限变更时须立即更新本机 ACL 并重新发布完整列表。
 3. **设备发现与可信选机**：手机发送 `{"type":"devices.list"}` 取得签名设备卡数组，通过 `endpoint.VerifyDevice` 校验名称、设备 ID 与所属账号并展示可辨认的所有者。复连时须使用已保存的 `device_id` 与 `owner`；初次接受分享时，主人账号须来自可信邀请或用户独立选择（任意信令目录都可能隐藏条目或展示攻击者自己的真实设备）。
 4. **发起与接受连接**：手机以 `Credentials.Request(deviceID, owner)` 请求连接；电脑以 `Credentials.Accept` 验签并再次核查本机 ACL；手机以 `Session.Accepted` 校验对端设备与新鲜连接随机数。任一方被撤权或失联时信令回送 `connect.closed`；协议错误事件为 `error`，`data` 为错误码。

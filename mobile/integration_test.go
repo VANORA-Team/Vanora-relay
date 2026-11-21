@@ -26,6 +26,7 @@ import (
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/identity/identitytest"
 	"vanora-relay/internal/membership"
 	signalserver "vanora-relay/internal/signal"
 )
@@ -137,11 +138,11 @@ func runFakeMobileCLI() error {
 type testIdentity struct {
 	creds   *endpoint.Credentials
 	key     ed25519.PrivateKey
-	signer  *identity.Signer
+	signer  *identitytest.Authority
 	subject string
 }
 
-func issue(t *testing.T, s *identity.Signer, subject string) *testIdentity {
+func issue(t *testing.T, s *identitytest.Authority, subject string) *testIdentity {
 	t.Helper()
 	_, k, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
@@ -152,7 +153,7 @@ func issue(t *testing.T, s *identity.Signer, subject string) *testIdentity {
 }
 func (s *testIdentity) Current(context.Context) (*endpoint.Credentials, endpoint.LeaseProof, error) {
 	now := time.Now()
-	cert, err := s.signer.Issue("https://issuer.example", s.subject, s.key.Public().(ed25519.PublicKey), now)
+	cert, err := s.signer.IssueWithKey("https://issuer.example", s.subject, s.key.Public().(ed25519.PublicKey), now)
 	if err != nil {
 		return nil, endpoint.LeaseProof{}, err
 	}
@@ -202,7 +203,7 @@ func exerciseAdapters(t *testing.T, cli string) {
 	dir := t.TempDir()
 	_, ca, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	signer, err := identity.NewSigner(ca, 10*time.Minute)
+	signer, err := identitytest.NewAuthorityWithKey(ca, 10*time.Minute)
 	must(t, err)
 	host := issue(t, signer, "owner")
 	phone := issue(t, signer, "visitor")
@@ -373,7 +374,7 @@ func TestMobileEmbeddedCapabilities(t *testing.T) {
 
 	_, ca, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	signer, err := identity.NewSigner(ca, 10*time.Minute)
+	signer, err := identitytest.NewAuthorityWithKey(ca, 10*time.Minute)
 	must(t, err)
 	// Same account on desktop and mobile (owner flow).
 	host := issue(t, signer, "owner")

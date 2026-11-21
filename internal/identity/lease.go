@@ -31,50 +31,6 @@ type Lease struct {
 	Expires time.Time
 }
 
-// IssueLease signs a liveness lease for an already verified principal. The
-// lifetime is capped at MaxLeaseLifetime and at the certificate's own expiry,
-// so a lease can never outlive the identity it attests.
-func (s *Signer) IssueLease(principal Principal, certificate, nonce string, now time.Time, ttl time.Duration) (string, time.Time, error) {
-	if ttl <= 0 || ttl > MaxLeaseLifetime {
-		return "", time.Time{}, fmt.Errorf("%w: lease ttl %s must be in (0, %s]", ErrCertificateLifetime, ttl, MaxLeaseLifetime)
-	}
-	if !validNonce(nonce) {
-		return "", time.Time{}, fmt.Errorf("%w: nonce must be 16..64 base64url bytes", ErrLeaseMalformed)
-	}
-	remoteUserID := principal.RemoteUserID()
-	if principal.DeviceID == "" || principal.Subject == "" {
-		return "", time.Time{}, fmt.Errorf("%w: incomplete principal", ErrLeaseMalformed)
-	}
-	if certificate == "" || len(certificate) > maxCertificateSize {
-		return "", time.Time{}, fmt.Errorf("%w: certificate binding", ErrLeaseMalformed)
-	}
-	now = now.UTC()
-	expires := now.Add(ttl)
-	if !principal.Expires.IsZero() && principal.Expires.Before(expires) {
-		expires = principal.Expires
-	}
-	if !expires.After(now) {
-		return "", time.Time{}, fmt.Errorf("%w: certificate already expired", ErrLeaseExpired)
-	}
-	hash := sha256.Sum256([]byte(certificate))
-	header := certificateHeader{Alg: "EdDSA", Typ: "vanl+v1", Kid: s.keyID}
-	claims := leaseClaims{
-		Version:         leaseVersion,
-		Audience:        CertificateAudience,
-		RemoteUserID:    remoteUserID,
-		DeviceID:        principal.DeviceID,
-		CertificateHash: base64.RawURLEncoding.EncodeToString(hash[:]),
-		Nonce:           nonce,
-		IssuedAt:        now.Unix(),
-		ExpiresAt:       expires.Unix(),
-	}
-	token, err := signToken(LeasePrefix, s.privateKey, header, claims)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	return token, expires, nil
-}
-
 type leaseClaims struct {
 	Version         int    `json:"v"`
 	Audience        string `json:"aud"`
@@ -109,7 +65,7 @@ func VerifyLease(token string, trusted ed25519.PublicKey, now time.Time) (Lease,
 	if !validDeviceID(claims.DeviceID) {
 		return Lease{}, fmt.Errorf("%w: device id", ErrLeaseMalformed)
 	}
-	if _, err := base64.RawURLEncoding.DecodeString(claims.CertificateHash); err != nil {
+	if _, err := base64.RawURLEncoding.Strict().DecodeString(claims.CertificateHash); err != nil {
 		return Lease{}, fmt.Errorf("%w: certificate hash", ErrLeaseMalformed)
 	}
 	if !validNonce(claims.Nonce) {
@@ -187,14 +143,13 @@ func validNonce(nonce string) bool {
 	if len(nonce) < 22 || len(nonce) > 128 {
 		return false
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(nonce)
 	if err != nil {
 		return false
 	}
 	return len(decoded) >= 16 && len(decoded) <= 64
 }
 
-// cutPrefix and toUpperASCII avoid pulling extra allocations into hot paths.
 func cutPrefix(s, prefix string) (string, bool) {
 	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
 		return s, false

@@ -89,15 +89,33 @@ func newClient(signalURL string, source transport.IdentitySource) *Client {
 	return c
 }
 
-func (c *Client) BeginLogin() (string, error) { return c.identity.Begin(c.ctx) }
-
-// BeginLoginWithRedirect starts browser enrollment with an explicit allowlisted
-// callback URI (such as a custom app scheme or universal link).
-func (c *Client) BeginLoginWithRedirect(redirectURI string) (string, error) {
-	return c.identity.BeginWithRedirect(c.ctx, redirectURI)
+// Enroll binds this mobile endpoint's key to the user represented by the host
+// app's existing authentication token.
+func (c *Client) Enroll(token string) error {
+	if c.identity == nil {
+		return errors.New("no account configured")
+	}
+	return c.identity.Enroll(c.ctx, token)
 }
 
-func (c *Client) FinishLogin(code, state string) error { return c.identity.Finish(c.ctx, code, state) }
+// UpdateToken supplies a refreshed host app authentication token for automatic
+// certificate renewal without re-running enrollment. If a desktop was selected
+// and disconnected due to credential expiry, background recovery is triggered.
+func (c *Client) UpdateToken(token string) error {
+	if c.identity == nil {
+		return errors.New("no account configured")
+	}
+	if err := c.identity.UpdateToken(token); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	shouldRetry := c.device != "" && c.peer == nil
+	c.mu.Unlock()
+	if shouldRetry {
+		signal(c.retry)
+	}
+	return nil
+}
 func (c *Client) UserID() string {
 	if c.identity == nil {
 		return ""

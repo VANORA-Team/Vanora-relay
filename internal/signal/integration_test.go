@@ -18,6 +18,7 @@ import (
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/identity/identitytest"
 	"vanora-relay/internal/membership"
 	"vanora-relay/internal/signal"
 	"vanora-relay/protocol"
@@ -52,12 +53,12 @@ func (c *client) read(t *testing.T, expect string) protocol.Message {
 	}
 	return m
 }
-func login(t *testing.T, ctx context.Context, url, role, subject string, signer *identity.Signer) *client {
+func login(t *testing.T, ctx context.Context, url, role, subject string, signer *identitytest.Authority) *client {
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	check(t, err)
 	now := time.Now()
-	cert, err := signer.Issue("https://issuer.example", subject, pub, now)
+	cert, err := signer.IssueWithKey("https://issuer.example", subject, pub, now)
 	check(t, err)
 	p, err := identity.VerifyCertificate(cert, signer.PublicKey(), now)
 	check(t, err)
@@ -110,7 +111,7 @@ func exerciseGuestWebRTC(t *testing.T, entitled bool) {
 	t.Cleanup(func() { network.Close() })
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	check(t, err)
-	signer, err := identity.NewSigner(key, time.Minute*10)
+	signer, err := identitytest.NewAuthorityWithKey(key, time.Minute*10)
 	check(t, err)
 	token := strings.Repeat("a", 40)
 	billing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

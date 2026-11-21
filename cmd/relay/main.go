@@ -23,7 +23,7 @@ import (
 func run() error {
 	key, err := identity.ParsePublicKey([]byte(strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY"))))
 	if err != nil || len(key) != ed25519.PublicKeySize {
-		return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the hex Ed25519 public key from relay-identity keygen")
+		return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the Ed25519 public key (hex or base64) of the identity authority")
 	}
 	billing := &membership.Client{URL: os.Getenv("RELAY_MEMBERSHIP_URL"), Token: os.Getenv("RELAY_MEMBERSHIP_TOKEN")}
 	if billing.URL == "" || len(billing.Token) < 32 {

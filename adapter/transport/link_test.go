@@ -17,6 +17,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/identity/identitytest"
 	"vanora-relay/protocol"
 )
 
@@ -39,7 +40,7 @@ func candidateLink(t *testing.T, c *Client) *link {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer, err := identity.NewSigner(ca, 10*time.Minute)
+	signer, err := identitytest.NewAuthorityWithKey(ca, 10*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func candidateLink(t *testing.T, c *Client) *link {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cert, err := signer.Issue("https://issuer.example", subject, pub, now)
+		cert, err := signer.IssueWithKey("https://issuer.example", subject, pub, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +206,7 @@ func testLeaseIdentity(t *testing.T) (*endpoint.Credentials, endpoint.LeaseProof
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer, err := identity.NewSigner(ca, 5*time.Minute)
+	signer, err := identitytest.NewAuthorityWithKey(ca, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func testLeaseIdentity(t *testing.T) (*endpoint.Credentials, endpoint.LeaseProof
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err := signer.Issue("https://issuer.example", "phone", pub, now)
+	cert, err := signer.IssueWithKey("https://issuer.example", "phone", pub, now)
 	if err != nil {
 		t.Fatal(err)
 	}

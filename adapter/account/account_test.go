@@ -10,7 +10,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/identity/identitytest"
 )
 
 // memStore is an in-memory Store that records calls. Test code only.
@@ -71,47 +71,51 @@ func (c *fakeClock) Advance(d time.Duration) {
 type fakeChallenge struct {
 	id        string
 	nonce     string
-	state     string
 	publicKey ed25519.PublicKey
 	purpose   string
 	expires   time.Time
 }
 
 type fakeConfig struct {
-	redirect      bool
-	enrollStatus  int
-	enrollCode    string
-	renewStatus   int
-	renewCode     string
-	renewSubject  string
-	enrollSubject string
-	badLease      bool
-	leaseDevice   string
-	renewable     bool
+	redirect       bool
+	enrollStatus   int
+	enrollCode     string
+	renewStatus    int
+	renewCode      string
+	tokenStatus    int
+	tokenCode      string
+	acceptedTokens map[string]string // token -> subject; nil accepts any token as default subject
+	renewSubject   string
+	enrollSubject  string
+	badLease       bool
+	leaseDevice    string
+	renewable      bool
+	rotateOnDirect bool
 }
 
 // fakeAuthority implements the enrollment, lease and renewal endpoints with
-// the real identity.Signer, so certificates and leases verify exactly as the
-// production authority's would.
+// identitytest.Authority so certificates and leases verify identically to production.
 type fakeAuthority struct {
 	t         *testing.T
 	clock     *fakeClock
-	signer    *identity.Signer
-	untrusted *identity.Signer
+	authority *identitytest.Authority
+	untrusted *identitytest.Authority
 	server    *httptest.Server
 	issuer    string
 	subject   string
 	leaseTTL  time.Duration
 
-	mu         sync.Mutex
-	config     fakeConfig
-	challenges map[string]*fakeChallenge
-	handles    map[string]ed25519.PublicKey
-	handleSeq  int
-	challengeN int
-	enrollN    int
-	leaseN     int
-	renewN     int
+	mu           sync.Mutex
+	config       fakeConfig
+	challenges   map[string]*fakeChallenge
+	handles      map[string]ed25519.PublicKey
+	handleSeq    int
+	challengeN   int
+	enrollN      int
+	leaseN       int
+	renewN       int
+	directRenewN int
+	handleRenewN int
 }
 
 func newFakeAuthority(t *testing.T) *fakeAuthority {
@@ -120,22 +124,22 @@ func newFakeAuthority(t *testing.T) *fakeAuthority {
 	if err != nil {
 		t.Fatalf("generate authority key: %v", err)
 	}
-	signer, err := identity.NewSigner(privateKey, 10*time.Minute)
+	auth, err := identitytest.NewAuthorityWithKey(privateKey, 10*time.Minute)
 	if err != nil {
-		t.Fatalf("new signer: %v", err)
+		t.Fatalf("new authority: %v", err)
 	}
 	_, otherKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate second key: %v", err)
 	}
-	untrusted, err := identity.NewSigner(otherKey, 10*time.Minute)
+	untrusted, err := identitytest.NewAuthorityWithKey(otherKey, 10*time.Minute)
 	if err != nil {
-		t.Fatalf("new untrusted signer: %v", err)
+		t.Fatalf("new untrusted authority: %v", err)
 	}
 	f := &fakeAuthority{
 		t:          t,
 		clock:      newFakeClock(time.Now().UTC().Truncate(time.Second)),
-		signer:     signer,
+		authority:  auth,
 		untrusted:  untrusted,
 		issuer:     "https://idp.example",
 		subject:    "user-42",
@@ -155,7 +159,7 @@ func newFakeAuthority(t *testing.T) *fakeAuthority {
 }
 
 func (f *fakeAuthority) caHex() string {
-	return hex.EncodeToString(f.signer.PublicKey())
+	return hex.EncodeToString(f.authority.PublicKey())
 }
 
 func (f *fakeAuthority) set(fn func(*fakeConfig)) {
@@ -176,6 +180,12 @@ func (f *fakeAuthority) calls() (challenges, enrolls, leases, renews int) {
 	return f.challengeN, f.enrollN, f.leaseN, f.renewN
 }
 
+func (f *fakeAuthority) renewBreakdown() (direct, handle int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.directRenewN, f.handleRenewN
+}
+
 func (f *fakeAuthority) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	cfg := f.cfg()
 	if cfg.redirect {
@@ -187,9 +197,8 @@ func (f *fakeAuthority) handleChallenge(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
-		Purpose     string `json:"purpose"`
-		PublicKey   string `json:"public_key"`
-		RedirectURI string `json:"redirect_uri"`
+		Purpose   string `json:"purpose"`
+		PublicKey string `json:"public_key"`
 	}
 	if !decodeBody(f.t, w, r, &req) {
 		return
@@ -213,44 +222,29 @@ func (f *fakeAuthority) handleChallenge(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "random_failed")
 		return
 	}
-	state, err := randomToken()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "random_failed")
-		return
-	}
 	now := f.clock.Now()
 	f.mu.Lock()
 	f.challengeN++
 	f.challenges[id] = &fakeChallenge{
 		id:        id,
 		nonce:     nonce,
-		state:     state,
 		publicKey: ed25519.PublicKey(publicKey),
 		purpose:   req.Purpose,
 		expires:   now.Add(5 * time.Minute),
 	}
 	f.mu.Unlock()
 
-	authURL := "https://idp.example/authorize?state=" + url.QueryEscape(state)
-	if req.RedirectURI != "" {
-		authURL += "&redirect_uri=" + url.QueryEscape(req.RedirectURI)
-	}
 	writeJSON(f.t, w, http.StatusOK, map[string]any{
-		"challenge_id":          id,
-		"nonce":                 nonce,
-		"state":                 state,
-		"code_challenge":        "challenge",
-		"code_challenge_method": "S256",
-		"authorization_url":     authURL,
-		"expires_at":            now.Add(5 * time.Minute).Unix(),
+		"challenge_id": id,
+		"nonce":        nonce,
+		"expires_at":   now.Add(5 * time.Minute).Unix(),
 	})
 }
 
 func (f *fakeAuthority) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ChallengeID string `json:"challenge_id"`
-		Code        string `json:"code"`
-		State       string `json:"state"`
+		Token       string `json:"token"`
 		Signature   string `json:"signature"`
 	}
 	if !decodeBody(f.t, w, r, &req) {
@@ -262,7 +256,7 @@ func (f *fakeAuthority) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	challenge := f.challenges[req.ChallengeID]
 	cfg := f.config
 	f.mu.Unlock()
-	if challenge == nil || challenge.purpose != "enroll" || challenge.state != req.State {
+	if challenge == nil || challenge.purpose != "enroll" {
 		writeError(w, http.StatusBadRequest, "challenge_invalid")
 		return
 	}
@@ -271,25 +265,33 @@ func (f *fakeAuthority) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "proof_invalid")
 		return
 	}
+	f.mu.Lock()
+	delete(f.challenges, challenge.id)
+	f.mu.Unlock()
+
 	if cfg.enrollStatus != 0 {
-		// The challenge is single use even when enrollment fails.
-		f.mu.Lock()
-		delete(f.challenges, challenge.id)
-		f.mu.Unlock()
 		writeError(w, cfg.enrollStatus, cfg.enrollCode)
 		return
 	}
 
 	subject := f.subject
+	if cfg.acceptedTokens != nil {
+		sub, ok := cfg.acceptedTokens[req.Token]
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "token_rejected")
+			return
+		}
+		subject = sub
+	}
 	if cfg.enrollSubject != "" {
 		subject = cfg.enrollSubject
 	}
-	certificate, err := f.signer.Issue(f.issuer, subject, challenge.publicKey, now)
+	certificate, err := f.authority.IssueWithKey(f.issuer, subject, challenge.publicKey, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "issue_failed")
 		return
 	}
-	principal, err := identity.VerifyCertificate(certificate, f.signer.PublicKey(), now)
+	principal, err := identity.VerifyCertificate(certificate, f.authority.PublicKey(), now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "issue_failed")
 		return
@@ -298,9 +300,6 @@ func (f *fakeAuthority) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	if cfg.renewable {
 		handle = f.registerHandle(challenge.publicKey)
 	}
-	f.mu.Lock()
-	delete(f.challenges, challenge.id)
-	f.mu.Unlock()
 
 	writeJSON(f.t, w, http.StatusOK, map[string]any{
 		"certificate":    certificate,
@@ -327,7 +326,7 @@ func (f *fakeAuthority) handleLease(w http.ResponseWriter, r *http.Request) {
 	cfg := f.config
 	f.mu.Unlock()
 
-	principal, err := identity.VerifyCertificate(req.Certificate, f.signer.PublicKey(), now)
+	principal, err := identity.VerifyCertificate(req.Certificate, f.authority.PublicKey(), now)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "certificate_invalid")
 		return
@@ -337,11 +336,11 @@ func (f *fakeAuthority) handleLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "proof_invalid")
 		return
 	}
-	signer := f.signer
+	auth := f.authority
 	if cfg.badLease {
-		signer = f.untrusted
+		auth = f.untrusted
 	}
-	lease, expires, err := signer.IssueLease(principal, req.Certificate, req.Nonce, now, f.leaseTTL)
+	lease, expires, err := auth.IssueLease(principal, req.Certificate, req.Nonce, now, f.leaseTTL)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "lease_failed")
 		return
@@ -362,6 +361,8 @@ func (f *fakeAuthority) handleLease(w http.ResponseWriter, r *http.Request) {
 func (f *fakeAuthority) handleRenew(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RefreshHandle string `json:"refresh_handle"`
+		Token         string `json:"token"`
+		PublicKey     string `json:"public_key"`
 		Nonce         string `json:"nonce"`
 		Signature     string `json:"signature"`
 	}
@@ -370,8 +371,72 @@ func (f *fakeAuthority) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.renewN++
-	publicKey, ok := f.handles[req.RefreshHandle]
 	cfg := f.config
+	f.mu.Unlock()
+
+	now := f.clock.Now()
+	if req.Token != "" {
+		f.mu.Lock()
+		f.directRenewN++
+		f.mu.Unlock()
+
+		pubBytes, err := base64.RawURLEncoding.DecodeString(req.PublicKey)
+		if err != nil || len(pubBytes) != ed25519.PublicKeySize {
+			writeError(w, http.StatusBadRequest, "public_key_invalid")
+			return
+		}
+		pub := ed25519.PublicKey(pubBytes)
+		signature, ok := decodeSignature(req.Signature)
+		if !ok || !ed25519.Verify(pub, identity.DirectRenewProofMessage(req.Nonce, req.Token, pub), signature) {
+			writeError(w, http.StatusUnauthorized, "proof_invalid")
+			return
+		}
+		if cfg.tokenStatus != 0 {
+			writeError(w, cfg.tokenStatus, cfg.tokenCode)
+			return
+		}
+		if cfg.renewStatus != 0 {
+			writeError(w, cfg.renewStatus, cfg.renewCode)
+			return
+		}
+		subject := f.subject
+		if cfg.acceptedTokens != nil {
+			sub, ok := cfg.acceptedTokens[req.Token]
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "token_rejected")
+				return
+			}
+			subject = sub
+		}
+		if cfg.renewSubject != "" {
+			subject = cfg.renewSubject
+		}
+		certificate, err := f.authority.IssueWithKey(f.issuer, subject, pub, now)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "issue_failed")
+			return
+		}
+		principal, err := identity.VerifyCertificate(certificate, f.authority.PublicKey(), now)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "issue_failed")
+			return
+		}
+		resp := map[string]any{
+			"certificate":    certificate,
+			"device_id":      principal.DeviceID,
+			"remote_user_id": principal.RemoteUserID(),
+			"expires_at":     principal.Expires.Unix(),
+		}
+		if cfg.rotateOnDirect {
+			resp["refresh_handle"] = f.registerHandle(pub)
+		}
+		writeJSON(f.t, w, http.StatusOK, resp)
+		return
+	}
+
+	f.mu.Lock()
+	f.handleRenewN++
+	publicKey, ok := f.handles[req.RefreshHandle]
 	f.mu.Unlock()
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_refresh_handle")
@@ -390,13 +455,12 @@ func (f *fakeAuthority) handleRenew(w http.ResponseWriter, r *http.Request) {
 	if cfg.renewSubject != "" {
 		subject = cfg.renewSubject
 	}
-	now := f.clock.Now()
-	certificate, err := f.signer.Issue(f.issuer, subject, publicKey, now)
+	certificate, err := f.authority.IssueWithKey(f.issuer, subject, publicKey, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "issue_failed")
 		return
 	}
-	principal, err := identity.VerifyCertificate(certificate, f.signer.PublicKey(), now)
+	principal, err := identity.VerifyCertificate(certificate, f.authority.PublicKey(), now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "issue_failed")
 		return
@@ -483,27 +547,9 @@ func newTestAccount(t *testing.T, f *fakeAuthority, store Store) *Account {
 
 func enroll(t *testing.T, a *Account, f *fakeAuthority) {
 	t.Helper()
-	authURL, err := a.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("begin: %v", err)
+	if err := a.Enroll(context.Background(), "client-token-default"); err != nil {
+		t.Fatalf("enroll: %v", err)
 	}
-	state := stateFromURL(t, authURL)
-	if err := a.Finish(context.Background(), "authorization-code", state); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
-}
-
-func stateFromURL(t *testing.T, raw string) string {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse authorization URL: %v", err)
-	}
-	state := u.Query().Get("state")
-	if state == "" {
-		t.Fatalf("authorization URL has no state: %s", raw)
-	}
-	return state
 }
 
 func mustCurrent(t *testing.T, a *Account, f *fakeAuthority) (*endpoint.Credentials, endpoint.LeaseProof) {
@@ -542,25 +588,11 @@ func TestEnrollLeaseCacheAndRestore(t *testing.T) {
 		t.Fatalf("New saved state")
 	}
 
-	authURL, err := a.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	if !strings.HasPrefix(authURL, "https://idp.example/authorize?") {
-		t.Fatalf("authorization URL = %q", authURL)
-	}
-	if store.saves != 1 {
-		t.Fatalf("Begin did not persist the endpoint key")
-	}
-	if a.UserID() != "" || a.DeviceID() != "" {
-		t.Fatalf("identity set before Finish")
-	}
-	state := stateFromURL(t, authURL)
-	if err := a.Finish(context.Background(), "authorization-code", state); err != nil {
-		t.Fatalf("Finish: %v", err)
+	if err := a.Enroll(context.Background(), "client-token-1"); err != nil {
+		t.Fatalf("Enroll: %v", err)
 	}
 
-	wantDevice, err := f.signer.DeviceID(f.issuer, f.subject, a.key.Public().(ed25519.PublicKey))
+	wantDevice, err := f.authority.DeviceID(f.issuer, f.subject, a.key.Public().(ed25519.PublicKey))
 	if err != nil {
 		t.Fatalf("derive device ID: %v", err)
 	}
@@ -572,7 +604,7 @@ func TestEnrollLeaseCacheAndRestore(t *testing.T) {
 		t.Fatalf("DeviceID = %q, want %q", a.DeviceID(), wantDevice)
 	}
 	if store.saves != 2 {
-		t.Fatalf("Finish did not persist credentials")
+		t.Fatalf("Enroll saves = %d, want 2 (key + credentials)", store.saves)
 	}
 	stateAfter := decodePersisted(t, store.value)
 	if stateAfter.Certificate == "" || stateAfter.RefreshHandle == "" {
@@ -580,6 +612,9 @@ func TestEnrollLeaseCacheAndRestore(t *testing.T) {
 	}
 	if stateAfter.Seed == "" || stateAfter.Authority == "" {
 		t.Fatalf("stored state missing seed or authority")
+	}
+	if strings.Contains(store.value, "client-token-1") {
+		t.Fatal("host client token must never be persisted to store")
 	}
 
 	credentials, proof := mustCurrent(t, a, f)
@@ -593,11 +628,11 @@ func TestEnrollLeaseCacheAndRestore(t *testing.T) {
 	if enrolls != 1 || leases != 1 {
 		t.Fatalf("calls after first Current: enroll=%d lease=%d", enrolls, leases)
 	}
-	principal, err := identity.VerifyCertificate(proof.Certificate, f.signer.PublicKey(), f.clock.Now())
+	principal, err := identity.VerifyCertificate(proof.Certificate, f.authority.PublicKey(), f.clock.Now())
 	if err != nil {
 		t.Fatalf("verify certificate: %v", err)
 	}
-	expires, err := identity.VerifyEndpointLease(proof.Lease, f.signer.PublicKey(), f.clock.Now(), proof.Certificate, principal)
+	expires, err := identity.VerifyEndpointLease(proof.Lease, f.authority.PublicKey(), f.clock.Now(), proof.Certificate, principal)
 	if err != nil {
 		t.Fatalf("verify lease: %v", err)
 	}
@@ -611,8 +646,7 @@ func TestEnrollLeaseCacheAndRestore(t *testing.T) {
 		t.Fatalf("cached lease was not reused: lease=%d", leases)
 	}
 
-	// Reuse is bounded so an overfrequent caller still observes authority
-	// changes promptly.
+	// Reuse is bounded so an overfrequent caller still observes authority changes promptly.
 	f.clock.Advance(leaseCacheWindow + time.Millisecond)
 	_, proof2 := mustCurrent(t, a, f)
 	if _, _, leases, _ := f.calls(); leases != 2 {
@@ -657,7 +691,7 @@ func TestRenewalReplacesCertificateAndHandle(t *testing.T) {
 	enroll(t, a, f)
 	before := decodePersisted(t, store.value)
 
-	// Restore first, then renew the restored certificate.
+	// Restore first (no live token in memory), then renew via refresh handle.
 	b := newTestAccount(t, f, store)
 	f.clock.Advance(7*time.Minute + 59*time.Second)
 	mustCurrent(t, b, f)
@@ -670,6 +704,9 @@ func TestRenewalReplacesCertificateAndHandle(t *testing.T) {
 	_, proof := mustCurrent(t, b, f)
 	if _, _, _, renews := f.calls(); renews != 1 {
 		t.Fatalf("certificate was not renewed: renew=%d", renews)
+	}
+	if direct, handle := f.renewBreakdown(); direct != 0 || handle != 1 {
+		t.Fatalf("renew breakdown = direct:%d handle:%d, want 0/1", direct, handle)
 	}
 	after := decodePersisted(t, store.value)
 	if after.Certificate == before.Certificate {
@@ -697,6 +734,63 @@ func TestRenewalReplacesCertificateAndHandle(t *testing.T) {
 	if _, _, _, renews := f.calls(); renews != 1 {
 		t.Fatalf("unexpected second renewal: renew=%d", renews)
 	}
+}
+
+func TestDirectTokenRenewalAndHandleFallback(t *testing.T) {
+	t.Run("direct_token_without_refresh_handle", func(t *testing.T) {
+		f := newFakeAuthority(t)
+		f.set(func(cfg *fakeConfig) {
+			cfg.renewable = false
+			cfg.acceptedTokens = map[string]string{
+				"tok-1": "user-42",
+				"tok-2": "user-42",
+			}
+		})
+		store := &memStore{}
+		a := newTestAccount(t, f, store)
+		if err := a.Enroll(context.Background(), "tok-1"); err != nil {
+			t.Fatalf("Enroll: %v", err)
+		}
+		before := decodePersisted(t, store.value)
+		if before.RefreshHandle != "" {
+			t.Fatalf("unexpected refresh handle in non-renewable mode")
+		}
+
+		// Supply a refreshed token via provider and advance past renewal margin.
+		a.SetTokenProvider(func(context.Context) (string, error) {
+			return "tok-2", nil
+		})
+		f.clock.Advance(8*time.Minute + 5*time.Second)
+		_, proof := mustCurrent(t, a, f)
+		if proof.Certificate == before.Certificate {
+			t.Fatal("certificate was not renewed via live token")
+		}
+		if direct, handle := f.renewBreakdown(); direct != 1 || handle != 0 {
+			t.Fatalf("renew breakdown = direct:%d handle:%d, want 1/0", direct, handle)
+		}
+	})
+
+	t.Run("expired_cached_token_falls_back_to_handle", func(t *testing.T) {
+		f := newFakeAuthority(t)
+		f.set(func(cfg *fakeConfig) {
+			cfg.renewable = true
+			cfg.acceptedTokens = map[string]string{"short-lived-tok": "user-42"}
+		})
+		store := &memStore{}
+		a := newTestAccount(t, f, store)
+		if err := a.Enroll(context.Background(), "short-lived-tok"); err != nil {
+			t.Fatalf("Enroll: %v", err)
+		}
+		// Simulate the short-lived startup access token expiring while the session handle remains valid.
+		f.set(func(cfg *fakeConfig) {
+			cfg.acceptedTokens = map[string]string{}
+		})
+		f.clock.Advance(8*time.Minute + 5*time.Second)
+		mustCurrent(t, a, f)
+		if direct, handle := f.renewBreakdown(); direct != 1 || handle != 1 {
+			t.Fatalf("expected direct attempt followed by handle fallback, got direct:%d handle:%d", direct, handle)
+		}
+	})
 }
 
 func TestRenewalRejectsChangedIdentity(t *testing.T) {
@@ -809,64 +903,49 @@ func TestCorruptStateFailsClosed(t *testing.T) {
 	}
 }
 
-func TestFinishErrorsAndSaveFailure(t *testing.T) {
+func TestEnrollErrorsAndSaveFailure(t *testing.T) {
 	f := newFakeAuthority(t)
 	store := &memStore{}
 	a := newTestAccount(t, f, store)
 
-	if err := a.Finish(context.Background(), "code", "state"); !errors.Is(err, ErrNoLogin) {
-		t.Fatalf("Finish without Begin = %v, want ErrNoLogin", err)
+	if err := a.Enroll(context.Background(), "   "); err == nil {
+		t.Fatal("Enroll with empty token succeeded")
 	}
-	authURL, err := a.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	state := stateFromURL(t, authURL)
-	if err := a.Finish(context.Background(), "code", "wrong-state"); !errors.Is(err, ErrStateMismatch) {
-		t.Fatalf("Finish with wrong state = %v, want ErrStateMismatch", err)
-	}
-	if err := a.Finish(context.Background(), "code", state); err != nil {
-		t.Fatalf("Finish after state mismatch: %v", err)
+	if err := a.UpdateToken(""); err == nil {
+		t.Fatal("UpdateToken with empty token succeeded")
 	}
 
-	// A rejected authorization is surfaced with its machine-readable code and
-	// consumes the pending challenge.
+	// Rejected token surfaces APIError.
 	f2 := newFakeAuthority(t)
 	store2 := &memStore{}
 	a2 := newTestAccount(t, f2, store2)
 	f2.set(func(config *fakeConfig) {
 		config.enrollStatus = http.StatusUnauthorized
-		config.enrollCode = "identity_verification_failed"
+		config.enrollCode = "token_rejected"
 	})
-	authURL2, err := a2.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	err = a2.Finish(context.Background(), "code", stateFromURL(t, authURL2))
+	err := a2.Enroll(context.Background(), "bad-token")
 	var apiError *APIError
 	if !errors.As(err, &apiError) {
-		t.Fatalf("Finish = %v, want APIError", err)
+		t.Fatalf("Enroll = %v, want APIError", err)
 	}
-	if apiError.StatusCode != http.StatusUnauthorized || apiError.Code != "identity_verification_failed" {
+	if apiError.StatusCode != http.StatusUnauthorized || apiError.Code != "token_rejected" {
 		t.Fatalf("APIError = %+v", apiError)
 	}
-	if err := a2.Finish(context.Background(), "code", stateFromURL(t, authURL2)); !errors.Is(err, ErrNoLogin) {
-		t.Fatalf("second Finish = %v, want ErrNoLogin", err)
-	}
 
-	// If the store fails, nothing is committed and no in-memory credential is
-	// exposed. The endpoint key stays persisted so the device ID is stable.
+	// If the store fails during credential save, key remains persisted so device ID is stable.
 	f3 := newFakeAuthority(t)
 	store3 := &memStore{}
 	a3 := newTestAccount(t, f3, store3)
-	authURL3, err := a3.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
+	// Trigger key generation first by failing enroll after challenge.
+	f3.set(func(cfg *fakeConfig) { cfg.enrollStatus = http.StatusServiceUnavailable; cfg.enrollCode = "unavailable" })
+	if err := a3.Enroll(context.Background(), "tok"); err == nil {
+		t.Fatal("expected unavailable error")
 	}
+	f3.set(func(cfg *fakeConfig) { cfg.enrollStatus = 0; cfg.enrollCode = "" })
 	store3.saveErr = errors.New("keyring locked")
-	err = a3.Finish(context.Background(), "code", stateFromURL(t, authURL3))
+	err = a3.Enroll(context.Background(), "tok")
 	if err == nil || !strings.Contains(err.Error(), "save state") {
-		t.Fatalf("Finish with failing store = %v", err)
+		t.Fatalf("Enroll with failing store = %v", err)
 	}
 	if a3.UserID() != "" || a3.DeviceID() != "" {
 		t.Fatalf("failed enrollment exposed identity")
@@ -877,7 +956,7 @@ func TestFinishErrorsAndSaveFailure(t *testing.T) {
 	}
 	store3.saveErr = nil
 	enroll(t, a3, f3)
-	wantDevice, err := f3.signer.DeviceID(f3.issuer, f3.subject, a3.key.Public().(ed25519.PublicKey))
+	wantDevice, err := f3.authority.DeviceID(f3.issuer, f3.subject, a3.key.Public().(ed25519.PublicKey))
 	if err != nil {
 		t.Fatalf("derive device ID: %v", err)
 	}
@@ -891,14 +970,14 @@ func TestFinishErrorsAndSaveFailure(t *testing.T) {
 	a4 := newTestAccount(t, f4, store4)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := a4.Begin(canceled); err == nil {
-		t.Fatalf("Begin with canceled context succeeded")
+	if err := a4.Enroll(canceled, "tok"); err == nil {
+		t.Fatalf("Enroll with canceled context succeeded")
 	}
 	if store4.saves != 1 {
-		t.Fatalf("canceled Begin did not persist the key")
+		t.Fatalf("canceled Enroll did not persist the key")
 	}
 	if a4.UserID() != "" {
-		t.Fatalf("canceled Begin exposed identity")
+		t.Fatalf("canceled Enroll exposed identity")
 	}
 }
 
@@ -909,6 +988,8 @@ func TestExpiredCertificateReauthenticatesSameAccount(t *testing.T) {
 	a := newTestAccount(t, f, store)
 	enroll(t, a, f)
 
+	// Restore so no live token is cached in memory.
+	a = newTestAccount(t, f, store)
 	userID, deviceID := a.UserID(), a.DeviceID()
 	before := decodePersisted(t, store.value)
 	saves := store.saves
@@ -984,7 +1065,7 @@ func TestCorruptRenewalDenialStateFailsClosed(t *testing.T) {
 		mutate func(*persisted)
 	}{
 		{"unknown code", func(state *persisted) { state.RenewalDenied = "not_a_denial" }},
-		{"denial without handle", func(state *persisted) {
+		{"refresh_rejected without handle", func(state *persisted) {
 			state.RenewalDenied = "refresh_rejected"
 			state.RefreshHandle = ""
 		}},
@@ -1009,12 +1090,19 @@ func TestCorruptRenewalDenialStateFailsClosed(t *testing.T) {
 }
 
 func TestDefinitiveRenewalDenialDeniesBeforeExpiry(t *testing.T) {
-	for _, code := range []string{"refresh_rejected", "identity_verification_failed"} {
+	for _, code := range []string{"refresh_rejected", "token_rejected", "identity_verification_failed"} {
 		t.Run(code, func(t *testing.T) {
 			f := newFakeAuthority(t)
+			if code == "token_rejected" {
+				f.set(func(cfg *fakeConfig) { cfg.renewable = false })
+			}
 			store := &memStore{}
 			a := newTestAccount(t, f, store)
 			enroll(t, a, f)
+			if code != "token_rejected" {
+				// Restore without live token so refresh handle is exercised.
+				a = newTestAccount(t, f, store)
+			}
 
 			userID, deviceID := a.UserID(), a.DeviceID()
 			before := decodePersisted(t, store.value)
@@ -1022,15 +1110,12 @@ func TestDefinitiveRenewalDenialDeniesBeforeExpiry(t *testing.T) {
 				config.renewStatus = http.StatusUnauthorized
 				config.renewCode = code
 			})
-			// One minute thirty seconds of certificate lifetime remains, inside
-			// the renewal margin but before expiry.
 			f.clock.Advance(8*time.Minute + 30*time.Second)
 			if _, _, err := a.Current(context.Background()); !errors.Is(err, ErrCredential) {
 				t.Fatalf("Current after %s = %v, want ErrCredential", code, err)
 			}
 
-			// A later transient failure must not resurrect the rejected
-			// certificate; the denial is sticky until browser sign-in.
+			// A later transient failure must not resurrect the rejected certificate.
 			f.set(func(config *fakeConfig) {
 				config.renewStatus = http.StatusServiceUnavailable
 				config.renewCode = "unavailable"
@@ -1045,8 +1130,7 @@ func TestDefinitiveRenewalDenialDeniesBeforeExpiry(t *testing.T) {
 				t.Fatalf("persisted denial = %q, want %q", denied.RenewalDenied, code)
 			}
 
-			// A restart during a provider outage must not resume the revoked
-			// certificate, and must not contact the authority.
+			// Restart during a provider outage must not resume the revoked certificate or contact authority.
 			restored := newTestAccount(t, f, store)
 			if restored.UserID() != userID || restored.DeviceID() != deviceID {
 				t.Fatalf("restore changed identity: user %q/%q device %q/%q", restored.UserID(), userID, restored.DeviceID(), deviceID)
@@ -1060,40 +1144,39 @@ func TestDefinitiveRenewalDenialDeniesBeforeExpiry(t *testing.T) {
 				t.Fatalf("restored denial contacted authority: renews %d->%d leases %d->%d", renewsBefore, renewsAfter, leasesBefore, leasesAfter)
 			}
 
-			// A rejected sign-in for another account must preserve the denial.
+			// Enrolling a different account preserves the denial.
 			f.set(func(config *fakeConfig) { config.enrollSubject = "other-user" })
-			authURL, err := restored.Begin(context.Background())
-			if err != nil {
-				t.Fatalf("begin for another account: %v", err)
-			}
-			if err := restored.Finish(context.Background(), "authorization-code", stateFromURL(t, authURL)); !errors.Is(err, ErrAlreadyEnrolled) {
-				t.Fatalf("Finish for another account = %v, want ErrAlreadyEnrolled", err)
+			if err := restored.Enroll(context.Background(), "other-token"); !errors.Is(err, ErrAlreadyEnrolled) {
+				t.Fatalf("Enroll for another account = %v, want ErrAlreadyEnrolled", err)
 			}
 			if store.value != deniedState {
-				t.Fatal("rejected sign-in changed the denied state")
+				t.Fatal("rejected enrollment changed the denied state")
 			}
 			if _, _, err := restored.Current(context.Background()); !errors.Is(err, ErrCredential) {
-				t.Fatalf("Current after rejected sign-in = %v, want ErrCredential", err)
+				t.Fatalf("Current after rejected enrollment = %v, want ErrCredential", err)
 			}
 
-			// Same-account reauthentication clears the persisted denial.
+			// Supplying a fresh valid host token via UpdateToken recovers cleanly.
 			f.set(func(config *fakeConfig) {
 				config.renewStatus = 0
 				config.renewCode = ""
 				config.enrollSubject = ""
+				config.rotateOnDirect = code != "token_rejected"
 			})
-			enroll(t, restored, f)
-			after := decodePersisted(t, store.value)
-			if after.RenewalDenied != "" {
-				t.Fatalf("reauth kept persisted denial %q", after.RenewalDenied)
-			}
-			if restored.UserID() != userID || restored.DeviceID() != deviceID {
-				t.Fatalf("reauth changed identity: user %q->%q device %q->%q", userID, restored.UserID(), deviceID, restored.DeviceID())
-			}
-			if after.RefreshHandle == before.RefreshHandle {
-				t.Fatal("reauth did not replace the rejected refresh handle")
+			if err := restored.UpdateToken("fresh-recovered-token"); err != nil {
+				t.Fatalf("UpdateToken: %v", err)
 			}
 			mustCurrent(t, restored, f)
+			after := decodePersisted(t, store.value)
+			if after.RenewalDenied != "" {
+				t.Fatalf("recovery kept persisted denial %q", after.RenewalDenied)
+			}
+			if restored.UserID() != userID || restored.DeviceID() != deviceID {
+				t.Fatalf("recovery changed identity: user %q->%q device %q->%q", userID, restored.UserID(), deviceID, restored.DeviceID())
+			}
+			if code != "token_rejected" && after.RefreshHandle == before.RefreshHandle {
+				t.Fatal("recovery did not replace the rejected refresh handle")
+			}
 
 			again := newTestAccount(t, f, store)
 			mustCurrent(t, again, f)
@@ -1131,22 +1214,18 @@ func TestDifferentAccountRejectedUntilReset(t *testing.T) {
 	saves := store.saves
 
 	f.set(func(config *fakeConfig) { config.enrollSubject = "other-user" })
-	authURL, err := a.Begin(context.Background())
-	if err != nil {
-		t.Fatalf("begin for another account: %v", err)
-	}
-	if err := a.Finish(context.Background(), "authorization-code", stateFromURL(t, authURL)); !errors.Is(err, ErrAlreadyEnrolled) {
-		t.Fatalf("Finish for another account = %v, want ErrAlreadyEnrolled", err)
+	if err := a.Enroll(context.Background(), "other-token"); !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("Enroll for another account = %v, want ErrAlreadyEnrolled", err)
 	}
 	after := decodePersisted(t, store.value)
 	if after.Certificate != before.Certificate || after.RefreshHandle != before.RefreshHandle || after.UserID != before.UserID || after.DeviceID != before.DeviceID {
-		t.Fatal("rejected sign-in changed the stored account")
+		t.Fatal("rejected enroll changed the stored account")
 	}
 	if store.saves != saves {
-		t.Fatalf("rejected sign-in saved state %d times", store.saves-saves)
+		t.Fatalf("rejected enroll saved state %d times", store.saves-saves)
 	}
 	if a.UserID() != userID || a.DeviceID() != deviceID {
-		t.Fatal("rejected sign-in changed the active account")
+		t.Fatal("rejected enroll changed the active account")
 	}
 	mustCurrent(t, a, f)
 
@@ -1194,17 +1273,17 @@ func TestRestoreAcceptsExpiredCertificateReadOnly(t *testing.T) {
 		t.Fatalf("generate key: %v", err)
 	}
 	issuedAt := time.Now().Add(-20 * time.Minute)
-	certificate, err := f.signer.Issue(f.issuer, f.subject, key.Public().(ed25519.PublicKey), issuedAt)
+	certificate, err := f.authority.IssueWithKey(f.issuer, f.subject, key.Public().(ed25519.PublicKey), issuedAt)
 	if err != nil {
 		t.Fatalf("issue certificate: %v", err)
 	}
-	principal, err := identity.VerifyCertificate(certificate, f.signer.PublicKey(), issuedAt)
+	principal, err := identity.VerifyCertificate(certificate, f.authority.PublicKey(), issuedAt)
 	if err != nil {
 		t.Fatalf("verify certificate: %v", err)
 	}
 	state, err := json.Marshal(persisted{
 		Version:     stateVersion,
-		Authority:   authorityFingerprint(f.signer.PublicKey()),
+		Authority:   authorityFingerprint(f.authority.PublicKey()),
 		Seed:        base64.RawURLEncoding.EncodeToString(key.Seed()),
 		Certificate: certificate,
 		UserID:      principal.RemoteUserID(),
@@ -1272,8 +1351,8 @@ func TestConfigurationAndRedirectPolicy(t *testing.T) {
 
 	f.set(func(config *fakeConfig) { config.redirect = true })
 	a := newTestAccount(t, f, &memStore{})
-	if _, err := a.Begin(context.Background()); err == nil || !strings.Contains(err.Error(), "redirect") {
-		t.Fatalf("Begin followed a redirect: %v", err)
+	if err := a.Enroll(context.Background(), "tok"); err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("Enroll followed a redirect: %v", err)
 	}
 }
 
@@ -1322,22 +1401,5 @@ func TestCurrentSerializesConcurrentCallers(t *testing.T) {
 	}
 	if _, _, leases, _ := f.calls(); leases != 1 {
 		t.Fatalf("concurrent callers issued %d leases, want 1", leases)
-	}
-}
-
-func TestBeginWithRedirect(t *testing.T) {
-	f := newFakeAuthority(t)
-	a := newTestAccount(t, f, &memStore{})
-	want := "http://127.0.0.1:43210/oauth/callback"
-	raw, err := a.BeginWithRedirect(context.Background(), want)
-	if err != nil {
-		t.Fatalf("BeginWithRedirect: %v", err)
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := parsed.Query().Get("redirect_uri"); got != want {
-		t.Fatalf("redirect_uri = %q, want %q", got, want)
 	}
 }

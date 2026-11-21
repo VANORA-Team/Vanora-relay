@@ -4,18 +4,20 @@
 
 `vanora-desktop` 运行在本机电脑上，负责托管本机 Vanora RPC 进程、执行本地会话与工具访问控制（ACL），并通过加密 WebRTC DataChannel 与移动端通信。
 
-## 1. 构建与登录
+## 1. 构建与设备注册（复用宿主客户端令牌）
 
 ```sh
 go build -o vanora-desktop ./cmd/vanora-desktop
-./vanora-desktop login \
+
+# 推荐通过 stdin 传入宿主 AI 客户端已有的认证令牌（避免令牌出现在进程命令行中）
+printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
   -identity https://identity.example.com \
   -ca identity-signing-key.pub \
-  -redirect-uri http://127.0.0.1:0/oauth/callback
+  -token-stdin
 ```
 
 - **Windows**：可将产物名设为 `vanora-desktop.exe`。
-- **无感回调登录**：传入 `-redirect-uri http://127.0.0.1:0/oauth/callback` 会自动绑定本机临时回环端口并接收 `code` 和 `state`；配置为自定义 URI Scheme 时按提示粘贴回调地址。传 `-no-browser -json` 可交由宿主 UI 展示/打开登录链接。
+- **令牌传入方式**：支持 `-token-stdin`（推荐）、环境变量 `VANORA_CLIENT_TOKEN` 或 `-token`。`vanora-desktop` 仅将宿主令牌用于向外部身份后端交换短期设备证书，**不会**持久化或打印宿主令牌。
 - **账号管理子命令**：支持 `whoami` / `status`（查看当前 `enrolled`、`user_id`、`device_id`）与 `logout`（安全重置本地设备密钥与绑定）。
 - **凭据与状态目录**：可通过 `-state-dir` 指定配置档目录，默认位于当前用户配置目录下的 `Vanora/relay`。端点私钥保存在系统凭据库中，运行 `serve` 时须使用同一桌面用户身份。
 
@@ -30,8 +32,9 @@ go build -o vanora-desktop ./cmd/vanora-desktop
     -o vanora-desktop ./cmd/vanora-desktop
   ```
 
-- **结构化状态事件**：以 `serve -sidecar` 启动后会向 `stdout` 输出 JSON-lines 状态事件（`ready`、`online`、`offline`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等）。
-- **生命周期控制**：支持通过 `stdin` 发送 `{"type":"reload"|"status"|"shutdown"}`，并在父进程退出（`stdin` EOF）时自动干净退出。
+- **自动注册与热更新令牌**：启动 `serve -sidecar` 时可通过环境变量 `VANORA_CLIENT_TOKEN` 传入当前宿主令牌（未注册设备会自动完成注册，已注册设备会更新内存令牌）；宿主刷新令牌后通过 `stdin` 发送 `{"type":"auth.token","token":"..."}` 即可无感续期（收到 `{"type":"auth.required",...}` 时亦可推送新令牌恢复）。
+- **结构化状态事件**：以 `serve -sidecar` 启动后会向 `stdout` 输出 JSON-lines 状态事件（`ready`、`online`、`offline`、`auth.ok`、`auth.required`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等）。
+- **生命周期控制**：支持通过 `stdin` 发送 `{"type":"auth.token"|"reload"|"status"|"shutdown"}`，并在父进程退出（`stdin` EOF）时自动干净退出。
 
 ## 3. 会话与工作区配置（`desktop.json`）
 
@@ -46,7 +49,7 @@ go build -o vanora-desktop ./cmd/vanora-desktop
       "id": "project",
       "title": "项目工作区",
       "working_dir": "/abs/path/to/project",
-      "owner": "本机登录输出的 user_id",
+      "owner": "本机注册输出的 user_id",
       "tools": ["read", "edit", "write", "bash", "ask"],
       "show_thinking": true,
       "show_tools": true,
@@ -59,13 +62,13 @@ go build -o vanora-desktop ./cmd/vanora-desktop
       "title": "已有对话",
       "working_dir": "/abs/path/to/project",
       "session_file": "/abs/path/to/sessions/project.jsonl",
-      "owner": "本机登录输出的 user_id",
+      "owner": "本机注册输出的 user_id",
       "tools": ["read", "bash"],
       "show_thinking": true,
       "show_tools": true,
       "approval_policy": "remote",
       "users": [
-        { "user_id": "访客手机登录后的 user_id", "read": true, "tools": false }
+        { "user_id": "访客手机注册后的 user_id", "read": true, "tools": false }
       ]
     }
   ]

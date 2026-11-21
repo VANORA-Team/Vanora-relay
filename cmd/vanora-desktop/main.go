@@ -71,13 +71,13 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -sidecar -json]")
+		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]")
 	}
 	cmd := args[0]
 	switch cmd {
 	case "login", "serve", "whoami", "status", "logout":
 	default:
-		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -sidecar -json]")
+		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]")
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
@@ -88,8 +88,8 @@ func run(args []string) error {
 	config := fs.String("config", "", "local Vanora session and permission config")
 	hostname, _ := os.Hostname()
 	name := fs.String("name", hostname, "published desktop name")
-	redirectURI := fs.String("redirect-uri", "", "OIDC redirect URI for login (supports http://127.0.0.1:0/... ephemeral loopback)")
-	noBrowser := fs.Bool("no-browser", false, "do not launch the system browser during login")
+	tokenFlag := fs.String("token", envOrDefault("VANORA_CLIENT_TOKEN", ""), "existing client auth token (or set VANORA_CLIENT_TOKEN)")
+	tokenStdin := fs.Bool("token-stdin", false, "read client auth token from stdin")
 	jsonOutput := fs.Bool("json", false, "emit structured JSON lines on stdout")
 	sidecar := fs.Bool("sidecar", false, "sidecar mode: JSONL stdout events, stdin commands, exit on stdin EOF")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -180,16 +180,39 @@ func run(args []string) error {
 		return nil
 	case "login":
 		return login(ctx, a, loginOptions{
-			redirectURI: strings.TrimSpace(*redirectURI),
-			noBrowser:   *noBrowser,
-			emitter:     emitter,
+			token:      *tokenFlag,
+			tokenStdin: *tokenStdin,
+			in:         os.Stdin,
+			emitter:    emitter,
 		})
 	case "serve":
 		if *config == "" || strings.TrimSpace(*signalURL) == "" {
 			return errors.New("serve requires -signal and -config")
 		}
+		if *tokenStdin && *sidecar {
+			return errors.New("-token-stdin cannot be combined with -sidecar; send {\"type\":\"auth.token\",\"token\":\"...\"} on stdin or set VANORA_CLIENT_TOKEN")
+		}
+		tok := strings.TrimSpace(*tokenFlag)
+		if *tokenStdin {
+			tok, err = readTokenInput("", true, os.Stdin)
+			if err != nil {
+				return err
+			}
+		}
+		if tok != "" {
+			if a.UserID() == "" {
+				enrollCtx, cancelEnroll := context.WithTimeout(ctx, 30*time.Second)
+				err = a.Enroll(enrollCtx, tok)
+				cancelEnroll()
+				if err != nil {
+					return err
+				}
+			} else if err = a.UpdateToken(tok); err != nil {
+				return err
+			}
+		}
 		if a.UserID() == "" {
-			return errors.New("run vanora-desktop login for this profile first")
+			return errors.New("endpoint not enrolled; run vanora-desktop login or provide -token / VANORA_CLIENT_TOKEN")
 		}
 		return serve(ctx, a, ca, strings.TrimSpace(*signalURL), *name, *config, dir, *sidecar, emitter)
 	default:
@@ -224,6 +247,15 @@ func (s *authority) Current(ctx context.Context) (*endpoint.Credentials, endpoin
 	s.adapter.AuthorityLost()
 	return nil, endpoint.LeaseProof{}, err
 }
+
+func isAuthRequiredError(err error) bool {
+	return errors.Is(err, account.ErrNotEnrolled) ||
+		errors.Is(err, account.ErrExpired) ||
+		errors.Is(err, account.ErrCredential) ||
+		errors.Is(err, account.ErrStateInvalid) ||
+		errors.Is(err, account.ErrAuthorityChanged)
+}
+
 func guests(cfg *desktop.Config, owner string) ([]string, error) {
 	seen := map[string]bool{}
 	for _, s := range cfg.Sessions {
@@ -253,6 +285,7 @@ func guests(cfg *desktop.Config, owner string) ([]string, error) {
 	slices.Sort(out)
 	return out, nil
 }
+
 func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, name, path, dir string, sidecar bool, emitter *jsonEmitter) error {
 	cfg, err := desktop.LoadConfig(path)
 	if err != nil {
@@ -300,6 +333,7 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 	}
 
 	reloadNow := make(chan struct{}, 1)
+	retryNow := make(chan struct{}, 1)
 	// Keep checking local ACL independently of a stalled WebSocket, enrollment service or ICE path.
 	updates := make(chan []string, 1)
 	fail := make(chan error, 1)
@@ -369,7 +403,8 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 					continue
 				}
 				var cmd struct {
-					Type string `json:"type"`
+					Type  string `json:"type"`
+					Token string `json:"token"`
 				}
 				if json.Unmarshal([]byte(line), &cmd) != nil {
 					continue
@@ -382,6 +417,16 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 					select {
 					case reloadNow <- struct{}{}:
 					default:
+					}
+				case "auth.token":
+					if err := a.UpdateToken(cmd.Token); err != nil {
+						emitter.Emit(map[string]any{"type": "auth.error", "error": err.Error()})
+					} else {
+						emitter.Emit(map[string]any{"type": "auth.ok"})
+						select {
+						case retryNow <- struct{}{}:
+						default:
+						}
 					}
 				case "status":
 					statusMu.Lock()
@@ -443,6 +488,9 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 			reason = e.Error()
 		}
 		setOnline(false, reason)
+		if emitter != nil && e != nil && isAuthRequiredError(e) {
+			emitter.Emit(map[string]any{"type": "auth.required", "error": reason})
+		}
 		if emitter == nil && e != nil {
 			log.Printf("desktop offline: %v", e)
 		}
@@ -450,9 +498,12 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+		case <-retryNow:
+			timer.Stop()
+			delay = time.Second
 		case <-timer.C:
+			delay = min(delay*2, 10*time.Second)
 		}
-		delay = min(delay*2, 10*time.Second)
 	}
 	if emitter != nil {
 		emitter.Emit(map[string]any{"type": "shutdown"})

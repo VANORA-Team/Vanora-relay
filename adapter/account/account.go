@@ -1,13 +1,14 @@
 // Package account enrolls a native Vanora endpoint with the identity
-// authority and supplies short-lived credentials to the signaling transport.
-// It is shared by the desktop and mobile clients: the host supplies secure
-// storage (an OS keyring on desktop, platform secure storage on mobile) and
-// the host opens the returned authorization URL in the system browser.
+// authority using the host client's existing authentication token and supplies
+// short-lived credentials to the signaling transport. It is shared by the
+// desktop and mobile clients: the host supplies secure storage (an OS keyring
+// on desktop, platform secure storage on mobile) and provides the host user's
+// live authentication token.
 //
 // An Account owns the endpoint Ed25519 key, the certificate that binds it to
-// the signed-in owner, and the opaque renewal handle. The key and handle are
-// written to the store as one opaque serialized value. The host never parses
-// that value and the package never logs it.
+// the signed-in owner, and an optional opaque renewal handle. The key and
+// handle are written to the store as one opaque serialized value. The host
+// never parses that value and the package never logs it or the host auth token.
 package account
 
 import (
@@ -16,7 +17,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -38,7 +38,7 @@ const (
 
 	requestTimeout   = 15 * time.Second
 	maxResponseBytes = 128 << 10
-	maxCodeBytes     = 4096
+	maxTokenBytes    = 16384
 	maxHandleBytes   = 8192
 
 	// Each explicit Current call obtains a fresh lease; a lease is only reused
@@ -71,26 +71,22 @@ var (
 	ErrAuthorityChanged = errors.New("account: stored state belongs to another authority")
 	// ErrNotEnrolled means no certificate has been obtained or saved yet.
 	ErrNotEnrolled = errors.New("account: endpoint is not enrolled")
-	// ErrNoLogin means there is no pending browser authorization to finish.
-	ErrNoLogin = errors.New("account: no login is pending")
-	// ErrStateMismatch means the state returned to Finish does not match the
-	// challenge this Account requested.
-	ErrStateMismatch = errors.New("account: authorization state mismatch")
 	// ErrCredential means the authority returned a certificate, lease or
-	// identity that does not bind the expected endpoint key, user or device.
+	// identity that does not bind the expected endpoint key, user or device,
+	// or definitively rejected this endpoint's standing credentials.
 	ErrCredential = errors.New("account: identity credential rejected")
 	// ErrExpired means the certificate has expired and cannot be renewed
-	// without a new browser sign-in.
+	// without a fresh host auth token or re-enrollment.
 	ErrExpired = errors.New("account: endpoint certificate expired")
-	// ErrAlreadyEnrolled means a browser sign-in verified an account or device
+	// ErrAlreadyEnrolled means enrollment verified an account or device
 	// different from the one already stored. Replacing the local account
 	// requires an explicit Reset; reauthenticating the same account does not.
-	ErrAlreadyEnrolled = errors.New("account: sign-in is for a different account; reset to replace the local account")
+	ErrAlreadyEnrolled = errors.New("account: token belongs to a different account; reset to replace the local account")
 )
 
 // APIError is a non-success response from the identity authority. Code is the
 // machine-readable value from the response body (for example
-// "refresh_rejected" or "provider_unavailable").
+// "token_rejected", "refresh_rejected", or "provider_unavailable").
 type APIError struct {
 	StatusCode int
 	Code       string
@@ -105,8 +101,8 @@ func (e *APIError) Error() string {
 //
 // Load returns an empty string with a nil error when nothing has been saved
 // yet. Save must replace the previous value atomically and durably. The value
-// contains the endpoint private key and the renewal handle; it must never be
-// logged or written to ordinary application storage.
+// contains the endpoint private key and optional renewal handle; it must never
+// be logged or written to ordinary application storage.
 type Store interface {
 	Load() (string, error)
 	Save(string) error
@@ -131,24 +127,20 @@ type Account struct {
 	deviceID      string
 	refreshHandle string
 
-	pending *login
+	// In-memory host auth token used for direct-token renewal; never persisted.
+	liveToken     string
+	tokenProvider func(context.Context) (string, error)
 
 	lease        string
 	leaseCert    string
 	leaseIssued  time.Time
 	leaseExpires time.Time
 
-	renewRetry    time.Time
-	renewErr      error
-	renewalDenied error
-}
-
-type login struct {
-	challengeID string
-	nonce       string
-	state       string
-	purpose     string
-	expires     time.Time
+	renewRetry      time.Time
+	renewErr        error
+	renewalDenied   error
+	deniedTokenHash [sha256.Size]byte
+	hasDeniedToken  bool
 }
 
 // persisted is the sole serialized representation kept by the host. Its
@@ -161,17 +153,16 @@ type persisted struct {
 	UserID        string `json:"user_id,omitempty"`
 	DeviceID      string `json:"device_id,omitempty"`
 	RefreshHandle string `json:"refresh_handle,omitempty"`
-	// RenewalDenied records a definitive authority rejection of the refresh
-	// credential. It is optional so state written before this field existed
-	// still loads, and it stays until a successful browser reauthentication.
+	// RenewalDenied records a definitive authority rejection of the endpoint's
+	// standing credentials. It stays until a successful re-enrollment or fresh
+	// host token renewal.
 	RenewalDenied string `json:"renewal_denied,omitempty"`
 }
 
 // New opens the account stored in store for the authority at baseURL. baseURL
 // must be HTTPS, or HTTP on a loopback host for local development; it may
 // include a path prefix. caHex is the pinned authority public key accepted by
-// identity.ParsePublicKey (hex, as written by `relay-identity keygen
-// -public-out`, or base64).
+// identity.ParsePublicKey (hex or base64).
 //
 // New never writes to the store. An absent value yields an account that is not
 // yet enrolled. A present but invalid value returns ErrStateInvalid or
@@ -232,17 +223,40 @@ func (a *Account) DeviceID() string {
 	return a.deviceID
 }
 
+// SetTokenProvider registers a callback that returns the host client's current
+// authentication token on demand during certificate renewal. The callback must
+// not call back into Account. Passing nil clears the provider.
+func (a *Account) SetTokenProvider(fn func(context.Context) (string, error)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tokenProvider = fn
+}
+
+// UpdateToken updates the in-memory host client authentication token used for
+// direct-token certificate renewal. The token is never persisted to Store.
+func (a *Account) UpdateToken(token string) error {
+	tok := strings.TrimSpace(token)
+	if tok == "" || len(tok) > maxTokenBytes {
+		return errors.New("account: client auth token is required")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.liveToken = tok
+	a.renewRetry = time.Time{}
+	a.renewErr = nil
+	return nil
+}
+
 // Reset forgets the local account and replaces the endpoint key. It is the only
-// way to switch to a different account: a browser sign-in for another identity
-// is rejected with ErrAlreadyEnrolled until Reset succeeds. Hosts must obtain
-// explicit local user confirmation before calling it, because the old device
-// identity cannot be recovered from this device. Reauthenticating the same
-// account does not require Reset.
+// way to switch to a different account: enrolling with a token belonging to
+// another identity is rejected with ErrAlreadyEnrolled until Reset succeeds.
+// Hosts must obtain explicit local user confirmation before calling it, because
+// the old device identity cannot be recovered from this device. Reauthenticating
+// the same account does not require Reset.
 //
-// Reset does not contact the identity authority. The old certificate and
-// renewal handle remain valid there until they expire; no revocation is
-// available. The new state is saved before in-memory identity is changed, so a
-// storage failure leaves the previous account usable.
+// Reset does not contact the identity authority. The new state is saved before
+// in-memory identity is changed, so a storage failure leaves the previous
+// account usable.
 func (a *Account) Reset() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -260,7 +274,7 @@ func (a *Account) Reset() error {
 	a.userID = ""
 	a.deviceID = ""
 	a.refreshHandle = ""
-	a.pending = nil
+	a.liveToken = ""
 	a.lease = ""
 	a.leaseCert = ""
 	a.leaseIssued = time.Time{}
@@ -268,137 +282,81 @@ func (a *Account) Reset() error {
 	a.renewRetry = time.Time{}
 	a.renewErr = nil
 	a.renewalDenied = nil
+	a.deniedTokenHash = [sha256.Size]byte{}
+	a.hasDeniedToken = false
 	return nil
 }
 
-// Begin requests a fresh enrollment challenge using the authority's default
-// redirect URI and returns the authorization URL to open in the system browser.
-func (a *Account) Begin(ctx context.Context) (string, error) {
-	return a.BeginWithRedirect(ctx, "")
-}
+// Enroll binds this endpoint's Ed25519 key to the account represented by the
+// host client's existing authentication token. The endpoint key is created and
+// persisted on the first call, so an interrupted enrollment reuses the same
+// device identity next time. Enroll is also used to reauthenticate an existing
+// account (for example after certificate expiry or credential rejection); the
+// verified identity must match the stored account unless Reset is called first.
+func (a *Account) Enroll(ctx context.Context, token string) error {
+	tok := strings.TrimSpace(token)
+	if tok == "" || len(tok) > maxTokenBytes {
+		return errors.New("account: client auth token is required")
+	}
 
-// BeginWithRedirect requests a fresh enrollment challenge using the supplied
-// redirect URI (or the authority's default when empty). The endpoint key is
-// created and persisted on the first call, so an interrupted sign-in reuses
-// the same device identity next time. BeginWithRedirect is also used to
-// reauthenticate an existing account, for example after its certificate expired
-// or its renewal handle was revoked; the verified identity must still match
-// the stored account.
-func (a *Account) BeginWithRedirect(ctx context.Context, redirectURI string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.key == nil {
 		_, key, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
-			return "", fmt.Errorf("account: generate endpoint key: %w", err)
+			return fmt.Errorf("account: generate endpoint key: %w", err)
 		}
 		a.key = key
 		if err := a.saveLocked(); err != nil {
 			a.key = nil
-			return "", err
+			return err
 		}
 	}
 
-	publicKey := base64.RawURLEncoding.EncodeToString(a.key.Public().(ed25519.PublicKey))
-	var resp challengeResponse
+	pub := a.key.Public().(ed25519.PublicKey)
+	var chResp challengeResponse
 	if err := a.post(ctx, challengePath, challengeRequest{
-		Purpose:     "enroll",
-		PublicKey:   publicKey,
-		RedirectURI: strings.TrimSpace(redirectURI),
-	}, &resp); err != nil {
-		return "", err
-	}
-	now := a.now()
-	if resp.ChallengeID == "" || resp.Nonce == "" || resp.State == "" || resp.AuthorizationURL == "" || resp.ExpiresAt == 0 {
-		return "", fmt.Errorf("%w: incomplete challenge response", ErrCredential)
-	}
-	if resp.CodeChallengeMethod != "S256" {
-		return "", fmt.Errorf("%w: authority does not use PKCE S256", ErrCredential)
-	}
-	expires := time.Unix(resp.ExpiresAt, 0).UTC()
-	if !expires.After(now) {
-		return "", fmt.Errorf("%w: expired challenge response", ErrCredential)
-	}
-	if err := checkAuthorizationURL(resp.AuthorizationURL); err != nil {
-		return "", err
-	}
-	if wantRedirect := strings.TrimSpace(redirectURI); wantRedirect != "" {
-		parsed, err := url.Parse(resp.AuthorizationURL)
-		if err != nil || parsed.Query().Get("redirect_uri") != wantRedirect {
-			return "", fmt.Errorf("%w: authority returned an unexpected redirect URI", ErrCredential)
-		}
-	}
-	a.pending = &login{
-		challengeID: resp.ChallengeID,
-		nonce:       resp.Nonce,
-		state:       resp.State,
-		purpose:     "enroll",
-		expires:     expires,
-	}
-	return resp.AuthorizationURL, nil
-}
-
-// Finish completes the browser login with the authorization code and state
-// delivered to the registered redirect URI. The returned certificate is
-// verified against the pinned authority, the endpoint key, the response's
-// device and user identifiers and its expiry before it is saved. On success
-// the store is updated with the certificate and the opaque renewal handle.
-// Reauthentication of the stored account is allowed and replaces the
-// certificate and renewal handle; a verified identity that differs from the
-// stored account is rejected with ErrAlreadyEnrolled.
-func (a *Account) Finish(ctx context.Context, code, state string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.key == nil {
-		return ErrNoLogin
-	}
-	pending := a.pending
-	if pending == nil {
-		return ErrNoLogin
-	}
-	now := a.now()
-	if !now.Before(pending.expires) {
-		a.pending = nil
-		return ErrNoLogin
-	}
-	if subtle.ConstantTimeCompare([]byte(pending.state), []byte(state)) != 1 {
-		return ErrStateMismatch
-	}
-	if code == "" || len(code) > maxCodeBytes {
-		return errors.New("account: authorization code is required")
-	}
-
-	proof := identity.ProofMessage(pending.challengeID, pending.nonce, pending.purpose, a.key.Public().(ed25519.PublicKey))
-	var resp enrollResponse
-	err := a.post(ctx, enrollPath, enrollRequest{
-		ChallengeID: pending.challengeID,
-		Code:        code,
-		State:       state,
-		Signature:   encodeSignature(ed25519.Sign(a.key, proof)),
-	}, &resp)
-	if err != nil {
-		// Any response from the authority consumed the single-use challenge.
-		var api *APIError
-		if errors.As(err, &api) {
-			a.pending = nil
-		}
+		Purpose:   "enroll",
+		PublicKey: base64.RawURLEncoding.EncodeToString(pub),
+	}, &chResp); err != nil {
 		return err
 	}
-	a.pending = nil
-	return a.applyEnrollmentLocked(resp, now)
+	now := a.now()
+	if chResp.ChallengeID == "" || chResp.Nonce == "" || chResp.ExpiresAt == 0 {
+		return fmt.Errorf("%w: incomplete challenge response", ErrCredential)
+	}
+	expires := time.Unix(chResp.ExpiresAt, 0).UTC()
+	if !expires.After(now) {
+		return fmt.Errorf("%w: expired challenge response", ErrCredential)
+	}
+
+	proof := identity.ProofMessage(chResp.ChallengeID, chResp.Nonce, "enroll", pub)
+	var resp enrollResponse
+	if err := a.post(ctx, enrollPath, enrollRequest{
+		ChallengeID: chResp.ChallengeID,
+		Token:       tok,
+		Signature:   encodeSignature(ed25519.Sign(a.key, proof)),
+	}, &resp); err != nil {
+		return err
+	}
+	if err := a.applyEnrollmentLocked(resp, a.now()); err != nil {
+		return err
+	}
+	a.liveToken = tok
+	a.deniedTokenHash = [sha256.Size]byte{}
+	a.hasDeniedToken = false
+	return nil
 }
 
 // Current returns credentials for a new signaling connection together with a
 // fresh lease. Each explicit call asks the authority for a new lease (a cached
 // lease is reused only for leaseCacheWindow so concurrent callers share one
-// request). When the certificate is close to expiry and a renewal handle
-// exists, Current renews it first, atomically replacing the stored handle.
-// A definitive 401 renewal denial (refresh_rejected or
-// identity_verification_failed) is returned immediately and keeps denying
-// until a successful browser sign-in, rather than falling back to the still
-// valid certificate.
+// request). When the certificate is close to expiry and a live token or renewal
+// handle exists, Current renews it first. A definitive 401 renewal denial
+// (token_rejected, refresh_rejected or identity_verification_failed) is
+// returned immediately and keeps denying until a fresh host token is supplied
+// or Enroll succeeds, rather than falling back to the still valid certificate.
 func (a *Account) Current(ctx context.Context) (*endpoint.Credentials, endpoint.LeaseProof, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -441,14 +399,11 @@ func (a *Account) applyEnrollmentLocked(resp enrollResponse, now time.Time) erro
 	if !principal.PublicKey.Equal(a.key.Public()) {
 		return fmt.Errorf("%w: certificate does not bind this endpoint key", ErrCredential)
 	}
-	// A browser sign-in may replace the credential only when it proves the
-	// same account and endpoint device. Renewal, which has no user present,
-	// applies the same rule.
 	if resp.DeviceID != principal.DeviceID || resp.RemoteUserID != principal.RemoteUserID() {
 		return fmt.Errorf("%w: enrollment identifiers do not match the certificate", ErrCredential)
 	}
 	if a.certificate != "" && (principal.DeviceID != a.deviceID || principal.RemoteUserID() != a.userID) {
-		return fmt.Errorf("%w: sign-in returned a different account or device", ErrAlreadyEnrolled)
+		return fmt.Errorf("%w: enrollment returned a different account or device", ErrAlreadyEnrolled)
 	}
 	if resp.ExpiresAt != principal.Expires.Unix() {
 		return fmt.Errorf("%w: enrollment expiry does not match the certificate", ErrCredential)
@@ -483,18 +438,62 @@ func (a *Account) applyEnrollmentLocked(resp enrollResponse, now time.Time) erro
 	return nil
 }
 
-// ensureCertificateLocked renews the certificate when it is close to expiry.
-// While the current certificate is still valid, a failed renewal is recorded
-// and retried later rather than breaking working connections. Once the
-// certificate has expired, the renewal error is returned.
+// resolveLiveTokenLocked returns the current host auth token if available.
+func (a *Account) resolveLiveTokenLocked(ctx context.Context) (string, bool, error) {
+	if a.tokenProvider != nil {
+		tok, err := a.tokenProvider(ctx)
+		if err != nil {
+			return "", true, err
+		}
+		tok = strings.TrimSpace(tok)
+		if tok != "" {
+			if len(tok) > maxTokenBytes {
+				return "", true, errors.New("account: token provider returned oversized token")
+			}
+			return tok, true, nil
+		}
+	}
+	if a.liveToken != "" {
+		return a.liveToken, false, nil
+	}
+	return "", false, nil
+}
+
+// ensureCertificateLocked renews the certificate when it is close to expiry or
+// when recovering from a denial with a fresh host auth token.
 func (a *Account) ensureCertificateLocked(ctx context.Context, now time.Time) error {
 	if a.renewalDenied != nil {
-		return fmt.Errorf("%w: certificate renewal: %v", ErrCredential, a.renewalDenied)
+		tok, _, err := a.resolveLiveTokenLocked(ctx)
+		if err != nil || tok == "" {
+			return fmt.Errorf("%w: certificate renewal: %v", ErrCredential, a.renewalDenied)
+		}
+		sum := sha256.Sum256([]byte(tok))
+		if a.hasDeniedToken && sum == a.deniedTokenHash {
+			return fmt.Errorf("%w: certificate renewal: %v", ErrCredential, a.renewalDenied)
+		}
+		// A genuinely new host token was supplied after a denial; attempt
+		// direct-token renewal immediately and never fall back to the denied cert.
+		if err := a.renewWithTokenLocked(ctx, now, tok); err != nil {
+			a.renewErr = err
+			if isDefinitiveRenewalDenial(err) {
+				a.deniedTokenHash = sum
+				a.hasDeniedToken = true
+				a.renewalDenied = err
+				_ = a.saveLocked()
+			}
+			return fmt.Errorf("%w: certificate renewal: %v", ErrCredential, err)
+		}
+		a.renewRetry = time.Time{}
+		a.renewErr = nil
+		return nil
 	}
+
 	if now.Before(a.certExpires) && a.certExpires.Sub(now) > certificateRenewMargin {
 		return nil
 	}
-	if a.refreshHandle == "" {
+
+	hasToken := a.liveToken != "" || a.tokenProvider != nil
+	if !hasToken && a.refreshHandle == "" {
 		if now.Before(a.certExpires) {
 			return nil
 		}
@@ -509,26 +508,17 @@ func (a *Account) ensureCertificateLocked(ctx context.Context, now time.Time) er
 		}
 		return ErrExpired
 	}
+
 	err := a.renewLocked(ctx, now)
 	if err != nil {
 		a.renewErr = err
-		// A definitive rejection of this endpoint's standing credentials is
-		// permanent until a browser sign-in. Do not fall back to the still
-		// valid certificate, which would hide that the authority no longer
-		// accepts this device.
 		if isDefinitiveRenewalDenial(err) {
 			a.renewalDenied = err
-			// Persist the denial so a restart during a provider outage cannot
-			// resume a certificate the authority has already revoked. The
-			// in-process denial still applies if the store write fails.
 			if saveErr := a.saveLocked(); saveErr != nil {
 				return fmt.Errorf("%w: certificate renewal: %v (persist denial: %v)", ErrCredential, err, saveErr)
 			}
 			return fmt.Errorf("%w: certificate renewal: %v", ErrCredential, err)
 		}
-		// A certificate from the pinned authority that does not bind this
-		// endpoint's identity is not a transient outage. Refuse to hand out
-		// credentials rather than silently keep using the old certificate.
 		if errors.Is(err, ErrCredential) {
 			return fmt.Errorf("account: certificate renewal: %w", err)
 		}
@@ -544,22 +534,16 @@ func (a *Account) ensureCertificateLocked(ctx context.Context, now time.Time) er
 }
 
 // isDefinitiveRenewalDenial reports whether the authority explicitly rejected
-// this endpoint's refresh credential, rather than failing transiently. These
-// responses cannot succeed on retry; the host must reauthenticate the account
-// in the browser.
+// this endpoint's standing credentials, rather than failing transiently.
 func isDefinitiveRenewalDenial(err error) bool {
 	var api *APIError
 	return errors.As(err, &api) && api.StatusCode == http.StatusUnauthorized && validRenewalDenialCode(api.Code)
 }
 
-// validRenewalDenialCode lists the authority responses that permanently reject
-// this endpoint's standing credentials.
 func validRenewalDenialCode(code string) bool {
-	return code == "refresh_rejected" || code == "identity_verification_failed"
+	return code == "refresh_rejected" || code == "token_rejected" || code == "identity_verification_failed"
 }
 
-// renewalDenialCode returns the persisted form of a definitive denial, or ""
-// when the account is not denied.
 func renewalDenialCode(err error) string {
 	var api *APIError
 	if errors.As(err, &api) && validRenewalDenialCode(api.Code) {
@@ -568,14 +552,65 @@ func renewalDenialCode(err error) string {
 	return ""
 }
 
-// renewalDenialError rebuilds the in-memory error for a persisted denial.
 func renewalDenialError(code string) error {
 	return &APIError{StatusCode: http.StatusUnauthorized, Code: code}
 }
 
 func (a *Account) renewLocked(ctx context.Context, now time.Time) error {
+	tok, fromProvider, tokErr := a.resolveLiveTokenLocked(ctx)
+	if tokErr != nil && a.refreshHandle == "" {
+		return tokErr
+	}
+	if tok != "" {
+		err := a.renewWithTokenLocked(ctx, now, tok)
+		if err == nil {
+			return nil
+		}
+		// If a cached startup token expired while an unattended refresh handle
+		// is still held, drop the stale cached token and fall back to the handle.
+		var api *APIError
+		if errors.As(err, &api) && api.StatusCode == http.StatusUnauthorized && api.Code == "token_rejected" {
+			if !fromProvider && a.liveToken == tok {
+				a.liveToken = ""
+			}
+			if a.refreshHandle != "" {
+				return a.renewWithHandleLocked(ctx, now)
+			}
+			a.deniedTokenHash = sha256.Sum256([]byte(tok))
+			a.hasDeniedToken = true
+		}
+		return err
+	}
+	return a.renewWithHandleLocked(ctx, now)
+}
+
+func (a *Account) renewWithTokenLocked(ctx context.Context, now time.Time, token string) error {
+	nonce, err := newNonce()
+	if err != nil {
+		return err
+	}
+	pub := a.key.Public().(ed25519.PublicKey)
+	proof := identity.DirectRenewProofMessage(nonce, token, pub)
+	var resp renewResponse
+	if err := a.post(ctx, renewPath, renewRequest{
+		Token:     token,
+		PublicKey: base64.RawURLEncoding.EncodeToString(pub),
+		Nonce:     nonce,
+		Signature: encodeSignature(ed25519.Sign(a.key, proof)),
+	}, &resp); err != nil {
+		return err
+	}
+	if err := a.applyRenewalLocked(resp, now, false); err != nil {
+		return err
+	}
+	a.deniedTokenHash = [sha256.Size]byte{}
+	a.hasDeniedToken = false
+	return nil
+}
+
+func (a *Account) renewWithHandleLocked(ctx context.Context, now time.Time) error {
 	if a.refreshHandle == "" {
-		return errors.New("account: no refresh handle")
+		return errors.New("account: no refresh handle or live token")
 	}
 	nonce, err := newNonce()
 	if err != nil {
@@ -591,6 +626,10 @@ func (a *Account) renewLocked(ctx context.Context, now time.Time) error {
 	}, &resp); err != nil {
 		return err
 	}
+	return a.applyRenewalLocked(resp, now, true)
+}
+
+func (a *Account) applyRenewalLocked(resp renewResponse, now time.Time, requireHandle bool) error {
 	if resp.Certificate == "" {
 		return fmt.Errorf("%w: renewal returned no certificate", ErrCredential)
 	}
@@ -613,16 +652,19 @@ func (a *Account) renewLocked(ctx context.Context, now time.Time) error {
 	if !now.Before(principal.Expires) {
 		return fmt.Errorf("%w: renewed certificate is already expired", ErrCredential)
 	}
-	// The authority may have rotated the provider refresh token, so the new
-	// handle always replaces the old one.
-	if resp.RefreshHandle == "" || len(resp.RefreshHandle) > maxHandleBytes {
+	if requireHandle && resp.RefreshHandle == "" {
 		return fmt.Errorf("%w: renewal returned no usable refresh handle", ErrCredential)
+	}
+	if len(resp.RefreshHandle) > maxHandleBytes {
+		return fmt.Errorf("%w: renewal returned oversized refresh handle", ErrCredential)
 	}
 
 	previous := a.credentialLocked()
 	a.certificate = resp.Certificate
 	a.certExpires = principal.Expires
-	a.refreshHandle = resp.RefreshHandle
+	if resp.RefreshHandle != "" {
+		a.refreshHandle = resp.RefreshHandle
+	}
 	a.renewalDenied = nil
 	a.clearLeaseLocked()
 	if err := a.saveLocked(); err != nil {
@@ -783,7 +825,7 @@ func (a *Account) restore(raw string) error {
 	if state.RenewalDenied != "" && !validRenewalDenialCode(state.RenewalDenied) {
 		return fmt.Errorf("%w: unknown renewal denial", ErrStateInvalid)
 	}
-	if state.RenewalDenied != "" && state.RefreshHandle == "" {
+	if state.RenewalDenied == "refresh_rejected" && state.RefreshHandle == "" {
 		return fmt.Errorf("%w: renewal denial without a refresh handle", ErrStateInvalid)
 	}
 	a.certificate = state.Certificate
@@ -813,25 +855,19 @@ func (a *Account) restore(raw string) error {
 }
 
 type challengeRequest struct {
-	Purpose     string `json:"purpose"`
-	PublicKey   string `json:"public_key"`
-	RedirectURI string `json:"redirect_uri,omitempty"`
+	Purpose   string `json:"purpose"`
+	PublicKey string `json:"public_key"`
 }
 
 type challengeResponse struct {
-	ChallengeID         string `json:"challenge_id"`
-	Nonce               string `json:"nonce"`
-	State               string `json:"state"`
-	CodeChallenge       string `json:"code_challenge"`
-	CodeChallengeMethod string `json:"code_challenge_method"`
-	AuthorizationURL    string `json:"authorization_url"`
-	ExpiresAt           int64  `json:"expires_at"`
+	ChallengeID string `json:"challenge_id"`
+	Nonce       string `json:"nonce"`
+	ExpiresAt   int64  `json:"expires_at"`
 }
 
 type enrollRequest struct {
 	ChallengeID string `json:"challenge_id"`
-	Code        string `json:"code"`
-	State       string `json:"state"`
+	Token       string `json:"token"`
 	Signature   string `json:"signature"`
 }
 
@@ -840,7 +876,7 @@ type enrollResponse struct {
 	DeviceID      string `json:"device_id"`
 	RemoteUserID  string `json:"remote_user_id"`
 	ExpiresAt     int64  `json:"expires_at"`
-	RefreshHandle string `json:"refresh_handle"`
+	RefreshHandle string `json:"refresh_handle,omitempty"`
 	Renewable     bool   `json:"renewable"`
 }
 
@@ -859,14 +895,16 @@ type leaseResponse struct {
 }
 
 type renewRequest struct {
-	RefreshHandle string `json:"refresh_handle"`
+	RefreshHandle string `json:"refresh_handle,omitempty"`
+	Token         string `json:"token,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
 	Nonce         string `json:"nonce"`
 	Signature     string `json:"signature"`
 }
 
 type renewResponse struct {
 	Certificate   string `json:"certificate"`
-	RefreshHandle string `json:"refresh_handle"`
+	RefreshHandle string `json:"refresh_handle,omitempty"`
 	DeviceID      string `json:"device_id"`
 	RemoteUserID  string `json:"remote_user_id"`
 	ExpiresAt     int64  `json:"expires_at"`
@@ -937,7 +975,7 @@ func decodeAPIError(resp *http.Response) error {
 }
 
 // parseServiceURL validates the configured authority base URL. HTTPS is
-// required except for loopback development, mirroring the identity service.
+// required except for loopback development.
 func parseServiceURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -954,17 +992,6 @@ func parseServiceURL(raw string) (*url.URL, error) {
 		return nil, err
 	}
 	return u, nil
-}
-
-func checkAuthorizationURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("account: authority returned an invalid authorization URL: %w", err)
-	}
-	if u.Scheme == "" || u.Host == "" || u.User != nil || u.Fragment != "" {
-		return errors.New("account: authority returned an invalid authorization URL")
-	}
-	return checkTransport(u)
 }
 
 func checkTransport(u *url.URL) error {

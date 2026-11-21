@@ -2,46 +2,25 @@
 
 [← 文档目录](README.md) · [返回主页](../README.md)
 
-需要 **Go 1.25** 或更高版本。`relay-identity` 与 `relay` 可独立部署，以下均为 Bash 示例。
+需要 **Go 1.25** 或更高版本。设备证书签发服务由外部身份后端独立部署；本仓库构建并提供 `relay`（信令 + STUN / TURN）与 `vanora-desktop`。
 
-## 1. 构建并生成身份签名密钥
+## 1. 对接外部身份签发后端
 
-```sh
-go build ./cmd/...
-go run ./cmd/relay-identity keygen -out identity-signing-key -public-out identity-signing-key.pub
-```
+端点证书与活性租约的签发逻辑不包含在本开源仓库中。部署 `relay` 前，需在你的私有身份后端实现 [外部身份签发协议](../internal/identity/README.md)：
 
-> [!IMPORTANT]
-> 私钥（`identity-signing-key`）只保存在独立部署的 `relay-identity` 主机上（权限 `0600`），不要分发给信令、权益后端或客户端；仅将公钥（`identity-signing-key.pub`）分发给 `relay` 与各端点。
+- 持有独立的 Ed25519 签发私钥，仅向 `relay`、桌面端与移动端分发对应的 32 字节 **公钥**（hex 或 base64）。
+- 暴露 `POST /v1/identity/challenges`、`POST /v1/identity/enroll`、`POST /v1/identity/lease` 与 `POST /v1/identity/renew`，在签发前校验宿主客户端现有认证令牌与端点 Ed25519 私钥持有证明（PoP）。
+- 若同时对接外部权益服务校验中继权限，证书中的 `iss` 与 `sub` 须与权益服务识别的 `(issuer, subject)` 保持一致。
 
-## 2. 配置 OIDC 并启动 `relay-identity`
-
-`relay-identity` 支持任意符合标准 Discovery / JWKS 规范的 OIDC 提供方（如 Keycloak），配置需满足：
-
-- 单独注册一个原生应用 Client：启用 **Authorization Code（Standard Flow）** 与 **PKCE S256**，登记精确回调地址，并允许 `openid offline_access`。
-- 若配合外部权益服务校验中继权限，`VANORA_IDENTITY_OIDC_ISSUER` 须与权益服务使用的完整 issuer URL（例如 Keycloak 的完整 realm URL）一致，且同一账号在两个端应返回相同的 `sub`。
-- 端点在系统浏览器中完成登录；电脑端无人值守自动续期要求 OIDC 的 refresh grant 返回可验证的 ID token（如提供方不支持，可设置 `VANORA_IDENTITY_DISABLE_REFRESH=1`，证书过期后需重新登录）。
+## 2. 构建并启动 `relay`（信令 + STUN / TURN）
 
 ```sh
-export VANORA_IDENTITY_SIGNING_KEY_FILE=identity-signing-key
-export VANORA_IDENTITY_OIDC_ISSUER=https://auth.example.com/realms/vanora
-export VANORA_IDENTITY_OIDC_CLIENT_ID=vanora-native
-export VANORA_IDENTITY_OIDC_REDIRECT_URI=com.vanora.app:/oauth/callback
-export VANORA_IDENTITY_OIDC_REDIRECT_URIS=http://127.0.0.1/oauth/callback
-
-go run ./cmd/relay-identity serve
+go build ./cmd/relay
 ```
-
-> [!TIP]
-> 同时配置 `VANORA_IDENTITY_OIDC_REDIRECT_URI`（手机自定义 Scheme）与 `VANORA_IDENTITY_OIDC_REDIRECT_URIS`（如 `http://127.0.0.1/oauth/callback`，不写端口即按 RFC 8252 自动匹配桌面临时回环端口），即可让手机和电脑 Sidecar 都自动完成浏览器回调登录，无需手动复制回调链接。
-
-全部环境变量（监听地址、TLS、证书 / 挑战 / 租约 TTL 等）见 [internal/identity/README.md](../internal/identity/README.md)。
-
-## 3. 启动 `relay`（信令 + STUN / TURN）
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `RELAY_IDENTITY_PUBLIC_KEY` | 是 | — | `relay-identity keygen` 生成的 Ed25519 公钥（hex） |
+| `RELAY_IDENTITY_PUBLIC_KEY` | 是 | — | 外部身份后端对应的 Ed25519 公钥（hex 或 base64） |
 | `RELAY_MEMBERSHIP_URL` | 是 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP） |
 | `RELAY_MEMBERSHIP_TOKEN` | 是 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
 | `TURN_PUBLIC_IP` | 是 | — | 本机或 NAT 对外公布的可达 IPv4（本地开发可用 `127.0.0.1`） |
@@ -52,7 +31,7 @@ go run ./cmd/relay-identity serve
 > `RELAY_MEMBERSHIP_URL` 指向的权益路由属于内部服务接口，跨主机部署时建议通过私有网络与 HTTPS 入口暴露。完整 `TURN_*` 配置（端口范围、绑定网卡、并发上限等）见 [internal/ice/README.md](../internal/ice/README.md)。
 
 ```sh
-export RELAY_IDENTITY_PUBLIC_KEY="$(cat identity-signing-key.pub)"
+export RELAY_IDENTITY_PUBLIC_KEY="<外部身份后端导出的 Ed25519 公钥>"
 export RELAY_MEMBERSHIP_URL=https://entitlement.internal.example.com
 export RELAY_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
 export TURN_PUBLIC_IP=127.0.0.1
@@ -60,12 +39,12 @@ export TURN_PUBLIC_IP=127.0.0.1
 go run ./cmd/relay
 ```
 
-## 4. 端口、探针与运维说明
+## 3. 端口、探针与运维说明
 
 | 服务 | 默认监听 | 健康探针 | 部署与防火墙要求 |
 | --- | --- | --- | --- |
 | 信令（`relay`） | `127.0.0.1:8787` | `GET /healthz` | 经反代暴露 HTTPS 并支持 `/v1/signal` WebSocket 升级，或设置 `RELAY_ADDR`、`RELAY_TLS_CERT`、`RELAY_TLS_KEY` 直接监听 TLS |
-| 身份（`relay-identity`） | `127.0.0.1:8090` | `GET /readyz` | 独立发布权限与 TLS；`/readyz` 检查外部 IdP discovery 与 JWKS 可达性；客户端经 HTTPS 调用 `/v1/identity/*` |
+| 外部身份签发后端 | 部署方自定义 | 部署方自定义 | 独立发布权限与 HTTPS；客户端调用 `/v1/identity/*` |
 | STUN / TURN（`relay`） | `0.0.0.0:3478`（UDP / TCP） | — | 放行 `TURN_PORT`（UDP + TCP）及 `TURN_RELAY_MIN_PORT`–`TURN_RELAY_MAX_PORT` UDP 端口（默认 `49152–65535`）；NAT 需保持公告端口映射；可按需设置 `TURN_BIND_IP`、`TURN_RELAY_BIND_IP` |
 
 **运行时行为与限制：**
@@ -76,7 +55,7 @@ go run ./cmd/relay
 - **目标地址过滤**：公网部署默认拒绝私网、回环、保留段等非公网单播目标 IP。
 - **受限网络说明**：TURN 支持 UDP / TCP 控制传输与 UDP relay；仅放行 HTTPS 的网络环境仍可能无法连通。
 
-## 5. 权益校验接口（TURN 授权）
+## 4. 权益校验接口（TURN 授权）
 
 `relay` 不内置订阅数据库，而是通过一个简单的 HTTP 内部接口向外部权益服务（可对接自建后端或会员系统）查询**发起访问的手机账号**是否允许使用 TURN 中继。
 
@@ -93,7 +72,7 @@ Content-Type: application/json
 ```json
 {
   "issuer": "https://auth.example.com/realms/vanora",
-  "subject": "<OIDC sub>"
+  "subject": "<account subject>"
 }
 ```
 
