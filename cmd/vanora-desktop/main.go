@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -70,14 +71,15 @@ func main() {
 }
 
 func run(args []string) error {
+	const usage = "usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
 	if len(args) == 0 {
-		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]")
+		return errors.New(usage)
 	}
 	cmd := args[0]
 	switch cmd {
 	case "login", "serve", "whoami", "status", "logout":
 	default:
-		return errors.New("usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]")
+		return errors.New(usage)
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
@@ -85,6 +87,8 @@ func run(args []string) error {
 	caHexFlag := fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)")
 	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	signalURL := fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL")
+	lanListen := fs.String("lan-listen", "", "listen for paired LAN clients on a private IP address and port")
+	relayEnabled := fs.Bool("relay", true, "enable the configured official relay")
 	config := fs.String("config", "", "local Vanora session and permission config")
 	hostname, _ := os.Hostname()
 	name := fs.String("name", hostname, "published desktop name")
@@ -98,7 +102,14 @@ func run(args []string) error {
 		}
 		return err
 	}
-	if fs.NArg() != 0 || strings.TrimSpace(*identityURL) == "" || (strings.TrimSpace(*caFile) == "" && strings.TrimSpace(*caHexFlag) == "") {
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	*identityURL = strings.TrimSpace(*identityURL)
+	*signalURL = strings.TrimSpace(*signalURL)
+	hasCA := strings.TrimSpace(*caFile) != "" || strings.TrimSpace(*caHexFlag) != ""
+	cloudConfigured := *identityURL != "" && hasCA
+	if !cloudConfigured && (cmd != "serve" || *identityURL != "" || hasCA || *signalURL != "") {
 		return errors.New("identity URL and pinned public key (-ca or -ca-hex) required")
 	}
 	if *sidecar {
@@ -132,23 +143,25 @@ func run(args []string) error {
 	}
 	defer lock.Unlock()
 
-	var pubRaw []byte
-	if strings.TrimSpace(*caFile) != "" {
-		pubRaw, err = os.ReadFile(*caFile)
+	var a *account.Account
+	var ca ed25519.PublicKey
+	if cloudConfigured {
+		pubRaw := []byte(strings.TrimSpace(*caHexFlag))
+		if strings.TrimSpace(*caFile) != "" {
+			pubRaw, err = os.ReadFile(*caFile)
+			if err != nil {
+				return err
+			}
+		}
+		ca, err = identity.ParsePublicKey(pubRaw)
 		if err != nil {
 			return err
 		}
-	} else {
-		pubRaw = []byte(strings.TrimSpace(*caHexFlag))
-	}
-	ca, err := identity.ParsePublicKey(pubRaw)
-	if err != nil {
-		return err
-	}
-	caHex := hex.EncodeToString(ca)
-	a, err := account.New(*identityURL, caHex, openVault(dir, *identityURL, caHex))
-	if err != nil {
-		return err
+		caHex := hex.EncodeToString(ca)
+		a, err = account.New(*identityURL, caHex, openVault(dir, *identityURL, caHex))
+		if err != nil {
+			return err
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -186,8 +199,8 @@ func run(args []string) error {
 			emitter:    emitter,
 		})
 	case "serve":
-		if *config == "" || strings.TrimSpace(*signalURL) == "" {
-			return errors.New("serve requires -signal and -config")
+		if *config == "" || (*lanListen == "" && !*sidecar && (*signalURL == "" || !*relayEnabled)) {
+			return errors.New("serve requires -config and an enabled -signal, -lan-listen, or -sidecar")
 		}
 		if *tokenStdin && *sidecar {
 			return errors.New("-token-stdin cannot be combined with -sidecar; send {\"type\":\"auth.token\",\"token\":\"...\"} on stdin or set VANORA_CLIENT_TOKEN")
@@ -199,22 +212,25 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if tok != "" {
+		if !*sidecar && *lanListen == "" && (a == nil || (a.UserID() == "" && tok == "")) {
+			return errors.New("endpoint not enrolled; run vanora-desktop login or provide -token / VANORA_CLIENT_TOKEN")
+		}
+		if !*sidecar && *lanListen == "" && tok != "" {
 			if a.UserID() == "" {
 				enrollCtx, cancelEnroll := context.WithTimeout(ctx, 30*time.Second)
 				err = a.Enroll(enrollCtx, tok)
 				cancelEnroll()
-				if err != nil {
-					return err
-				}
-			} else if err = a.UpdateToken(tok); err != nil {
+			} else {
+				err = a.UpdateToken(tok)
+			}
+			if err != nil {
 				return err
 			}
+			tok = ""
 		}
-		if a.UserID() == "" {
-			return errors.New("endpoint not enrolled; run vanora-desktop login or provide -token / VANORA_CLIENT_TOKEN")
-		}
-		return serve(ctx, a, ca, strings.TrimSpace(*signalURL), *name, *config, dir, *sidecar, emitter)
+		return serve(ctx, a, ca, *signalURL, *name, *config, dir, *sidecar, emitter, accessOptions{
+			lanListen: *lanListen, relayEnabled: *relayEnabled, token: tok,
+		})
 	default:
 		return errors.New("unknown subcommand")
 	}
@@ -259,7 +275,7 @@ func isAuthRequiredError(err error) bool {
 func guests(cfg *desktop.Config, owner string) ([]string, error) {
 	seen := map[string]bool{}
 	for _, s := range cfg.Sessions {
-		if s.Owner != owner {
+		if s.Owner != owner && s.Owner != desktop.LocalOwner {
 			return nil, fmt.Errorf("session %q must belong to this desktop account", s.ID)
 		}
 		for _, g := range s.Users {
@@ -269,7 +285,7 @@ func guests(cfg *desktop.Config, owner string) ([]string, error) {
 		}
 	}
 	for _, w := range cfg.Workspaces {
-		if w.Owner != owner {
+		if w.Owner != owner && w.Owner != desktop.LocalOwner {
 			return nil, fmt.Errorf("workspace %q must belong to this desktop account", w.ID)
 		}
 		for _, g := range w.Users {
@@ -286,14 +302,15 @@ func guests(cfg *desktop.Config, owner string) ([]string, error) {
 	return out, nil
 }
 
-func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, name, path, dir string, sidecar bool, emitter *jsonEmitter) error {
+func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, name, path, dir string, sidecar bool, emitter *jsonEmitter, options accessOptions) error {
 	cfg, err := desktop.LoadConfig(path)
 	if err != nil {
 		return err
 	}
-	allowed, err := guests(cfg, a.UserID())
-	if err != nil {
-		return err
+	if !sidecar && options.lanListen == "" && a != nil && a.UserID() != "" {
+		if _, err := guests(cfg, a.UserID()); err != nil {
+			return err
+		}
 	}
 	service, err := desktop.New(cfg, filepath.Join(dir, "sessions"))
 	if err != nil {
@@ -303,40 +320,26 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 	if emitter != nil {
 		service.SetObserver(emitter.Emit)
 	}
-	source := &authority{account: a, adapter: service, ca: ca}
 	ctx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	defer func() { cancel(); workers.Wait() }()
 
-	var statusMu sync.Mutex
-	onlineState := false
-	setOnline := func(v bool, reason string) {
-		statusMu.Lock()
-		onlineState = v
-		statusMu.Unlock()
-		if emitter != nil {
-			if v {
-				emitter.Emit(map[string]any{
-					"type":      "online",
-					"device_id": a.DeviceID(),
-					"user_id":   a.UserID(),
-					"name":      strings.TrimSpace(name),
-				})
-			} else {
-				emitter.Emit(map[string]any{
-					"type":      "offline",
-					"device_id": a.DeviceID(),
-					"error":     reason,
-				})
-			}
+	reloadNow := make(chan struct{}, 1)
+	updates := make(chan struct{}, 1)
+	fail := make(chan error, 1)
+	var currentConfig atomic.Pointer[desktop.Config]
+	currentConfig.Store(cfg)
+	access := &accessManager{
+		ctx: ctx, account: a, ca: ca, url: url, name: name, service: service,
+		dir: dir, emitter: emitter, config: currentConfig.Load, updates: updates,
+		retry: make(chan struct{}, 1), relayEnabled: options.relayEnabled && url != "" && a != nil,
+		token: options.token, requireHostToken: sidecar,
+	}
+	if options.lanListen != "" {
+		if err := access.listen(options.lanListen); err != nil {
+			return err
 		}
 	}
-
-	reloadNow := make(chan struct{}, 1)
-	retryNow := make(chan struct{}, 1)
-	// Keep checking local ACL independently of a stalled WebSocket, enrollment service or ICE path.
-	updates := make(chan []string, 1)
-	fail := make(chan error, 1)
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
@@ -356,12 +359,8 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 				continue
 			}
 			var next *desktop.Config
-			var list []string
 			if e == nil {
 				next, e = desktop.ParseConfig(b)
-			}
-			if e == nil {
-				list, e = guests(next, a.UserID())
 			}
 			if e == nil {
 				e = service.ReloadACL(next)
@@ -376,22 +375,22 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 				return
 			}
 			prev = b
+			currentConfig.Store(next)
 			if emitter != nil {
 				emitter.Emit(map[string]any{"type": "config.reloaded"})
 			}
 			select {
-			case <-updates:
+			case updates <- struct{}{}:
 			default:
-			}
-			select {
-			case updates <- list:
-			case <-ctx.Done():
-				return
 			}
 		}
 	}()
 
 	if sidecar {
+		ready := map[string]any{
+			"type": "ready", "user_id": access.userID(), "device_id": access.deviceID(),
+			"name": strings.TrimSpace(name),
+		}
 		// Watch parent stdin: EOF shuts down the sidecar cleanly so parent exit
 		// never leaves an orphaned process. JSONL control commands are also handled.
 		go func() {
@@ -402,10 +401,7 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 				if line == "" {
 					continue
 				}
-				var cmd struct {
-					Type  string `json:"type"`
-					Token string `json:"token"`
-				}
+				var cmd accessCommand
 				if json.Unmarshal([]byte(line), &cmd) != nil {
 					continue
 				}
@@ -418,93 +414,24 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 					case reloadNow <- struct{}{}:
 					default:
 					}
-				case "auth.token":
-					if err := a.UpdateToken(cmd.Token); err != nil {
-						emitter.Emit(map[string]any{"type": "auth.error", "error": err.Error()})
-					} else {
-						emitter.Emit(map[string]any{"type": "auth.ok"})
-						select {
-						case retryNow <- struct{}{}:
-						default:
-						}
-					}
 				case "status":
-					statusMu.Lock()
-					on := onlineState
-					statusMu.Unlock()
 					emitter.Emit(map[string]any{
-						"type":      "status",
-						"online":    on,
-						"user_id":   a.UserID(),
-						"device_id": a.DeviceID(),
+						"type": "status", "online": access.online.Load(),
+						"user_id": access.userID(), "device_id": access.deviceID(),
 					})
+				default:
+					access.command(cmd)
 				}
 			}
 			cancel()
 		}()
-		emitter.Emit(map[string]any{
-			"type":      "ready",
-			"user_id":   a.UserID(),
-			"device_id": a.DeviceID(),
-			"name":      strings.TrimSpace(name),
-		})
+		emitter.Emit(ready)
 	}
-
-	for delay := time.Second; ctx.Err() == nil; {
-		s, e := transport.Dial(ctx, url, "desktop", source, service)
-		if e == nil {
-			select {
-			case allowed = <-updates:
-			default:
-			}
-			e = publish(ctx, s, name, allowed)
-			if e == nil {
-				delay = time.Second
-				setOnline(true, "")
-				if emitter == nil {
-					log.Printf("desktop online: %s", a.DeviceID())
-				}
-			online:
-				for {
-					select {
-					case <-ctx.Done():
-						break online
-					case <-s.Done():
-						break online
-					case allowed = <-updates:
-						if e = publish(ctx, s, name, allowed); e != nil {
-							break online
-						}
-					}
-				}
-			}
-			s.Close()
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		reason := ""
-		if e != nil {
-			reason = e.Error()
-		}
-		setOnline(false, reason)
-		if emitter != nil && e != nil && isAuthRequiredError(e) {
-			emitter.Emit(map[string]any{"type": "auth.required", "error": reason})
-		}
-		if emitter == nil && e != nil {
-			log.Printf("desktop offline: %v", e)
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-		case <-retryNow:
-			timer.Stop()
-			delay = time.Second
-		case <-timer.C:
-			delay = min(delay*2, 10*time.Second)
-		}
-	}
+	access.mu.Lock()
+	access.startRelay()
+	access.mu.Unlock()
+	<-ctx.Done()
+	access.close()
 	if emitter != nil {
 		emitter.Emit(map[string]any{"type": "shutdown"})
 	}

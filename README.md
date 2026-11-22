@@ -1,7 +1,8 @@
 # Vanora Relay
 
-让原生手机 App 通过 WebRTC 安全连接本机电脑上的 [Vanora](https://github.com/VANORA-Team/vanora)。
+让原生手机 App 连接电脑上的 [Vanora](https://github.com/VANORA-Team/vanora)。同一局域网内可免账号配对，登录 Vanora 后可通过官方信令从外网连接。
 
+- **局域网配对**：桌面为选定的会话和工作区分享访问。一次性链接绑定设备密钥，授权可查看和撤销。
 - **模型密钥不上云**：模型 API Key 仅保留在本地电脑的 Vanora 配置中，无需进入 `relay` 或身份签发后端。
 - **独立身份信任根（签发闭源、验签开源）**：本仓库仅开源端点证书/租约验签、客户端密钥持有证明（PoP）、信令与端到端适配器；设备证书签发私钥与账号鉴权流程由部署方的外部身份后端独立持有，信令与权益服务均无法伪造端点身份。
 - **直接复用宿主客户端登录态**：桌面端与移动端直接复用宿主 AI 客户端已有的认证令牌完成设备注册与续期，不引入独立的账号密码体系。
@@ -90,6 +91,6 @@ VANORA_TEST_CLI=/abs/path/to/vanora/packages/coding-agent/dist/cli.js \
 | `internal/membership` | 外部权益校验 HTTP 客户端 |
 | `protocol` | 信令消息格式与 Ed25519 签名 / 验签 |
 | `endpoint` | 端点证书校验、设备卡验证、签名协商与租约访问控制 |
-| `adapter/` | 账号管理（`account`）、WebRTC 传输与分片（`transport`）、桌面业务适配器（`desktop`） |
+| `adapter/` | 账号管理（`account`）、局域网配对（`lan`）、WebRTC 传输与分片（`transport`）、桌面业务适配器（`desktop`） |
 | `mobile` | 面向 `gomobile` 绑定的移动端 Go SDK |
 | `native/` | Android AAR 构建脚本与 Keystore 封装、iOS Keychain 封装 |

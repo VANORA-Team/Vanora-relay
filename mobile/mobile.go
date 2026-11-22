@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"vanora-relay/adapter/account"
+	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/transport"
 )
 
@@ -27,6 +28,9 @@ type Client struct {
 	identity      *account.Account
 	source        transport.IdentitySource
 	url           string
+	lanKey        string
+	lanTarget     *lan.Target
+	lanName       string
 	ctx           context.Context
 	stop          context.CancelFunc
 	op            sync.Mutex // dial, selection, subscription setup and link recovery
@@ -69,6 +73,17 @@ func NewClient(identityURL, signalURL, publicKeyHex string, store Store) (*Clien
 	}
 	c := newClient(signalURL, a)
 	c.identity = a
+	return c, nil
+}
+
+// NewLANClient creates an account-free client. Use a secure store dedicated to LAN pairing.
+func NewLANClient(store Store) (*Client, error) {
+	key, err := lan.LoadClientKey(store)
+	if err != nil {
+		return nil, err
+	}
+	c := newClient("", nil)
+	c.lanKey = key
 	return c, nil
 }
 
@@ -204,6 +219,9 @@ func (c *Client) dial() (*transport.Client, error) {
 	if err := c.ctx.Err(); err != nil {
 		return nil, err
 	}
+	if c.source == nil {
+		return nil, errors.New("official relay requires an account client")
+	}
 	if c.socket != nil {
 		select {
 		case <-c.socket.Done():
@@ -253,11 +271,57 @@ func (c *Client) Devices() (string, error) {
 // Connect pins both values. The adapter reconnects to this desktop on link loss.
 // A different selection clears queued events and subscriptions from the previous desktop.
 func (c *Client) Connect(deviceID, ownerID string) error {
+	if c.source == nil {
+		return errors.New("official relay requires an account client")
+	}
 	if deviceID == "" || ownerID == "" {
 		return errors.New("desktop and owner required")
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
+	return c.selectDesktop(deviceID, ownerID)
+}
+
+// ConnectLAN pairs with a private desktop link or reconnects using LANAddress.
+func (c *Client) ConnectLAN(link, clientName string) error {
+	if c.lanKey == "" {
+		return errors.New("LAN requires a LAN client")
+	}
+	target, err := lan.ParseTarget(link)
+	if err != nil {
+		return err
+	}
+	c.op.Lock()
+	defer c.op.Unlock()
+	if c.lanTarget != nil && c.lanTarget.Address != target.Address && c.lanTarget.Pin == target.Pin {
+		c.mu.Lock()
+		old := c.peer
+		c.detachLocked()
+		c.mu.Unlock()
+		if old != nil {
+			old.Close()
+		}
+	}
+	c.lanTarget = &target
+	c.lanName = clientName
+	if err := c.selectDesktop(target.Pin, "lan"); err != nil {
+		return err
+	}
+	c.lanTarget.Token = ""
+	return nil
+}
+
+// LANAddress returns the current paired desktop address with the invitation removed.
+func (c *Client) LANAddress() string {
+	c.op.Lock()
+	defer c.op.Unlock()
+	if c.lanTarget == nil || c.lanTarget.Token != "" {
+		return ""
+	}
+	return c.lanTarget.Link()
+}
+
+func (c *Client) selectDesktop(deviceID, ownerID string) error {
 	c.mu.Lock()
 	same := deviceID == c.device && ownerID == c.owner
 	old := c.peer
@@ -294,16 +358,7 @@ func (c *Client) connectLocked() error {
 	if d == "" {
 		return errors.New("no desktop selected")
 	}
-	s, err := c.dial()
-	if err != nil {
-		c.mu.Lock()
-		c.setStateLocked("reconnecting", "", err.Error())
-		c.mu.Unlock()
-		return err
-	}
-	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
-	defer stop()
-	p, err := s.Connect(ctx, d, o)
+	p, start, err := c.dialPeer(d, o)
 	if err != nil {
 		c.mu.Lock()
 		c.setStateLocked("reconnecting", "", err.Error())
@@ -324,6 +379,9 @@ func (c *Client) connectLocked() error {
 		resume[id] = cur.applied
 	}
 	c.mu.Unlock()
+	if start != nil {
+		start()
+	}
 	for id, seq := range resume {
 		if _, err := c.subscribe(p, id, seq); err != nil {
 			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
@@ -338,6 +396,24 @@ func (c *Client) connectLocked() error {
 		}
 	}
 	return nil
+}
+
+func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) {
+	if c.lanTarget != nil {
+		p, start, err := lan.Dial(c.ctx, *c.lanTarget, c.lanKey, c.lanName, (*handler)(c))
+		if err == nil {
+			c.lanTarget.Token = ""
+		}
+		return p, start, err
+	}
+	s, err := c.dial()
+	if err != nil {
+		return nil, nil, err
+	}
+	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
+	defer stop()
+	p, err := s.Connect(ctx, device, owner)
+	return p, nil, err
 }
 
 func (c *Client) recoverConnection() {
@@ -374,6 +450,8 @@ func (c *Client) recoverConnection() {
 // Disconnect forgets the selected desktop and disables automatic reconnect. The identity is retained.
 func (c *Client) Disconnect() { c.op.Lock(); defer c.op.Unlock(); c.disconnect() }
 func (c *Client) disconnect() {
+	c.lanTarget = nil
+	c.lanName = ""
 	c.mu.Lock()
 	p := c.peer
 	c.device = ""
@@ -428,15 +506,20 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 }
 
 func (c *Client) handleAuthError(err error) bool {
-	if !isLoginRequiredError(err) {
+	lanAccessRequired := errors.Is(err, lan.ErrUnpaired)
+	if !lanAccessRequired && !isLoginRequiredError(err) {
 		return false
 	}
 	c.mu.Lock()
 	c.setStateLocked("disconnected", "", err.Error())
 	if len(c.events) < 256 {
+		eventType, state := "auth.state", "login_required"
+		if lanAccessRequired {
+			eventType, state = "access.state", "pairing_required"
+		}
 		payload, _ := json.Marshal(map[string]string{
-			"type":  "auth.state",
-			"state": "login_required",
+			"type":  eventType,
+			"state": state,
 			"error": err.Error(),
 		})
 		c.enqueueLocked(event{payload: string(payload)})

@@ -675,7 +675,7 @@ func (a *Adapter) handleExtensionUI(r *run, rec rpcRecord) {
 		_ = json.Unmarshal(rec.Message, &msgStr)
 	}
 	a.mu.Lock()
-	if r.terminal || r.stopFlag.Load() || !r.session.cfg.remoteApproval() || !a.effectiveOnlineLocked() || len(r.pendingUI) >= maxPendingUI {
+	if r.terminal || r.stopFlag.Load() || !r.session.cfg.remoteApproval() || !a.userOnlineLocked(r.userID) || len(r.pendingUI) >= maxPendingUI {
 		a.mu.Unlock()
 		a.autoCancelExtension(r, rec)
 		return

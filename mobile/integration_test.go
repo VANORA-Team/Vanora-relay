@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"vanora-relay/adapter/desktop"
+	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
@@ -75,15 +77,15 @@ func runFakeMobileCLI() error {
 			"data": map[string]any{"disposition": "started"},
 		})
 		_ = enc.Encode(map[string]any{
-			"type": "message_start",
+			"type":    "message_start",
 			"message": map[string]any{"role": "user", "content": cmd.Message, "timestamp": 1},
 		})
 		_ = enc.Encode(map[string]any{
-			"type": "message_start",
+			"type":    "message_start",
 			"message": map[string]any{"role": "assistant", "content": []any{}, "timestamp": 2},
 		})
 		_ = enc.Encode(map[string]any{
-			"type": "message_update",
+			"type":                  "message_update",
 			"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "plan step"},
 		})
 		_ = enc.Encode(map[string]any{
@@ -113,11 +115,11 @@ func runFakeMobileCLI() error {
 		})
 		_ = enc.Encode(map[string]any{
 			"type": "tool_execution_end", "toolCallId": "call-1", "toolName": "bash",
-			"result": map[string]any{"content": []map[string]any{{"type": "text", "text": "hi"}}},
+			"result":  map[string]any{"content": []map[string]any{{"type": "text", "text": "hi"}}},
 			"isError": false, "durationMs": 5,
 		})
 		_ = enc.Encode(map[string]any{
-			"type": "message_update",
+			"type":                  "message_update",
 			"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "done!"},
 		})
 		_ = enc.Encode(map[string]any{
@@ -187,6 +189,165 @@ func writeJSON(t *testing.T, path string, v any) {
 }
 
 func TestNativeAdapters(t *testing.T) { exerciseAdapters(t, "") }
+
+type lanTestStore struct{ value string }
+
+func (s *lanTestStore) Load() (string, error) { return s.value, nil }
+func (s *lanTestStore) Save(value string) error {
+	s.value = value
+	return nil
+}
+
+func TestLANSharingWithoutAccount(t *testing.T) {
+	t.Setenv("VANORA_MOBILE_FAKE_CLI", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	must(t, err)
+	service, err := desktop.New(&desktop.Config{
+		Executable: executable,
+		Workspaces: []desktop.WorkspaceConfig{
+			{ID: "shared", WorkingDir: dir, SessionDir: filepath.Join(dir, "sessions"), Owner: "local",
+				LANAccess: true, Tools: []string{"read"}, ApprovalPolicy: "remote"},
+			{ID: "private", WorkingDir: dir, SessionDir: filepath.Join(dir, "private"), Owner: "local"},
+		},
+	}, filepath.Join(dir, "state"))
+	must(t, err)
+	defer service.Close()
+
+	desktopStore := &lanTestStore{}
+	server, err := lan.OpenServer(desktopStore, service)
+	must(t, err)
+	defer server.Stop()
+	service.SetLANAuthority(server.Allows)
+	if err := server.Listen(ctx, "0.0.0.0:0"); err == nil {
+		t.Fatal("wildcard address accepted")
+	}
+	must(t, server.Listen(ctx, "127.0.0.1:0"))
+
+	_, controlLink, err := server.Invite(lan.Control)
+	must(t, err)
+	target, err := lan.ParseTarget(controlLink)
+	must(t, err)
+	wrongPin := target
+	wrongPin.Pin = target.Token
+	controllerStore := &lanTestStore{}
+	controller, err := NewLANClient(controllerStore)
+	must(t, err)
+	defer controller.Close()
+	if err := controller.ConnectLAN(wrongPin.Link(), "Controller"); err == nil {
+		t.Fatal("incorrect desktop key pin accepted")
+	}
+	must(t, controller.ConnectLAN(controlLink, "Controller"))
+	if state := controller.ConnectionState(); !strings.Contains(state, `"path":"lan"`) || controller.UserID() != "" {
+		t.Fatalf("unexpected LAN state: %s", state)
+	}
+	saved, err := lan.ParseTarget(controller.LANAddress())
+	must(t, err)
+	if saved.Token != "" {
+		t.Fatal("connection retained the pairing token")
+	}
+	workspaces, err := controller.ListWorkspaces()
+	must(t, err)
+	if !strings.Contains(workspaces, `"workspace_id":"shared"`) || strings.Contains(workspaces, `"workspace_id":"private"`) {
+		t.Fatalf("wrong LAN workspace scope: %s", workspaces)
+	}
+
+	readerStore := &lanTestStore{}
+	reader, err := NewLANClient(readerStore)
+	must(t, err)
+	defer reader.Close()
+	if err := reader.ConnectLAN(controlLink, "Reader"); !errors.Is(err, lan.ErrUnpaired) {
+		t.Fatalf("pairing link reused by another key: %v", err)
+	}
+	invite, _, err := server.Invite(lan.Read)
+	must(t, err)
+	if !server.RevokeInvitation(invite.ID) || server.RevokeInvitation(invite.ID) {
+		t.Fatal("unexpected pairing link revocation")
+	}
+	_, readLink, err := server.Invite(lan.Read)
+	must(t, err)
+	must(t, reader.ConnectLAN(readLink, "Reader"))
+	readerAddress := reader.LANAddress()
+	if _, err := reader.CreateSession("shared", NewRequestID(), "Denied"); !errors.Is(err, errUnavailable) {
+		t.Fatalf("read-only device created a session: %v", err)
+	}
+	created, err := controller.CreateSession("shared", NewRequestID(), "Local conversation")
+	must(t, err)
+	var session struct {
+		ID string `json:"session_id"`
+	}
+	must(t, json.Unmarshal([]byte(created), &session))
+	_, err = reader.OpenSession(session.ID)
+	must(t, err)
+	if _, err := reader.StartRun(session.ID, NewRequestID(), "Denied"); err == nil || err.Error() != "tool_denied" {
+		t.Fatalf("read-only device started a run: %v", err)
+	}
+
+	_, err = controller.OpenSession(session.ID)
+	must(t, err)
+	_, err = controller.StartRun(session.ID, NewRequestID(), "Request approval")
+	must(t, err)
+	for {
+		if ctx.Err() != nil {
+			t.Fatal("LAN run did not reach approval")
+		}
+		raw, err := controller.NextEvent(100)
+		must(t, err)
+		if strings.Contains(raw, `"kind":"ui.request"`) {
+			break
+		}
+	}
+	service.AuthorityLost()
+	_, err = controller.OpenSession(session.ID)
+	must(t, err)
+	controllerID := ""
+	for _, authorized := range server.Status().Clients {
+		if authorized.Name == "Controller" {
+			controllerID = authorized.ID
+		}
+	}
+	if controllerID == "" {
+		t.Fatal("controller missing from the authorized clients list")
+	}
+	must(t, server.RevokeClients(controllerID))
+	service.RefreshLANAccess()
+	if err := controller.Reconnect(); !errors.Is(err, lan.ErrUnpaired) {
+		t.Fatalf("revoked device reconnected: %v", err)
+	}
+	for {
+		if ctx.Err() != nil {
+			t.Fatal("run continued after the controller was revoked")
+		}
+		raw, err := reader.NextEvent(100)
+		must(t, err)
+		if strings.Contains(raw, `"reason":"authority_lost"`) {
+			t.Fatalf("official authority loss stopped a LAN run: %s", raw)
+		}
+		if strings.Contains(raw, `"reason":"lan_access_revoked"`) {
+			break
+		}
+	}
+
+	reader.Close()
+	server.Stop()
+	restarted, err := lan.OpenServer(desktopStore, service)
+	must(t, err)
+	defer restarted.Stop()
+	service.SetLANAuthority(restarted.Allows)
+	must(t, restarted.Listen(ctx, "127.0.0.1:0"))
+	readTarget, err := lan.ParseTarget(readerAddress)
+	must(t, err)
+	readTarget.Address = restarted.Status().Address
+	returning, err := NewLANClient(readerStore)
+	must(t, err)
+	defer returning.Close()
+	must(t, returning.ConnectLAN(readTarget.Link(), "Reader"))
+	if got := restarted.Status().Clients; len(got) != 1 || got[0].Name != "Reader" {
+		t.Fatalf("authorization state did not persist: %+v", got)
+	}
+}
 
 // Set VANORA_TEST_CLI to the installed upstream dist/cli.js. Only the model's
 // HTTP endpoint is simulated; real Vanora handles prompts, sessions and RPC lifecycle.
@@ -407,7 +568,7 @@ func TestMobileEmbeddedCapabilities(t *testing.T) {
 			Title:          "My Repo",
 			WorkingDir:     work,
 			SessionDir:     filepath.Join(dir, "vanora-sessions"),
-			Owner:          host.creds.UserID(),
+			Owner:          desktop.LocalOwner,
 			Tools:          []string{"read", "bash"},
 			ShowThinking:   true,
 			ShowTools:      true,
@@ -417,6 +578,7 @@ func TestMobileEmbeddedCapabilities(t *testing.T) {
 	service, err := desktop.New(cfg, filepath.Join(dir, "state"))
 	must(t, err)
 	defer service.Close()
+	service.SetOfficialOwner(host.creds.UserID())
 	service.AuthorityUntil(time.Now().Add(time.Minute))
 
 	desktopConn, err := transport.Dial(ctx, signalURL, "desktop", host, service)

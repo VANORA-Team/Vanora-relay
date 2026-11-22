@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"unicode"
+
+	"vanora-relay/adapter/lan"
 )
 
 // Config is the local allowlist. It is the only source of sessions, working
@@ -74,6 +76,7 @@ type RetentionConfig struct {
 const (
 	approvalNone   = "none"
 	approvalRemote = "remote"
+	LocalOwner     = "local"
 )
 
 // SessionConfig is one explicitly shared conversation.
@@ -92,6 +95,8 @@ type SessionConfig struct {
 	// Owner always has read and tool access. Only a Tools-enabled user may
 	// submit model prompts; a Read-only user can only read shared context.
 	Owner string `json:"owner"`
+
+	LANAccess bool `json:"lan_access,omitempty"`
 
 	// Tools selects the local tool set. Empty means --no-tools: the user may
 	// still hold a text-only conversation, with extensions and MCP disabled.
@@ -130,6 +135,7 @@ type WorkspaceConfig struct {
 	WorkingDir     string   `json:"working_dir"`
 	SessionDir     string   `json:"session_dir,omitempty"`
 	Owner          string   `json:"owner"`
+	LANAccess      bool     `json:"lan_access,omitempty"`
 	Tools          []string `json:"tools,omitempty"`
 	Arguments      []string `json:"arguments,omitempty"`
 	ShowThinking   bool     `json:"show_thinking,omitempty"`
@@ -181,6 +187,8 @@ type normalizedWorkspace struct {
 	workDir        string
 	sessionDir     string
 	owner          string
+	officialOwner  string
+	lanAccess      bool
 	tools          []string
 	arguments      []string
 	showThinking   bool
@@ -196,6 +204,8 @@ type normalizedSession struct {
 	workDir        string
 	sessionFile    string
 	owner          string
+	officialOwner  string
+	lanAccess      bool
 	tools          []string
 	arguments      []string
 	showThinking   bool
@@ -208,7 +218,19 @@ func (s *normalizedSession) grant(userID string) (Grant, bool) {
 	if userID == "" {
 		return Grant{}, false
 	}
-	if userID == s.owner {
+	if access := lan.Access(userID); access != "" {
+		if !s.lanAccess {
+			return Grant{}, false
+		}
+		control := access == lan.Control
+		return Grant{
+			UserID: userID, Read: true, Tools: control,
+			ShowThinking: control && s.showThinking,
+			ShowTools:    control && s.showTools,
+			Approve:      control && s.remoteApproval(),
+		}, true
+	}
+	if s.owns(userID) {
 		return Grant{
 			UserID:       userID,
 			Read:         true,
@@ -220,6 +242,24 @@ func (s *normalizedSession) grant(userID string) (Grant, bool) {
 	}
 	g, ok := s.grants[userID]
 	return g, ok
+}
+
+func (s *normalizedSession) owns(userID string) bool {
+	return owns(s.owner, s.officialOwner, userID)
+}
+
+func owns(owner, officialOwner, userID string) bool {
+	if owner == LocalOwner {
+		return officialOwner != "" && officialOwner == userID
+	}
+	return owner == userID
+}
+
+func (w *normalizedWorkspace) canCreate(userID string) bool {
+	if access := lan.Access(userID); access != "" {
+		return w.lanAccess && access == lan.Control
+	}
+	return owns(w.owner, w.officialOwner, userID)
 }
 
 func (s *normalizedSession) canRead(userID string) bool {
@@ -513,6 +553,7 @@ func normalizeSession(in *SessionConfig) (*normalizedSession, error) {
 		workDir:        workDir,
 		sessionFile:    sessionFile,
 		owner:          owner,
+		lanAccess:      in.LANAccess,
 		tools:          tools,
 		arguments:      args,
 		showThinking:   in.ShowThinking,
@@ -571,6 +612,7 @@ func normalizeWorkspace(in *WorkspaceConfig) (*normalizedWorkspace, error) {
 		workDir:        workDir,
 		sessionDir:     sessionDir,
 		owner:          owner,
+		lanAccess:      in.LANAccess,
 		tools:          tools,
 		arguments:      args,
 		showThinking:   in.ShowThinking,

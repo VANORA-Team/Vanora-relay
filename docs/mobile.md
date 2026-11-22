@@ -4,6 +4,13 @@
 
 `mobile` 与 `native` 目录提供基于 `gomobile` 的移动端原生绑定（Android AAR / iOS XCFramework），封装了基于宿主客户端令牌的设备注册、签名信令、WebRTC 传输、事件游标恢复与远程交互审批。
 
+## 连接方式
+
+- **局域网，免账号。** 用独立的安全存储创建 `NewLANClient(store)`，扫描或粘贴桌面邀请后调用 `ConnectLAN(link, deviceName)`。连接成功后保存 `LANAddress()` 返回的地址，重新启动时可用它连接同一台桌面。SDK 移除邀请密钥，并在后续连接中核验已配对的桌面公钥。`connection.state` 的路径为 `lan`。收到 `access.state` / `pairing_required` 时，提示用户重新配对。
+- **官方中继，使用 Vanora 账号。** 用 `NewClient(identityURL, signalURL, pinnedPublicKeyHex, store)` 并传入宿主账号令牌。SDK 继续使用签名信令和 WebRTC，由访问者的权益决定是否可用 TURN。
+
+两种客户端共用会话和事件接口。局域网客户端使用独立于官方账号的安全存储槽。宿主退出官方账号后可保留局域网客户端与其配对记录。
+
 ## Android
 
 **环境依赖**：JDK、Go、Python 3、Android SDK（设置 `ANDROID_HOME`）及 NDK（可选设置 `ANDROID_NDK_HOME`）。

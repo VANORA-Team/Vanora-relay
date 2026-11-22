@@ -24,6 +24,7 @@ import (
 	"vanora-relay/adapter/account"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/identity/identitytest"
+	signalserver "vanora-relay/internal/signal"
 )
 
 type memVault struct {
@@ -248,14 +249,24 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 	defer func() { os.Stdin = oldStdin }()
 
 	outR, outW := io.Pipe()
+	defer outR.Close()
+	defer inW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	hub := signalserver.New(auth.PublicKey(), nil, nil)
+	go hub.Run(ctx)
+	relay := httptest.NewServer(hub)
+	defer relay.Close()
+	signalURL := "ws" + strings.TrimPrefix(relay.URL, "http")
 	serveDone := make(chan error, 1)
 	go func() {
-		err := serve(context.Background(), a, auth.PublicKey(), "ws://127.0.0.1:1/v1/signal", "SidecarHost", cfgPath, filepath.Join(dir, "sidecar-state"), true, &jsonEmitter{out: outW})
+		err := serve(ctx, a, auth.PublicKey(), signalURL, "SidecarHost", cfgPath, filepath.Join(dir, "sidecar-state"), true, &jsonEmitter{out: outW}, accessOptions{relayEnabled: true})
 		_ = outW.Close()
 		serveDone <- err
 	}()
 
-	var sawReady, sawAuthOK, sawStatus, sawShutdown bool
+	var sawReady, sawGate, sawAuthOK, sawOnline, sawLogout, sawShutdown bool
+	commands := json.NewEncoder(inW)
 	outScanner := bufio.NewScanner(outR)
 	for outScanner.Scan() {
 		var ev map[string]any
@@ -265,13 +276,30 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 		switch ev["type"] {
 		case "ready":
 			sawReady = true
-			_, _ = inW.Write([]byte("{\"type\":\"auth.token\",\"token\":\"sidecar-token-2\"}\n"))
+			_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "signed-out", "enabled": true})
+		case "access.error":
+			if ev["request_id"] != "signed-out" {
+				t.Fatalf("unexpected access error: %v", ev)
+			}
+			sawGate = true
+			_ = commands.Encode(map[string]any{"type": "auth.token", "token": "sidecar-token-2"})
 		case "auth.ok":
 			sawAuthOK = true
-			_, _ = inW.Write([]byte("{\"type\":\"status\"}\n"))
-		case "status":
-			sawStatus = true
-			_ = inW.Close() // Trigger stdin EOF shutdown.
+		case "online":
+			if !sawAuthOK {
+				t.Fatalf("official relay came online before host authentication: %v", ev)
+			}
+			sawOnline = true
+			_ = commands.Encode(map[string]any{"type": "auth.logout"})
+		case "auth.logout.ok":
+			sawLogout = true
+		case "access.status":
+			if sawLogout {
+				if ev["relay_online"] != false || ev["relay_authorized"] != false || a.UserID() != "" {
+					t.Fatalf("official access survived logout: %v", ev)
+				}
+				_ = inW.Close()
+			}
 		case "shutdown":
 			sawShutdown = true
 		}
@@ -279,7 +307,7 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 	if err := <-serveDone; err != nil {
 		t.Fatalf("sidecar serve failed: %v", err)
 	}
-	if !sawReady || !sawAuthOK || !sawStatus || !sawShutdown {
-		t.Fatalf("sidecar lifecycle incomplete: ready=%v auth_ok=%v status=%v shutdown=%v", sawReady, sawAuthOK, sawStatus, sawShutdown)
+	if !sawReady || !sawGate || !sawAuthOK || !sawOnline || !sawLogout || !sawShutdown {
+		t.Fatalf("sidecar lifecycle incomplete: ready=%v gate=%v auth_ok=%v online=%v logout=%v shutdown=%v", sawReady, sawGate, sawAuthOK, sawOnline, sawLogout, sawShutdown)
 	}
 }

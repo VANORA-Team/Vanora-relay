@@ -176,12 +176,16 @@ func (a *Adapter) handleSessionList(ps *peerState, req wireRequest) {
 }
 
 func (a *Adapter) handleWorkspaceList(ps *peerState, req wireRequest) {
-	user := ps.peer.UserID()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	ps.pendingLists.Add(1)
+	a.enqueueLocked(ps, delivery{listRequestID: req.RequestID, workspaceList: true})
+}
+
+func (a *Adapter) workspaceListLocked(user string) workspaceListResult {
 	out := workspaceListResult{Workspaces: make([]workspaceSummary, 0, len(a.cfg.workspaces))}
 	for _, w := range a.cfg.workspaces {
-		if w.owner != user {
+		if !w.canCreate(user) {
 			continue
 		}
 		policy := ""
@@ -197,7 +201,7 @@ func (a *Adapter) handleWorkspaceList(ps *peerState, req wireRequest) {
 			ApprovalPolicy: policy,
 		})
 	}
-	a.sendResultLocked(ps, req.RequestID, out, "", false)
+	return out
 }
 
 func (a *Adapter) handleSessionCreate(ps *peerState, req wireRequest) {
@@ -216,13 +220,13 @@ func (a *Adapter) handleSessionCreate(ps *peerState, req wireRequest) {
 	titleSHA := payloadHash(title)
 
 	a.mu.Lock()
-	if a.closed || !a.effectiveOnlineLocked() || !ps.peer.Allows(true) || ps.closed.Load() {
+	if a.closed || !a.userOnlineLocked(user) || !ps.peer.Allows(true) || ps.closed.Load() {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
 	w := a.cfg.workspacesByID[wsID]
-	if w == nil || w.owner != user {
+	if w == nil || !w.canCreate(user) {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -374,7 +378,7 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		Messages: visibleMsgs,
 		LastSeq:  sr.ps.LastSeq,
 	}
-	if sr.active != nil && sr.cfg.canApprove(user) && (user == sr.cfg.owner || user == sr.active.userID) && len(sr.active.pendingUI) > 0 {
+	if sr.active != nil && sr.cfg.canApprove(user) && (sr.cfg.owns(user) || user == sr.active.userID) && len(sr.active.pendingUI) > 0 {
 		pending := make([]uiRequestData, 0, len(sr.active.pendingUI))
 		for _, pui := range sr.active.pendingUI {
 			if !pui.resolved {
@@ -489,7 +493,7 @@ func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
 		return
 	}
 	a.mu.Lock()
-	if a.closed || !a.effectiveOnlineLocked() || !ps.peer.Allows(true) || ps.closed.Load() {
+	if a.closed || !a.userOnlineLocked(user) || !ps.peer.Allows(true) || ps.closed.Load() {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -501,12 +505,12 @@ func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
 		return
 	}
 	r := sr.runs[req.RunID]
-	if r == nil || r.terminal {
+	if r == nil || r.terminal || r.stopFlag.Load() || !a.userOnlineLocked(r.userID) {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
-	if user != sr.cfg.owner && user != r.userID {
+	if !sr.cfg.owns(user) && user != r.userID {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -605,7 +609,7 @@ func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
-	if r.userID != user && sr.cfg.owner != user {
+	if r.userID != user && !sr.cfg.owns(user) {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -677,7 +681,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		a.mu.Unlock()
 		return "", nil, codeToolDenied
 	}
-	if !a.effectiveOnlineLocked() || !ps.peer.Allows(true) || ps.closed.Load() {
+	if !a.userOnlineLocked(user) || !ps.peer.Allows(true) || ps.closed.Load() {
 		a.mu.Unlock()
 		return "", nil, codeUnavailable
 	}
@@ -714,10 +718,12 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		tools:            len(sr.cfg.tools) > 0,
 		started:          a.now().UnixMilli(),
 		status:           statusRunning,
-		authorityUntil:   a.authorityUntil,
 		pendingTimestamp: a.now().UnixMilli(),
 		pendingUI:        make(map[string]*pendingUIRequest),
 		done:             make(chan struct{}),
+	}
+	if officialRun(r) {
+		r.authorityUntil = a.authorityUntil
 	}
 	discardRun := func() {
 		delete(sr.ps.Requests, key)

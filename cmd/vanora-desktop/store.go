@@ -20,8 +20,12 @@ import (
 type vault struct{ file, id string }
 
 func openVault(dir, authority, ca string) *vault {
-	file := filepath.Join(dir, "account.enc")
-	hash := sha256.Sum256([]byte(file + "\x00" + authority + "\x00" + ca))
+	return namedVault(dir, "account.enc", authority+"\x00"+ca)
+}
+
+func namedVault(dir, name, scope string) *vault {
+	file := filepath.Join(dir, name)
+	hash := sha256.Sum256([]byte(file + "\x00" + scope))
 	return &vault{file, hex.EncodeToString(hash[:])}
 }
 func (v *vault) cipher(create bool) (cipher.AEAD, error) {

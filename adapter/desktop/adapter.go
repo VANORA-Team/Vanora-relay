@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/transport"
 )
 
@@ -49,6 +50,8 @@ type Adapter struct {
 	authorityUntil  time.Time
 	authorityGen    uint64
 	authorityTimer  *time.Timer
+	lanAuthority    func(string) bool
+	officialOwner   string
 	flushTimer      *time.Timer
 	dirty           bool
 
@@ -96,6 +99,7 @@ type delivery struct {
 	// the current ACL at delivery time. This prevents a list snapshot queued
 	// before ReloadACL from disclosing sessions the user can no longer read.
 	listRequestID string
+	workspaceList bool
 }
 
 // SetObserver installs an optional callback for host lifecycle notifications
@@ -254,6 +258,8 @@ func sessionFromWorkspace(w *normalizedWorkspace, rec createdSessionRecord, sess
 		workDir:        w.workDir,
 		sessionFile:    sessionFile,
 		owner:          w.owner,
+		officialOwner:  w.officialOwner,
+		lanAccess:      w.lanAccess,
 		tools:          slices.Clone(w.tools),
 		arguments:      slices.Clone(w.arguments),
 		showThinking:   w.showThinking,
@@ -430,7 +436,7 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 		}
 		if d.visibility != "" {
 			allowed := sr.cfg.canSeeEvent(user, d.visibility)
-			if allowed && d.visibility == visApproval && d.approvalUser != "" && user != sr.cfg.owner && user != d.approvalUser {
+			if allowed && d.visibility == visApproval && d.approvalUser != "" && !sr.cfg.owns(user) && user != d.approvalUser {
 				allowed = false
 			}
 			if !allowed {
@@ -452,15 +458,21 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 			}
 		}
 	}
-	if d.requiresOnline && !a.effectiveOnlineLocked() {
+	if d.requiresOnline && !a.userOnlineLocked(ps.peer.UserID()) {
 		a.mu.Unlock()
 		return
 	}
 	if d.listRequestID != "" {
+		var data any
+		if d.workspaceList {
+			data = a.workspaceListLocked(ps.peer.UserID())
+		} else {
+			data = a.sessionListLocked(ps.peer.UserID())
+		}
 		wire, err := json.Marshal(resultEnvelope{
 			Type:      "result",
 			RequestID: d.listRequestID,
-			Data:      a.sessionListLocked(ps.peer.UserID()),
+			Data:      data,
 		})
 		if err != nil {
 			a.logger.Error("encode session list", "request", d.listRequestID, "error", err)
@@ -654,6 +666,7 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	}
 	next := make(map[string]*sessionRuntime, len(nc.sessions)+len(createdPreload))
 	attachSession := func(s *normalizedSession, data loadedSession) error {
+		s.officialOwner = a.officialOwner
 		sr := a.sessions[s.id]
 		if sr == nil {
 			ps := a.state.Sessions[s.id]
@@ -717,6 +730,9 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 			stopRun(r, "acl_revoked")
 		}
 	}
+	for _, workspace := range nc.workspaces {
+		workspace.officialOwner = a.officialOwner
+	}
 	var closePeers []*peerState
 	for _, ps := range a.peers {
 		user := ps.peer.UserID()
@@ -735,7 +751,7 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		}
 		if !anyVisible {
 			for _, w := range nc.workspaces {
-				if w.owner == user {
+				if w.canCreate(user) {
 					anyVisible = true
 					break
 				}
@@ -775,6 +791,39 @@ func sameExecution(a, b *normalizedSession) bool {
 		slices.Equal(a.arguments, b.arguments)
 }
 
+func (a *Adapter) SetLANAuthority(allows func(string) bool) {
+	a.mu.Lock()
+	a.lanAuthority = allows
+	a.mu.Unlock()
+}
+
+func (a *Adapter) SetOfficialOwner(user string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.officialOwner == user {
+		return
+	}
+	a.officialOwner = user
+	for _, session := range a.sessions {
+		session.cfg.officialOwner = user
+	}
+	for _, workspace := range a.cfg.workspaces {
+		workspace.officialOwner = user
+	}
+}
+
+func (a *Adapter) RefreshLANAccess() {
+	a.mu.Lock()
+	stops, uiCancels := a.stopRunsLocked("lan_access_revoked", func(r *run) bool {
+		return lan.Access(r.userID) != "" && !a.userOnlineLocked(r.userID)
+	})
+	a.mu.Unlock()
+	flushUICancels(uiCancels)
+	for _, r := range stops {
+		r.stop(0)
+	}
+}
+
 // AuthorityLost stops acting on behalf of the identity authority. All active
 // model jobs are cancelled immediately; disconnected phones do not trigger
 // this method. The last validated deadline is retained so AuthorityRestored
@@ -791,7 +840,7 @@ func (a *Adapter) AuthorityLost() {
 		a.authorityTimer.Stop()
 		a.authorityTimer = nil
 	}
-	stops, uiCancels := a.stopAllRunsLocked("authority_lost")
+	stops, uiCancels := a.stopRunsLocked("authority_lost", officialRun)
 	a.mu.Unlock()
 	flushUICancels(uiCancels)
 	for _, r := range stops {
@@ -852,14 +901,14 @@ func (a *Adapter) AuthorityUntil(until time.Time) {
 	}
 	a.authorityUntil = until
 	for _, r := range a.runs {
-		if !r.terminal {
+		if !r.terminal && officialRun(r) {
 			r.authorityUntil = until
 		}
 	}
 	now := a.now()
 	if until.IsZero() || !now.Before(until) {
 		a.authorityOnline = false
-		stops, uiCancels := a.stopAllRunsLocked("authority_lost")
+		stops, uiCancels := a.stopRunsLocked("authority_lost", officialRun)
 		a.mu.Unlock()
 		flushUICancels(uiCancels)
 		for _, r := range stops {
@@ -885,7 +934,7 @@ func (a *Adapter) expireAuthority(gen uint64, until time.Time) {
 		return
 	}
 	a.authorityOnline = false
-	stops, uiCancels := a.stopAllRunsLocked("authority_lost")
+	stops, uiCancels := a.stopRunsLocked("authority_lost", officialRun)
 	a.mu.Unlock()
 	flushUICancels(uiCancels)
 	for _, r := range stops {
@@ -916,7 +965,6 @@ func (a *Adapter) checkRuns() {
 	var stops []*run
 	var uiCancels []uiCancelAction
 	now := a.now()
-	online := a.effectiveOnlineLocked()
 	for _, r := range a.runs {
 		if r.terminal || r.status != statusRunning {
 			continue
@@ -926,8 +974,11 @@ func (a *Adapter) checkRuns() {
 		switch {
 		case sr == nil || !sr.cfg.canRead(r.userID) || !sr.cfg.canRun(r.userID):
 			reason = "acl_revoked"
-		case !online:
+		case !a.userOnlineLocked(r.userID):
 			reason = "authority_lost"
+			if !officialRun(r) {
+				reason = "lan_access_revoked"
+			}
 		case !r.authorityUntil.IsZero() && !now.Before(r.authorityUntil):
 			reason = "authority_lost"
 		}
@@ -949,11 +1000,15 @@ func (a *Adapter) checkRuns() {
 	}
 }
 
-func (a *Adapter) stopAllRunsLocked(reason string) ([]*run, []uiCancelAction) {
+func officialRun(r *run) bool {
+	return lan.Access(r.userID) == ""
+}
+
+func (a *Adapter) stopRunsLocked(reason string, matches func(*run) bool) ([]*run, []uiCancelAction) {
 	var stops []*run
 	var uiCancels []uiCancelAction
 	for _, r := range a.runs {
-		if r.terminal || r.status == statusCancelling {
+		if r.terminal || r.status == statusCancelling || !matches(r) {
 			continue
 		}
 		r.status = statusCancelling
@@ -963,6 +1018,13 @@ func (a *Adapter) stopAllRunsLocked(reason string) ([]*run, []uiCancelAction) {
 		stops = append(stops, r)
 	}
 	return stops, uiCancels
+}
+
+func (a *Adapter) userOnlineLocked(user string) bool {
+	if lan.Access(user) != "" {
+		return a.lanAuthority != nil && a.lanAuthority(user)
+	}
+	return a.effectiveOnlineLocked()
 }
 
 func (a *Adapter) effectiveOnlineLocked() bool {
