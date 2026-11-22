@@ -32,7 +32,7 @@ flowchart LR
 | 组件 | 职责 | 安全边界与说明 |
 | --- | --- | --- |
 | 外部身份签发后端 | 校验宿主客户端现有令牌，为端点公钥签发短期 `vanc1` 证书与 `vanl1` 活性租约 | 独立部署在外部私有后端，**唯一持有**端点签名私钥（接口约定见 [`internal/identity/README.md`](internal/identity/README.md)） |
-| `relay` | 设备发现、签名信令路由、STUN 及按权益授权的 TURN | 仅持身份公钥，无签名私钥，不接触 AI 对话正文 |
+| `relay` | 设备发现、签名信令路由、下发公共 STUN 列表及按权益授权的 TURN | 仅持身份公钥，无签名私钥，不接触 AI 对话正文 |
 | `vanora-desktop` | 启动并托管本机 Vanora RPC 进程、执行会话与工具 ACL | 端点私钥存于系统凭据库；支持独立运行与 Sidecar 内嵌 |
 | `mobile` / `native` | 封装令牌注册、信令、WebRTC 传输与会话恢复状态机 | 提供 Android AAR 与 iOS XCFramework 原生绑定 |
 

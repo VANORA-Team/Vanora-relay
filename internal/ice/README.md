@@ -12,7 +12,7 @@ signaling.
 ## API
 
 ```go
-srv, err := ice.FromEnv()          // reads TURN_* env, starts listeners
+srv, err := ice.FromEnv()          // reads STUN_URLS and TURN_* env, starts listeners
 defer srv.Close()
 
 servers, err := srv.Config(connectionID, visitor, entitlement.ValidUntil)
@@ -24,13 +24,13 @@ srv.Revoke(connectionID)           // closes live allocations immediately
 `ICEServer` is the standard WebRTC shape:
 
 ```json
-{"urls": ["stun:203.0.113.10:3478"]}
+{"urls": ["stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"]}
 {"urls": ["turn:203.0.113.10:3478?transport=udp", "turn:203.0.113.10:3478?transport=tcp"],
  "username": "…", "credential": "…"}
 ```
 
-`FromEnv` returns an error for a missing public address, an invalid port or
-range, or no enabled control transport. `Close` is idempotent.
+`FromEnv` returns an error for a missing public address, an invalid STUN URL,
+an invalid port or range, or no enabled control transport. `Close` is idempotent.
 
 ## Grant lifecycle
 
@@ -107,7 +107,8 @@ hook.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TURN_PUBLIC_IP` | *(required)* | Public IPv4 advertised in STUN/TURN URLs and relay addresses. No hostname resolution. |
+| `STUN_URLS` | `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478` | Comma-separated `stun:host[:port]` URLs. Use `local` to advertise the in-process STUN server. |
+| `TURN_PUBLIC_IP` | *(required)* | Public IPv4 advertised in TURN URLs and relay addresses, and in the STUN URL when `STUN_URLS=local`. |
 | `TURN_BIND_IP` | `0.0.0.0` | Local IPv4 for the UDP/TCP control listeners. |
 | `TURN_RELAY_BIND_IP` | `TURN_BIND_IP` | Local IPv4 the relay sockets bind to. |
 | `TURN_PORT` | `3478` | Control port for both UDP and TCP. `0` picks an ephemeral port (testing only). |
@@ -120,9 +121,13 @@ hook.
 | `TURN_MAX_ALLOCATIONS_PER_GRANT` | `8` | Maximum allocations per credential (desktop + phone + retries). |
 | `TURN_LOG_LEVEL` | `error` | `disabled`, `error`, `warn`, `info`, `debug`, or `trace`. Pion's `PION_LOG_*` variables may add per-package detail. |
 
-The advertised public address is exactly `TURN_PUBLIC_IP:TURN_PORT` in every
-URL. Deployments behind NAT must forward the control port and relay range to
-this instance.
+The STUN list goes to both endpoints in `ice.config`. Clients gather candidates
+from the configured servers in parallel. To use overseas public STUN, set
+`STUN_URLS=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302`.
+Domestic and overseas URLs can also be combined in one list.
+
+TURN URLs advertise `TURN_PUBLIC_IP:TURN_PORT`. Deployments behind NAT must
+forward the control port and relay range to this instance.
 
 With `TURN_PORT=0` and both transports enabled, the TCP listener picks the
 ephemeral port first and UDP binds the same port, retrying the pair with a new

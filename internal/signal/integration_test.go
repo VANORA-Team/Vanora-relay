@@ -100,6 +100,7 @@ func exerciseGuestWebRTC(t *testing.T, entitled bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	t.Setenv("STUN_URLS", "local")
 	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
 	t.Setenv("TURN_BIND_IP", "127.0.0.1")
 	t.Setenv("TURN_PORT", "0")

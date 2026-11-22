@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -55,7 +56,7 @@ type Server struct {
 	realm       string
 	controlAddr string
 	publicIP    netip.Addr
-	stunURL     string
+	stunURLs    []string
 	turnURLs    []string
 
 	maxGrants              int
@@ -109,7 +110,7 @@ type removal struct {
 
 // Config returns the ICE servers for one authorized connection.
 //
-// A zero until means the visitor has no relay entitlement: only a STUN server
+// A zero until means the visitor has no relay entitlement: only the STUN entry
 // is returned and credentials are empty. Any non-zero until at or before the
 // current time is treated as expired and likewise yields STUN-only, so callers
 // never receive credentials that are already dead.
@@ -250,16 +251,13 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) stunOnly() []ICEServer {
-	return []ICEServer{{URLs: []string{s.stunURL}}}
+	return []ICEServer{{URLs: slices.Clone(s.stunURLs)}}
 }
 
 func (s *Server) turnServers(g *grant) []ICEServer {
-	urls := make([]string, len(s.turnURLs))
-	copy(urls, s.turnURLs)
-
 	return []ICEServer{
-		{URLs: []string{s.stunURL}},
-		{URLs: urls, Username: g.username, Credential: g.password},
+		{URLs: slices.Clone(s.stunURLs)},
+		{URLs: slices.Clone(s.turnURLs), Username: g.username, Credential: g.password},
 	}
 }
 

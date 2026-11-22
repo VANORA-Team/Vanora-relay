@@ -3,6 +3,8 @@ package ice
 import (
 	"errors"
 	"net"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,6 +104,59 @@ func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestConfiguredSTUNURLs(t *testing.T) {
+	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
+	t.Setenv("TURN_BIND_IP", "127.0.0.1")
+	t.Setenv("TURN_RELAY_BIND_IP", "127.0.0.1")
+	t.Setenv("TURN_PORT", "0")
+	t.Setenv("TURN_UDP", "true")
+	t.Setenv("TURN_TCP", "false")
+	t.Setenv("TURN_RELAY_MIN_PORT", "0")
+	t.Setenv("TURN_RELAY_MAX_PORT", "0")
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{"default", "", []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}},
+		{"mixed", "stun:stun.miwifi.com, stun:stun.cloudflare.com:3478", []string{"stun:stun.miwifi.com", "stun:stun.cloudflare.com:3478"}},
+		{"local", "local", nil},
+		{"invalid", "stun:stun.cloudflare.com:3478,turn:example.com", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("STUN_URLS", tc.value)
+			s, err := FromEnv()
+			if s != nil {
+				t.Cleanup(func() { _ = s.Close() })
+			}
+			if tc.name == "invalid" {
+				if err == nil || !strings.Contains(err.Error(), "STUN_URLS entry 2") {
+					t.Fatalf("FromEnv error = %v, want invalid STUN_URLS entry", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			want := tc.want
+			if tc.name == "local" {
+				want = []string{"stun:" + s.controlAddr}
+			}
+			for _, until := range []time.Time{time.Time{}, time.Now().Add(time.Minute)} {
+				servers, err := s.Config("conn", "visitor", until)
+				if err != nil {
+					t.Fatalf("Config: %v", err)
+				}
+				if len(servers) == 0 || !slices.Equal(servers[0].URLs, want) || servers[0].Username != "" || servers[0].Credential != "" {
+					t.Fatalf("Config = %+v, want STUN URLs %v without credentials", servers, want)
+				}
+				servers[0].URLs[0] = "stun:example.com"
+			}
+		})
+	}
 }
 
 func TestConfigGrantsAndReusesCredential(t *testing.T) {

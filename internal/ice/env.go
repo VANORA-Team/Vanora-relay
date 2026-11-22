@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/pion/logging"
+	"github.com/pion/stun/v4"
 	"github.com/pion/turn/v4"
 )
 
@@ -28,6 +29,7 @@ type options struct {
 	realm     string
 	enableUDP bool
 	enableTCP bool
+	stunURLs  []string
 
 	relayMinPort uint16
 	relayMaxPort uint16
@@ -43,11 +45,15 @@ type options struct {
 	onRemove         func(removal)
 }
 
-// FromEnv starts a STUN/TURN server from the TURN_* environment variables
-// documented in README.md. TURN_PUBLIC_IP is required; the advertised address
-// must be the public IPv4 address clients can reach.
+// FromEnv starts a STUN/TURN server using STUN_URLS and the TURN_* environment
+// variables documented in README.md. TURN_PUBLIC_IP must be the public IPv4
+// address clients can reach for relaying.
 func FromEnv() (*Server, error) {
 	publicIP, err := envIPv4("TURN_PUBLIC_IP", "")
+	if err != nil {
+		return nil, err
+	}
+	stunURLs, err := envSTUNURLs()
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +114,7 @@ func FromEnv() (*Server, error) {
 		realm:                  realm,
 		enableUDP:              enableUDP,
 		enableTCP:              enableTCP,
+		stunURLs:               stunURLs,
 		relayMinPort:           uint16(relayMinPort),
 		relayMaxPort:           uint16(relayMaxPort),
 		maxGrants:              maxGrants,
@@ -229,7 +236,10 @@ func newServer(opts options) (*Server, error) {
 	s.controlAddr = net.JoinHostPort(opts.bindIP.String(), strconv.Itoa(port))
 
 	hostPort := net.JoinHostPort(opts.publicIP.String(), strconv.Itoa(port))
-	s.stunURL = "stun:" + hostPort
+	s.stunURLs = opts.stunURLs
+	if len(s.stunURLs) == 0 {
+		s.stunURLs = []string{"stun:" + hostPort}
+	}
 	if opts.enableUDP {
 		s.turnURLs = append(s.turnURLs, "turn:"+hostPort+"?transport=udp")
 	}
@@ -297,6 +307,29 @@ func (o options) relayGenerator(s *Server) turn.RelayAddressGenerator {
 	}
 
 	return &countingGenerator{inner: inner, srv: s}
+}
+
+func envSTUNURLs() ([]string, error) {
+	value := strings.TrimSpace(os.Getenv("STUN_URLS"))
+	switch value {
+	case "":
+		return []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}, nil
+	case "local":
+		return nil, nil
+	}
+
+	urls := strings.Split(value, ",")
+	for i, raw := range urls {
+		raw = strings.TrimSpace(raw)
+		uri, err := stun.ParseURI(raw)
+		if err != nil || uri.Scheme != stun.SchemeTypeSTUN || uri.Port < 1 || uri.Port > 65535 ||
+			strings.ContainsAny(raw, "/\\@?# \t\r\n") {
+			return nil, fmt.Errorf("ice: STUN_URLS entry %d must be a stun:host[:port] URL", i+1)
+		}
+		urls[i] = raw
+	}
+
+	return urls, nil
 }
 
 func envIPv4(name, fallback string) (net.IP, error) {

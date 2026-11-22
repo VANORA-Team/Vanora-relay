@@ -24,17 +24,27 @@ go build ./cmd/relay
 | `RELAY_MEMBERSHIP_URL` | 是 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP） |
 | `RELAY_MEMBERSHIP_TOKEN` | 是 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
 | `TURN_PUBLIC_IP` | 是 | — | 本机或 NAT 对外公布的可达 IPv4（本地开发可用 `127.0.0.1`） |
+| `STUN_URLS` | 否 | 小米和哔哩哔哩公共 STUN | 逗号分隔的 `stun:host[:port]`，可混用国内外服务。设为 `local` 时使用 `relay` 内置 STUN |
 | `RELAY_ADDR` | 否 | `127.0.0.1:8787` | 信令监听地址；非回环监听须配置 TLS |
 | `RELAY_TLS_CERT` / `RELAY_TLS_KEY` | 否 | — | 信令直接启用 TLS 时的证书与私钥（成对设置） |
 
 > [!NOTE]
 > `RELAY_MEMBERSHIP_URL` 指向的权益路由属于内部服务接口，跨主机部署时建议通过私有网络与 HTTPS 入口暴露。完整 `TURN_*` 配置（端口范围、绑定网卡、并发上限等）见 [internal/ice/README.md](../internal/ice/README.md)。
 
+`relay` 通过 `ice.config` 把 STUN 列表发给手机和电脑，由两端直接向这些地址收集直连候选。下面的 `STUN_URLS` 配置将默认列表替换为小米和 Cloudflare。
+
+```sh
+export STUN_URLS='stun:stun.miwifi.com:3478,stun:stun.cloudflare.com:3478'
+```
+
+本地开发可使用以下配置启用内置 STUN。
+
 ```sh
 export RELAY_IDENTITY_PUBLIC_KEY="<外部身份后端导出的 Ed25519 公钥>"
 export RELAY_MEMBERSHIP_URL=https://entitlement.internal.example.com
 export RELAY_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
 export TURN_PUBLIC_IP=127.0.0.1
+export STUN_URLS=local
 
 go run ./cmd/relay
 ```

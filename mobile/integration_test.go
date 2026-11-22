@@ -207,6 +207,7 @@ func exerciseAdapters(t *testing.T, cli string) {
 	must(t, err)
 	host := issue(t, signer, "owner")
 	phone := issue(t, signer, "visitor")
+	t.Setenv("STUN_URLS", "local")
 	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
 	t.Setenv("TURN_BIND_IP", "127.0.0.1")
 	t.Setenv("TURN_TCP", "false")
@@ -380,6 +381,7 @@ func TestMobileEmbeddedCapabilities(t *testing.T) {
 	host := issue(t, signer, "owner")
 	phone := issue(t, signer, "owner")
 
+	t.Setenv("STUN_URLS", "local")
 	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
 	t.Setenv("TURN_BIND_IP", "127.0.0.1")
 	t.Setenv("TURN_TCP", "false")
