@@ -55,9 +55,11 @@ an invalid port or range, or no enabled control transport. `Close` is idempotent
   client's TURN allocation refresh lifetime (10 minutes by default). The TURN
   username TTL is a second line of defense for new allocations, not the
   mechanism that cuts existing ones.
-- `TURN_MAX_GRANTS` bounds the grant table and
-  `TURN_MAX_ALLOCATIONS_PER_GRANT` bounds allocations per credential. Both are
-  enforced before the TURN layer allocates resources.
+- `TURN_MAX_GRANTS` bounds the global grant table, `TURN_MAX_GRANTS_PER_VISITOR`
+  bounds active grants per visitor (failing with `ErrVisitorGrantLimit`), and
+  `TURN_MAX_ALLOCATIONS_PER_GRANT` atomically bounds concurrent allocations per
+  credential (reserving pending quota before allocation creation so concurrent
+  `Allocate` requests cannot race past the limit).
 
 Removal is logged with `slog.Info` (or delivered to the test hook):
 
@@ -117,8 +119,9 @@ hook.
 | `TURN_RELAY_MIN_PORT` | `49152` | First UDP relay port. |
 | `TURN_RELAY_MAX_PORT` | `65535` | Last UDP relay port (inclusive). Set both relay bounds to `0` for ephemeral relay ports. |
 | `TURN_REALM` | `vanora` | STUN/TURN authentication realm. |
-| `TURN_MAX_GRANTS` | `4096` | Maximum concurrent grants. |
-| `TURN_MAX_ALLOCATIONS_PER_GRANT` | `8` | Maximum allocations per credential (desktop + phone + retries). |
+| `TURN_MAX_GRANTS` | `4096` | Maximum concurrent grants globally (`1..1000000`). |
+| `TURN_MAX_GRANTS_PER_VISITOR` | `min(32, max(1, TURN_MAX_GRANTS/2))` | Maximum concurrent active grants per visitor (`1..TURN_MAX_GRANTS`). |
+| `TURN_MAX_ALLOCATIONS_PER_GRANT` | `8` | Maximum allocations per credential (desktop + phone + retries, `1..1024`). |
 | `TURN_LOG_LEVEL` | `error` | `disabled`, `error`, `warn`, `info`, `debug`, or `trace`. Pion's `PION_LOG_*` variables may add per-package detail. |
 
 The STUN list goes to both endpoints in `ice.config`. Clients gather candidates
@@ -153,6 +156,11 @@ choice simple.
   ranges, IPv4-compatible IPv6, Teredo, ORCHID, and deprecated site-local
   ranges are rejected. The filter runs on the address the TURN client asks to
   reach, before any permission or channel is created.
+- **Host interface address blocking**: At startup, `ice.Server` snapshots
+  `net.InterfaceAddrs()` and rejects relay permissions and outbound packets to
+  any local host interface IP (including secondary public NICs) except
+  `TURN_PUBLIC_IP` itself. If a new public IP or NIC is attached at runtime,
+  restart the `relay` process so the snapshot refreshes.
 - `TURN_PUBLIC_IP` itself is the one exception: a permission for the server's
   own advertised address is allowed so two allocations of one connection can
   relay to each other. Permissions are per IP, so the relay socket independently

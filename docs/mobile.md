@@ -1,70 +1,139 @@
 # 移动端 SDK 接入指南
 
-[← 文档目录](README.md) · [返回主页](../README.md)
+[← 桌面适配器](desktop.md) · [文档中心](README.md) · [协议参考 →](protocol.md) · **简体中文** | [English](en/mobile.md)
 
-`mobile` 与 `native` 目录提供基于 `gomobile` 的移动端原生绑定（Android AAR / iOS XCFramework），封装了官方分站中转、免账号自建配对中转、局域网免账号配对、WebRTC 传输、事件游标恢复与远程交互审批。
+`mobile/` 与 `native/` 目录提供基于 `gomobile` 的移动端原生绑定（Android AAR / iOS XCFramework），开箱封装官方分站中转、免账号自建配对中转、局域网 mTLS 直连、WebRTC 传输、配对网多电脑并发、事件游标恢复与远程工具审批。
 
-## 连接方式与通道隔离
+---
 
-三种客户端共用同一套会话、运行与事件循环接口，各自使用**独立的安全存储槽位**，互不干扰：
+## 1. 接入全流程概览
 
-| 通道 | 构造器 | 登录要求 | 存储槽位示例 | 连接方式 |
-| --- | --- | --- | --- | --- |
-| **CN 官方中转** | `NewClient(cnIdentityURL, cnSignalURL, cnPublicKeyHex, cnStore)` | 必须登录 CN 站 | `"cn"` | `Enroll(cnToken)` -> `Devices()` -> `Connect(deviceID, ownerID)` |
-| **GLOBAL 官方中转** | `NewClient(globalIdentityURL, globalSignalURL, globalPublicKeyHex, globalStore)` | 必须登录 GLOBAL 站 | `"global"` | `Enroll(globalToken)` -> `Devices()` -> `Connect(deviceID, ownerID)` |
-| **自建中转（`self`）** | `NewSelfRelayClient(selfStore)` | **免登录账号** | `"self"` | `ConnectSelfRelay(link, deviceName)`（或 `ConnectSelfRelayWithToken`） |
-| **局域网直连（`lan`）** | `NewLANClient(lanStore)` | **免登录账号** | `"lan"` | `ConnectLAN(link, deviceName)` |
+```mermaid
+flowchart LR
+    Init["1. 按渠道创建 Client 与独立存储槽"]
+    Auth["2. 登录或扫码/手输码配对"]
+    Sync["3. 建连并同步配对网成员"]
+    Chat["4. 打开会话 & 幂等发起运行"]
+    Loop["5. 单消费者 NextEvent & Acknowledge"]
+    Recover["6. 切网 Reconnect / 重启 Resume"]
 
-### 关键约束
+    Init --> Auth --> Sync --> Chat --> Loop
+    Loop -.->|"网络切换 / 进程重启"| Recover -.-> Loop
+```
 
-- **官方双站严格隔离**：CN 站与 GLOBAL 站使用独立的身份公钥与信令节点，且中继权益互不共享。宿主 App 只有在用户已登录 CN 站时才允许初始化并连接 CN `Client`，只有在已登录 GLOBAL 站时才允许连接 GLOBAL `Client`。用户同时登录两站时，可各自持有独立 `Store` 槽位按需切换，切勿共用同一存储槽（否则不同身份公钥会返回 `account: stored state belongs to another authority`）。
-- **自建中转仅通过配对使用（免账号）**：使用 `NewSelfRelayClient(store)`，不调用 `Enroll`/`UpdateToken`/`Devices`。扫描或粘贴桌面端生成的自建配对链接后调用 `ConnectSelfRelay(link, deviceName)`（若配对链接未内嵌节点令牌，改用 `ConnectSelfRelayWithToken(link, relayToken, deviceName)`）。连接成功后持久化 `SelfRelayTarget()` 返回的脱敏链接（已移除一次性 `pair` 令牌）用于下次自动复连。被桌面撤权或未配对时收到 `access.state` / `pairing_required`，节点令牌失效时收到 `access.state` / `relay_token_invalid`。
-- **局域网配对**：使用 `NewLANClient(store)` 与 `ConnectLAN(link, deviceName)`，成功后保存 `LANAddress()`。`connection.state` 的路径为 `lan`，撤权时收到 `access.state` / `pairing_required`。退出官方账号后可继续保留自建与局域网客户端及其配对记录。
+---
 
-## Android
+## 2. 四通道构造与存储隔离
 
-**环境依赖**：JDK、Go、Python 3、Android SDK（设置 `ANDROID_HOME`）及 NDK（可选设置 `ANDROID_NDK_HOME`）。
+四种连接方式共用完全一致的会话、运行与事件循环 API，但**必须为每个渠道提供独立的安全存储槽位（`Store`）**，切勿复用同一存储槽：
 
-在仓库根目录执行构建：
+| 通道 | Go / Android 构造器 | iOS 构造器 | 账号要求 | 推荐存储槽名 | 首次接入方式 |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| **CN 官方中转** | `NewClient(idURL, sigURL, cnPubHex, store)` | `MobileNewClient(...)` | 登录 CN 站 | `"cn"` | `Enroll(cnToken)` → `Pair(input, "", "", name)` |
+| **GLOBAL 官方中转** | `NewClient(idURL, sigURL, glPubHex, store)` | `MobileNewClient(...)` | 登录 GLOBAL 站 | `"global"` | `Enroll(glToken)` → `Pair(input, "", "", name)` |
+| **自建中转 (`self`)** | `NewSelfRelayClient(store)` | `MobileNewSelfRelayClient(store)` | **免账号** | `"self"` | `Pair(input, selfSigURL, relayToken, name)` |
+| **局域网直连 (`lan`)** | `NewLANClient(store)` | `MobileNewLANClient(store)` | **免账号** | `"lan"` | `Pair(input, "", "", name)` |
+
+> [!IMPORTANT]
+> **官方双站严格隔离**：CN 与 GLOBAL 使用独立的身份公钥与信令节点，权益互不共享。用户同时登录两站时，请分别为其创建 `"cn"` 与 `"global"` 存储槽按需切换；若把不同身份公钥指向同一存储槽，SDK 会直接返回 `account: stored state belongs to another authority`。
+
+---
+
+## 3. 配对、重连与多电脑配对网
+
+### 首次配对（`Pair`）
+
+统一调用 `Pair(input, signalURL, relayToken, clientName)`：
+
+- `input` 支持**扫码完整链接**或 **16 位手输码**（自动忽略大小写、空格和短横线）。
+- **官方渠道**：`signalURL` 与 `relayToken` 传空字符串，使用构造时配置的站点节点。
+- **自建渠道**：扫码链接已包含节点地址，可留空 `signalURL`；输入 16 位手输码时须传入 `signalURL`。邀请默认携带节点令牌，仅在桌面创建邀请时显式传 `include_token: false` 时才需另传 `relayToken`。
+- **局域网渠道**：局域网手输码自带私网地址（`XXXX-XXXX-XXXX-XXXX@私网IP:端口`）；如仅输入 16 位码，可通过第二个参数 `signalURL` 传入 `私网IP:端口`。
+
+### 重连已配对电脑
+
+配对成功后，一次性邀请凭据会自动剥离，后续重启 App 直接使用已绑定的设备密钥重连：
+
+| 渠道 | 本地持久化目标 | 重连调用 |
+| :--- | :--- | :--- |
+| **官方 (`cn` / `global`)** | `ConnectionState()` 中的 `device_id` 与 `owner` | `Connect(deviceID, ownerID)` |
+| **自建 (`self`)** | 安全存储 `SelfRelayTarget()` 返回值（保留节点令牌、已剥离一次性 `pair`） | `ConnectSelfRelay(savedTarget, name)`<br>*(外置令牌时用 `ConnectSelfRelayWithToken(target, token, name)`)* |
+| **局域网 (`lan`)** | 安全存储 `LANAddress()` 返回值 | `ConnectLAN(savedAddress, name)` |
+
+收到 `access.state` 中的 `pairing_required` 时，表示本机被桌面撤权或尚未配对，应引导用户在电脑端生成新邀请。
+
+### 配对网与多台电脑并发
+
+- **查看成员**：`PairingNetwork()` 返回当前渠道成员 JSON 数组，每项包含稳定 `id`、`role`（`"mobile"` / `"desktop"`）等字段。
+- **同时操控多台电脑**：在主客户端调用 `OpenNetworkDesktop(id)` 获取对应电脑的独立 `*Client` 句柄（打开当前已选电脑时返回主客户端本身）。每台电脑维护各自的请求队列、订阅与事件游标；主客户端关闭时会自动清理所有子句柄。
+- **移除成员**：`RemoveNetworkDevice(id)` 可移除手机或电脑，变更通过在线认证链路广播同步；离线设备在下次重连时同步状态。
+- **间接配对默认权限**：在 `self` / `lan` 渠道下，经配对网间接发现的新电脑默认授予 `read` 权限；如需执行任务，可由该电脑重新签发 `control` 邀请，或在被控电脑端通过 `access.client.access.set` 动态升权。
+
+---
+
+## 4. Android 接入指南
+
+### 构建 AAR
+
+**环境依赖**：JDK（支持 `javac --release 8`）、Go 1.26+、Python 3、Android SDK（设置 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`）及 NDK（可选 `ANDROID_NDK_HOME`）。
 
 ```sh
+# 在仓库根目录执行，输出 dist/vanora-mobile.aar（minSdk 23，含 arm64-v8a 与 x86_64）
 python native/android/build.py
 ```
 
-输出 `dist/vanora-mobile.aar`（最低 API 23，包含 `arm64-v8a` 与 `x86_64`）：
+1. 将 `dist/vanora-mobile.aar` 放入模块 `libs/`，在 `build.gradle` 中添加 `implementation(files("libs/vanora-mobile.aar"))`。
+2. 在 `AndroidManifest.xml` 中声明 `<uses-permission android:name="android.permission.INTERNET" />`。
+3. **所有网络与 `nextEvent` 阻塞方法必须在后台线程（如 `Dispatchers.IO`）调用**。
 
-1. 将 AAR 放入应用模块的 `libs/`，在 Gradle 中添加 `implementation(files("libs/vanora-mobile.aar"))`。
-2. 在 `AndroidManifest.xml` 中声明 `android.permission.INTERNET`。
-3. 所有阻塞式 SDK 方法须在工作线程中调用。
+### Kotlin 集成示例
 
 ```kotlin
+import mobile.Mobile
+import org.json.JSONArray
+import org.vanora.relay.AndroidAccountStore
+
+// 0. 进程初始化时注入 Application Context
 go.Seq.setContext(applicationContext)
 
-// --- 方式 A：官方分站（以 CN / GLOBAL 独立槽位为例）---
-val cnStore = org.vanora.relay.AndroidAccountStore(applicationContext, "cn")
-val cnClient = mobile.Mobile.newClient(cnIdentityUrl, cnSignalUrl, cnPinnedPublicKeyHex, cnStore)
-cnClient.enroll(cnHostAccessToken) // 仅传入 CN 站登录令牌
-cnClient.updateToken(refreshedCnAccessToken)
+// --- 方式 A：官方分站（以 CN 槽位为例，GLOBAL 请使用独立 "global" 槽位）---
+val cnStore = AndroidAccountStore(applicationContext, "cn")
+val cnClient = Mobile.newClient(cnIdentityUrl, cnSignalUrl, cnPinnedPublicKeyHex, cnStore)
+cnClient.enroll(cnHostAccessToken)       // 仅提交 CN 站宿主令牌
+cnClient.updateToken(refreshedCnToken)   // 令牌续期时调用
+cnClient.pair(scannedLinkOrTypedCode, "", "", "Pixel 9")
+val stateJson = cnClient.connectionState() // 含 state / path ("direct"|"relay") / device_id / owner
 
-val directory = cnClient.devices() // JSON 包含已验证的 device_id、owner、name
-cnClient.connect(selectedDeviceID, selectedOwnerID)
-val connState = cnClient.connectionState() // state + direct/relay path
+// --- 方式 B：免账号自建中转 ---
+val selfStore = AndroidAccountStore(applicationContext, "self")
+val selfClient = Mobile.newSelfRelayClient(selfStore)
+selfClient.pair(scannedLinkOrTypedCode, selfSignalUrl, "", "Pixel 9")
+val savedReconnectTarget = selfClient.selfRelayTarget() // 持久化供重启重连
 
-// --- 方式 B：自建中转（免登录账号，仅配对使用）---
-val selfStore = org.vanora.relay.AndroidAccountStore(applicationContext, "self")
-val selfClient = mobile.Mobile.newSelfRelayClient(selfStore)
-selfClient.connectSelfRelay(scannedPairingLink, "Pixel 9")
-val savedReconnectTarget = selfClient.selfRelayTarget() // 已去除一次性 pair 令牌
+// --- 方式 C：局域网直连 + 多电脑并发 ---
+val lanStore = AndroidAccountStore(applicationContext, "lan")
+val lanClient = Mobile.newLANClient(lanStore)
+lanClient.pair(scannedLinkOrTypedCode, "", "", "Pixel 9")
+val members = JSONArray(lanClient.pairingNetwork())
+val desktopA = lanClient.openNetworkDesktop(firstDesktopId)
+val desktopB = lanClient.openNetworkDesktop(secondDesktopId)
+val sessionsA = desktopA.listSessions()
+val sessionsB = desktopB.listSessions()
 
-// --- 通用会话与远程审批接口（官方 / 自建 / 局域网一致）---
+// --- 通用 AI 会话与远程审批（四通道 API 完全一致）---
 val workspaces = selfClient.listWorkspaces()
-val created = selfClient.createSession(selectedWorkspaceID, mobile.Mobile.newRequestID(), "新对话")
-val sessions = selfClient.listSessions()
-val snapshot = selfClient.openSession(selectedSessionID)
-selfClient.respondUI(selectedSessionID, runID, uiID, """{"confirmed":true}""")
+val reqId = Mobile.newRequestID() // 先落盘 reqId 再发起请求，确保断线幂等重试
+val created = selfClient.createSession(selectedWorkspaceId, reqId, "新对话")
+val snapshot = selfClient.openSession(selectedSessionId)
+selfClient.startRun(selectedSessionId, Mobile.newRequestID(), "总结最近的变更")
+selfClient.respondUI(selectedSessionId, runId, uiId, """{"confirmed":true}""")
 ```
 
-## iOS
+---
+
+## 5. iOS 接入指南
+
+### 构建 XCFramework
 
 在已安装 Xcode 的 macOS 上执行：
 
@@ -75,16 +144,48 @@ mkdir -p dist
 go tool gomobile bind -target=ios,iossimulator -o dist/Mobile.xcframework ./mobile
 ```
 
-1. 将 `dist/Mobile.xcframework` 以及 [VanoraAccountStore.h](../native/ios/VanoraAccountStore.h)、[VanoraAccountStore.m](../native/ios/VanoraAccountStore.m) 加入 App Target。
-2. 启用 ARC，并链接 `Security.framework`。
-3. 官方分站按站点创建独立 `VanoraAccountStore(profile: "cn")` / `VanoraAccountStore(profile: "global")` 传入 `MobileNewClient`；自建中转使用独立 `VanoraAccountStore(profile: "self")` 传入 `MobileNewSelfRelayClient`，通过 `connectSelfRelay:clientName:error:` 完成扫码配对并持久化 `selfRelayTarget`。
+1. 将 `dist/Mobile.xcframework` 以及 [VanoraAccountStore.h](../native/ios/VanoraAccountStore.h)、[VanoraAccountStore.m](../native/ios/VanoraAccountStore.m) 添加至 App Target。
+2. 启用 ARC 并链接 `Security.framework`（Keychain 隔离存储）。
+3. 按渠道实例化独立 `VanoraAccountStore`：
+   - **CN / GLOBAL 官方站**：`VanoraAccountStore(profile: "cn")` / `"global"` → `MobileNewClient(...)`
+   - **自建中转**：`VanoraAccountStore(profile: "self")` → `MobileNewSelfRelayClient(selfStore, &err)`
+   - **局域网直连**：`VanoraAccountStore(profile: "lan")` → `MobileNewLANClient(lanStore, &err)`
 
-## 客户端持久化与事件循环约定
+```objc
+// Objective-C 示例（Swift 可通过 Bridging Header 直接调用同名接口）
+NSError *err = nil;
+VanoraAccountStore *selfStore = [[VanoraAccountStore alloc] initWithProfile:@"self"];
+MobileClient *client = MobileNewSelfRelayClient(selfStore, &err);
+[client pair:scannedLinkOrCode signalURL:selfSignalURL relayToken:@"" clientName:@"iPhone 16" error:&err];
+NSString *savedTarget = [client selfRelayTarget];
+```
 
-- **幂等提交提示词**：调用 `startRun(sessionID, requestID, text)` 前，先持久化 `Mobile.newRequestID()` 与提示词正文；网络中断后重试必须复用两者。
-- **单消费者事件循环**：`nextEvent(timeoutMillis)` 仅允许一个消费者读取；除业务 `event`（带 `seq`）外，还会推送 `connection.state`（`connecting`/`connected`/`reconnecting`/`disconnected` 与 `direct`/`relay`/`lan` 路径）、`auth.state`（`login_required`，官方渠道）、`access.state`（`pairing_required` 或 `relay_token_invalid`，局域网与自建渠道）和 `subscription.error`。每应用一条带 `seq` 的业务事件并保存本地快照后，调用 `acknowledge(sessionID, seq)` 更新游标。
-- **令牌刷新与恢复（官方渠道）**：收到 `auth.state`（`login_required`）或宿主 App 刷新了对应站点的用户令牌时，调用该站客户端的 `updateToken(newToken)` 即可触发设备证书续期与后台重连；切换同站账号或注销时调用 `reset()` 安全重置本地设备密钥。
-- **网络切换**：切网或从后台恢复时可调用 `reconnect()` 主动重连并续订游标。
-- **进程重启恢复**：官方渠道使用本地保存的 `device_id` 与 `owner` 重新 `connect`；自建渠道用 `SelfRelayTarget()` 重新 `ConnectSelfRelay`；局域网用 `LANAddress()` 重新 `ConnectLAN`；随后调用 `resume(sessionID, lastAppliedSeq)` 续读事件。
-- **快照重建**：收到 `snapshot_required` 时，调用 `openSession(sessionID)` 重新拉取完整快照。
-- **退出清理**：切换或退出账号配置档时，务必关闭 `client`。
+---
+
+## 6. 核心 API 速查与事件循环规范
+
+<details>
+<summary>展开查看 Client 公开方法速查表</summary>
+
+| 分类 | 方法 | 说明 |
+| :--- | :--- | :--- |
+| **身份管理** *(官方)* | `Enroll(token)` / `UpdateToken(token)` / `Reset()` / `UserID()` / `DeviceID()` | 绑定宿主令牌、刷新令牌续期、安全重置本机密钥以切换账号 |
+| **配对与连接** | `Pair(input, signalURL, relayToken, name)` / `Connect(devID, owner)` / `ConnectSelfRelay(link, name)` / `ConnectSelfRelayWithToken(link, token, name)` / `ConnectLAN(link, name)` | 首次配对或使用已持久化目标重连 |
+| **状态与网络** | `ConnectionState()` / `Reconnect()` / `Disconnect()` / `Close()` / `Devices()` / `SelfRelayTarget()` / `LANAddress()` | 查询连接与直连/中继路径、切网重连、清理资源 |
+| **配对网** | `PairingNetwork()` / `OpenNetworkDesktop(id)` / `RemoveNetworkDevice(id)` | 成员管理与多电脑并发句柄 |
+| **会话与运行** | `ListWorkspaces()` / `CreateSession(wsID, reqID, title)` / `ListSessions()` / `OpenSession(sessID)` / `Resume(sessID, afterSeq)` / `StartRun(sessID, reqID, text)` / `CancelRun(sessID, runID)` / `RespondUI(sessID, runID, uiID, payloadJSON)` | 全通道一致的 AI 会话、流式控制与远程审批操作 |
+| **事件消费** | `NextEvent(timeoutMillis)` / `Acknowledge(sessID, seq)` / `Mobile.NewRequestID()` | 单消费者阻塞拉取事件并确认游标 |
+
+</details>
+
+### 客户端工程最佳实践 Checklist
+
+- **单消费者事件循环**：每个 `*Client` 仅允许**一个后台协程/线程**循环调用 `NextEvent(timeoutMillis)`。事件包含业务事件（带 `seq`）以及四类系统控制事件：
+  - `connection.state`：连接状态与直连/中继路径（`direct` / `relay` / `lan`）变化
+  - `auth.state`：官方渠道登录态失效（`login_required`）
+  - `access.state`：配对失效（`pairing_required`，全渠道）或自建节点令牌失效（`relay_token_invalid`）
+  - `subscription.error`：游标超出保留窗口（`snapshot_required`）或资源不可用
+- **幂等提交提示词**：调用 `StartRun` 或 `CreateSession` 前，先本地持久化 `NewRequestID()` 与提示词正文；网络抖动重试必须复用同一组参数。
+- **游标推进与快照重建**：业务事件渲染并落盘后，立即调用 `Acknowledge(sessionID, seq)` 更新本地确认游标；收到 `snapshot_required` 时调用 `OpenSession(sessionID)` 全量替换本地快照。
+- **前后台与切网恢复**：网络从 Wi-Fi 切换至蜂窝或 App 回到前台时调用 `Reconnect()` 主动重建链路并自动续订游标；进程重启后先调用对应通道的重连方法，再对活跃会话调用 `Resume(sessionID, lastAppliedSeq)`。
+- **退出清理**：切换账号或销毁页面配置档时务必调用 `Close()` 释放底层 WebRTC、信令与子句柄资源。
