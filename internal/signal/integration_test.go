@@ -55,6 +55,11 @@ func (c *client) read(t *testing.T, expect string) protocol.Message {
 }
 func login(t *testing.T, ctx context.Context, url, role, subject string, signer *identitytest.Authority) *client {
 	t.Helper()
+	return loginWithHeader(t, ctx, url, role, subject, signer, nil)
+}
+
+func loginWithHeader(t *testing.T, ctx context.Context, url, role, subject string, signer *identitytest.Authority, header http.Header) *client {
+	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	check(t, err)
 	now := time.Now()
@@ -68,7 +73,7 @@ func login(t *testing.T, ctx context.Context, url, role, subject string, signer 
 	check(t, err)
 	creds, err := endpoint.OpenCredentials(cert, key, signer.PublicKey(), now)
 	check(t, err)
-	ws, _, err := websocket.Dial(ctx, url, nil)
+	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: header})
 	check(t, err)
 	t.Cleanup(func() { ws.CloseNow() })
 	c := &client{ws, ctx, creds, endpoint.LeaseProof{Certificate: cert, Lease: lease}}
@@ -81,16 +86,10 @@ func login(t *testing.T, ctx context.Context, url, role, subject string, signer 
 
 func TestAuthorizedGuestWebRTC(t *testing.T) {
 	t.Run("direct_when_membership_denies", func(t *testing.T) {
-		exerciseGuestWebRTC(t, membership.Sites{billingServer(t, false)}, false)
+		exerciseGuestWebRTC(t, billingServer(t, false), false)
 	})
 	t.Run("relay_only_with_membership", func(t *testing.T) {
-		exerciseGuestWebRTC(t, membership.Sites{billingServer(t, true)}, true)
-	})
-	t.Run("relay_only_cross_site_membership", func(t *testing.T) {
-		exerciseGuestWebRTC(t, membership.Sites{billingServer(t, false), billingServer(t, true)}, true)
-	})
-	t.Run("relay_only_self_hosted", func(t *testing.T) {
-		exerciseGuestWebRTC(t, nil, true)
+		exerciseGuestWebRTC(t, billingServer(t, true), true)
 	})
 }
 
@@ -295,5 +294,238 @@ func exerciseGuestWebRTC(t *testing.T, verifier signal.EntitlementVerifier, enti
 	publish(nil)
 	if string(guest.read(t, "connect.closed").Data) != `"access_revoked"` {
 		t.Fatal("missing revocation")
+	}
+}
+
+func TestOfficialHubIsolatesSites(t *testing.T) {
+	cnSigner := identitytest.NewAuthority(10 * time.Minute)
+	globalSigner := identitytest.NewAuthority(10 * time.Minute)
+	h := signal.New(cnSigner.PublicKey(), nil, nil)
+	h.RequireIssuer("https://auth.cn.example/realms/vanora")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go h.Run(ctx)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	dialOfficial := func(signer *identitytest.Authority, issuer string) error {
+		pub, key, err := ed25519.GenerateKey(rand.Reader)
+		check(t, err)
+		now := time.Now()
+		cert, err := signer.IssueWithKey(issuer, "user-1", pub, now)
+		check(t, err)
+		p, err := identity.VerifyCertificate(cert, signer.PublicKey(), now)
+		check(t, err)
+		nonce := make([]byte, 24)
+		_, _ = rand.Read(nonce)
+		lease, _, err := signer.IssueLease(p, cert, base64.RawURLEncoding.EncodeToString(nonce), now, 60*time.Second)
+		check(t, err)
+		creds, err := endpoint.OpenCredentials(cert, key, signer.PublicKey(), now)
+		check(t, err)
+		ws, _, err := websocket.Dial(ctx, url, nil)
+		check(t, err)
+		defer ws.CloseNow()
+		_, raw, err := ws.Read(ctx)
+		if err != nil {
+			return err
+		}
+		var challenge protocol.Message
+		check(t, json.Unmarshal(raw, &challenge))
+		m, err := creds.Login(challenge, "mobile", lease)
+		check(t, err)
+		if err := ws.Write(ctx, websocket.MessageText, protocol.Encode(m)); err != nil {
+			return err
+		}
+		_, replyRaw, err := ws.Read(ctx)
+		if err != nil {
+			return err
+		}
+		var reply protocol.Message
+		check(t, json.Unmarshal(replyRaw, &reply))
+		if reply.Type != "auth.ok" {
+			t.Fatalf("unexpected reply %s", reply.Type)
+		}
+		return nil
+	}
+
+	if err := dialOfficial(globalSigner, "https://auth.global.example/realms/vanora"); err == nil {
+		t.Fatal("CN hub accepted certificate signed by GLOBAL authority")
+	}
+	if err := dialOfficial(cnSigner, "https://auth.global.example/realms/vanora"); err == nil {
+		t.Fatal("CN hub accepted certificate with mismatched issuer")
+	}
+	if err := dialOfficial(cnSigner, "https://auth.cn.example/realms/vanora"); err != nil {
+		t.Fatalf("CN hub rejected valid CN certificate: %v", err)
+	}
+}
+
+func TestSelfHostedAccessTokenAndPairingRouting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	t.Setenv("STUN_URLS", "local")
+	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
+	t.Setenv("TURN_BIND_IP", "127.0.0.1")
+	t.Setenv("TURN_PORT", "0")
+	t.Setenv("TURN_TCP", "false")
+	t.Setenv("TURN_RELAY_MIN_PORT", "0")
+	t.Setenv("TURN_RELAY_MAX_PORT", "0")
+	network, err := ice.FromEnv()
+	check(t, err)
+	t.Cleanup(func() { network.Close() })
+
+	token := strings.Repeat("self-token-", 4)
+	h := signal.NewSelfHosted(token, network)
+	go h.Run(ctx)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	for name, header := range map[string]http.Header{
+		"missing": nil,
+		"wrong":   {"Authorization": {"Bearer not-the-token"}},
+	} {
+		ws, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: header})
+		if ws != nil {
+			ws.CloseNow()
+		}
+		if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s token: err=%v status=%v", name, err, resp)
+		}
+	}
+
+	authHeader := http.Header{"Authorization": {"Bearer " + token}}
+
+	// Official certificate must be rejected on a self-hosted hub.
+	officialSigner := identitytest.NewAuthority(10 * time.Minute)
+	{
+		pub, key, err := ed25519.GenerateKey(rand.Reader)
+		check(t, err)
+		now := time.Now()
+		cert, err := officialSigner.IssueWithKey("https://issuer.example", "guest", pub, now)
+		check(t, err)
+		p, err := identity.VerifyCertificate(cert, officialSigner.PublicKey(), now)
+		check(t, err)
+		nonce := make([]byte, 24)
+		_, _ = rand.Read(nonce)
+		lease, _, err := officialSigner.IssueLease(p, cert, base64.RawURLEncoding.EncodeToString(nonce), now, 60*time.Second)
+		check(t, err)
+		creds, err := endpoint.OpenCredentials(cert, key, officialSigner.PublicKey(), now)
+		check(t, err)
+		ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: authHeader})
+		check(t, err)
+		defer ws.CloseNow()
+		_, raw, err := ws.Read(ctx)
+		check(t, err)
+		var ch protocol.Message
+		check(t, json.Unmarshal(raw, &ch))
+		loginMsg, err := creds.Login(ch, "mobile", lease)
+		check(t, err)
+		check(t, ws.Write(ctx, websocket.MessageText, protocol.Encode(loginMsg)))
+		if _, _, err := ws.Read(ctx); err == nil {
+			t.Fatal("self-hosted hub accepted official certificate")
+		}
+	}
+
+	type selfEndpoint struct {
+		ws   *websocket.Conn
+		pub  ed25519.PublicKey
+		priv ed25519.PrivateKey
+		id   string
+	}
+	dialSelf := func(role string) *selfEndpoint {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		check(t, err)
+		devID, err := identity.SelfDeviceID(pub)
+		check(t, err)
+		ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: authHeader})
+		check(t, err)
+		t.Cleanup(func() { ws.CloseNow() })
+		_, raw, err := ws.Read(ctx)
+		check(t, err)
+		var ch protocol.Message
+		check(t, json.Unmarshal(raw, &ch))
+		loginMsg := protocol.Message{Type: "auth.login", Connection: ch.Connection, From: devID, To: "signal"}
+		check(t, loginMsg.Sign(priv, protocol.Encode(map[string]string{
+			"role":       role,
+			"public_key": base64.RawURLEncoding.EncodeToString(pub),
+		})))
+		check(t, ws.Write(ctx, websocket.MessageText, protocol.Encode(loginMsg)))
+		_, okRaw, err := ws.Read(ctx)
+		check(t, err)
+		var okMsg protocol.Message
+		check(t, json.Unmarshal(okRaw, &okMsg))
+		if okMsg.Type != "auth.ok" || !strings.Contains(string(okMsg.Data), `"mode":"self"`) {
+			t.Fatalf("unexpected self auth.ok: %s %s", okMsg.Type, okMsg.Data)
+		}
+		return &selfEndpoint{ws: ws, pub: pub, priv: priv, id: devID}
+	}
+	readSelf := func(ep *selfEndpoint, expect string) protocol.Message {
+		_, b, err := ep.ws.Read(ctx)
+		check(t, err)
+		var m protocol.Message
+		check(t, json.Unmarshal(b, &m))
+		if m.Type != expect {
+			t.Fatalf("want %s, got %s %s", expect, m.Type, m.Data)
+		}
+		return m
+	}
+	sendSelf := func(ep *selfEndpoint, m protocol.Message) {
+		check(t, ep.ws.Write(ctx, websocket.MessageText, protocol.Encode(m)))
+	}
+
+	desk := dialSelf("desktop")
+	phone := dialSelf("mobile")
+
+	// Self-hosted hub disables anonymous directory and external leases.
+	sendSelf(phone, protocol.Message{Type: "devices.list"})
+	if got := string(readSelf(phone, "error").Data); got != `"directory_unavailable"` {
+		t.Fatalf("devices.list error = %s", got)
+	}
+	sendSelf(phone, protocol.Message{Type: "auth.lease", Data: protocol.Encode(map[string]string{"lease": "unused"})})
+	if got := string(readSelf(phone, "error").Data); got != `"lease_unsupported"` {
+		t.Fatalf("auth.lease error = %s", got)
+	}
+
+	card := protocol.Message{Type: "device.card", From: desk.id, To: "self"}
+	check(t, card.Sign(desk.priv, []byte("HomePC")))
+	sendSelf(desk, protocol.Message{Type: "device.online", Data: protocol.Encode(map[string]any{"card": card})})
+	readSelf(desk, "device.registered")
+
+	// Rejecting an unpaired connection before accept reports access_denied.
+	deniedConn := protocol.NewID()
+	reqDenied := protocol.Message{Type: "connect.request", Connection: deniedConn, From: phone.id, To: desk.id, Seq: 1}
+	check(t, reqDenied.Sign(phone.priv, []byte(`{"name":"Stranger"}`)))
+	sendSelf(phone, reqDenied)
+	gotReq := readSelf(desk, "connect.request")
+	if gotReq.Certificate != "" || gotReq.Connection != deniedConn {
+		t.Fatalf("unexpected self connect.request: %+v", gotReq)
+	}
+	reject := protocol.Message{Type: "connect.close", Connection: deniedConn, From: desk.id, To: phone.id, Seq: 1}
+	check(t, reject.Sign(desk.priv, nil))
+	sendSelf(desk, reject)
+	if got := string(readSelf(phone, "connect.closed").Data); got != `"access_denied"` {
+		t.Fatalf("denied connect.closed = %s", got)
+	}
+	readSelf(desk, "connect.closed")
+
+	// Accepted self-hosted connection grants TURN without any entitlement backend.
+	okConn := protocol.NewID()
+	reqOK := protocol.Message{Type: "connect.request", Connection: okConn, From: phone.id, To: desk.id, Seq: 1}
+	check(t, reqOK.Sign(phone.priv, []byte(`{"name":"PairedPhone"}`)))
+	sendSelf(phone, reqOK)
+	readSelf(desk, "connect.request")
+	accept := protocol.Message{Type: "connect.accept", Connection: okConn, From: desk.id, To: phone.id, Seq: 1}
+	check(t, accept.Sign(desk.priv, []byte(`{"nonce":"`+protocol.NewID()+`"}`)))
+	sendSelf(desk, accept)
+	gotAccept := readSelf(phone, "connect.accept")
+	if gotAccept.Certificate != "" {
+		t.Fatalf("self connect.accept carried certificate")
+	}
+	var servers []webrtc.ICEServer
+	check(t, json.Unmarshal(readSelf(phone, "ice.config").Data, &servers))
+	readSelf(desk, "ice.config")
+	if len(servers) != 2 || servers[1].Username == "" {
+		t.Fatalf("self-hosted connection did not receive TURN credentials: %+v", servers)
 	}
 }

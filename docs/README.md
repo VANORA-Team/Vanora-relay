@@ -6,10 +6,10 @@
 
 | 文档 | 适用对象 | 主要内容 |
 | --- | --- | --- |
-| [服务端部署与权益校验](deployment.md) | 运维 / 自建部署者 | 外部身份后端接入要求、`relay`（信令与 STUN/TURN）启动、端口与探针说明、TURN 权益校验 HTTP 接口规范 |
-| [桌面适配器指南](desktop.md) | 桌面端用户 / 宿主集成者 | `vanora-desktop` 令牌注册与账号管理、Sidecar 内嵌协议、`desktop.json` 会话/工作区/权限/远程审批配置、服务运行与热更新 |
-| [移动端 SDK 接入指南](mobile.md) | Android / iOS 开发者 | Android AAR 与 iOS XCFramework 构建、原生代码接入示例、令牌刷新与单消费者事件循环约定 |
-| [协议与自定义客户端参考](protocol.md) | 协议实现 / 非 Go 客户端开发者 | 端点接入时序、Ed25519 签名规范、DataChannel 分片帧格式、业务 RPC、流式事件与错误码 |
+| [服务端部署与权益校验](deployment.md) | 运维 / 自建部署者 | CN / GLOBAL 单站隔离部署、`RELAY_ALLOWED_ISSUER`、单站 TURN 权益接口、以及零外部依赖的免账号自建节点（`RELAY_CHANNEL=self`）部署步骤 |
+| [桌面适配器指南](desktop.md) | 桌面端用户 / 宿主集成者 | `vanora-desktop` 双站分槽凭据管理、Sidecar 渠道热切换（`cn` / `global` / `self` + 并发 `lan`）、自建配对指令与 `desktop.json`（含 `lan_access` / `self_access`）配置 |
+| [移动端 SDK 接入指南](mobile.md) | Android / iOS 开发者 | Android AAR 与 iOS XCFramework 构建、CN / GLOBAL 独立槽位接入、免账号自建配对（`NewSelfRelayClient`）、令牌刷新与单消费者事件循环约定 |
+| [协议与自定义客户端参考](protocol.md) | 协议实现 / 非 Go 客户端开发者 | 官方渠道端点接入时序、自建免账号配对与 HMAC 证明协议、Ed25519 签名规范、DataChannel 分片帧格式、业务 RPC 与错误码 |
 
 ## 延伸参考
 

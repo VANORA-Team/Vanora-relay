@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
 )
 
@@ -51,6 +52,7 @@ type Adapter struct {
 	authorityGen    uint64
 	authorityTimer  *time.Timer
 	lanAuthority    func(string) bool
+	selfAuthority   func(string) bool
 	officialOwner   string
 	flushTimer      *time.Timer
 	dirty           bool
@@ -260,6 +262,7 @@ func sessionFromWorkspace(w *normalizedWorkspace, rec createdSessionRecord, sess
 		owner:          w.owner,
 		officialOwner:  w.officialOwner,
 		lanAccess:      w.lanAccess,
+		selfAccess:     w.selfAccess,
 		tools:          slices.Clone(w.tools),
 		arguments:      slices.Clone(w.arguments),
 		showThinking:   w.showThinking,
@@ -797,6 +800,12 @@ func (a *Adapter) SetLANAuthority(allows func(string) bool) {
 	a.mu.Unlock()
 }
 
+func (a *Adapter) SetSelfAuthority(allows func(string) bool) {
+	a.mu.Lock()
+	a.selfAuthority = allows
+	a.mu.Unlock()
+}
+
 func (a *Adapter) SetOfficialOwner(user string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -816,6 +825,18 @@ func (a *Adapter) RefreshLANAccess() {
 	a.mu.Lock()
 	stops, uiCancels := a.stopRunsLocked("lan_access_revoked", func(r *run) bool {
 		return lan.Access(r.userID) != "" && !a.userOnlineLocked(r.userID)
+	})
+	a.mu.Unlock()
+	flushUICancels(uiCancels)
+	for _, r := range stops {
+		r.stop(0)
+	}
+}
+
+func (a *Adapter) RefreshSelfAccess() {
+	a.mu.Lock()
+	stops, uiCancels := a.stopRunsLocked("self_access_revoked", func(r *run) bool {
+		return selfrelay.Access(r.userID) != "" && !a.userOnlineLocked(r.userID)
 	})
 	a.mu.Unlock()
 	flushUICancels(uiCancels)
@@ -976,8 +997,10 @@ func (a *Adapter) checkRuns() {
 			reason = "acl_revoked"
 		case !a.userOnlineLocked(r.userID):
 			reason = "authority_lost"
-			if !officialRun(r) {
+			if lan.Access(r.userID) != "" {
 				reason = "lan_access_revoked"
+			} else if selfrelay.Access(r.userID) != "" {
+				reason = "self_access_revoked"
 			}
 		case !r.authorityUntil.IsZero() && !now.Before(r.authorityUntil):
 			reason = "authority_lost"
@@ -1001,7 +1024,7 @@ func (a *Adapter) checkRuns() {
 }
 
 func officialRun(r *run) bool {
-	return lan.Access(r.userID) == ""
+	return lan.Access(r.userID) == "" && selfrelay.Access(r.userID) == ""
 }
 
 func (a *Adapter) stopRunsLocked(reason string, matches func(*run) bool) ([]*run, []uiCancelAction) {
@@ -1023,6 +1046,9 @@ func (a *Adapter) stopRunsLocked(reason string, matches func(*run) bool) ([]*run
 func (a *Adapter) userOnlineLocked(user string) bool {
 	if lan.Access(user) != "" {
 		return a.lanAuthority != nil && a.lanAuthority(user)
+	}
+	if selfrelay.Access(user) != "" {
+		return a.selfAuthority != nil && a.selfAuthority(user)
 	}
 	return a.effectiveOnlineLocked()
 }

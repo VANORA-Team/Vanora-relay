@@ -165,9 +165,9 @@ type leaseUpdate struct {
 	Certificate string `json:"certificate,omitempty"`
 }
 
-// Dial opens and authenticates one signaling connection. role must be
-// RoleDesktop or RoleMobile. The returned Client is usable until Done is
-// closed or Close is called.
+// Dial opens and authenticates one official-channel signaling connection. role
+// must be RoleDesktop or RoleMobile. The returned Client is usable until Done
+// is closed or Close is called.
 func Dial(ctx context.Context, url, role string, source IdentitySource, h Handler) (*Client, error) {
 	if role != RoleDesktop && role != RoleMobile {
 		return nil, fmt.Errorf("%w: role %q", ErrInvalidArgument, role)

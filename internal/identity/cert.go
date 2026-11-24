@@ -262,6 +262,12 @@ func validDeviceID(id string) bool {
 	return true
 }
 
+// ValidateIssuerURL accepts an HTTPS issuer without query, fragment or user
+// info. Loopback HTTP issuers are accepted for local development only.
+func ValidateIssuerURL(raw string) error {
+	return validateIssuerURL(raw)
+}
+
 // validateIssuerURL accepts an HTTPS issuer without query, fragment or user
 // info. Loopback HTTP issuers are accepted for local development only.
 func validateIssuerURL(raw string) error {

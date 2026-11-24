@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,76 +16,197 @@ import (
 	"vanora-relay/adapter/account"
 	"vanora-relay/adapter/desktop"
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
 )
 
 type accessOptions struct {
-	lanListen    string
-	relayEnabled bool
-	token        string
+	lanListen     string
+	relayEnabled  bool
+	activeChannel string
+	selfURL       string
+	selfToken     string
+	selfStore     selfrelay.Store
+	token         string
+	tokens        map[string]string
 }
 
 type accessCommand struct {
-	Type      string `json:"type"`
-	RequestID string `json:"request_id"`
-	Token     string `json:"token"`
-	Enabled   *bool  `json:"enabled"`
-	Address   string `json:"address"`
-	Access    string `json:"access"`
-	ID        string `json:"id"`
+	Type         string `json:"type"`
+	RequestID    string `json:"request_id"`
+	Channel      string `json:"channel"`
+	Token        string `json:"token"`
+	SignalURL    string `json:"signal_url"`
+	SignalToken  string `json:"signal_token"`
+	Enabled      *bool  `json:"enabled"`
+	IncludeToken *bool  `json:"include_token"`
+	Address      string `json:"address"`
+	Access       string `json:"access"`
+	ID           string `json:"id"`
+}
+
+type officialSlot struct {
+	name     string
+	account  *account.Account
+	ca       ed25519.PublicKey
+	url      string
+	token    string
+	online   atomic.Bool
+	verified atomic.Bool
 }
 
 type accessManager struct {
-	ctx     context.Context
-	account *account.Account
-	ca      ed25519.PublicKey
-	url     string
-	name    string
-	service *desktop.Adapter
-	dir     string
-	emitter *jsonEmitter
-	config  func() *desktop.Config
-	updates <-chan struct{}
-	retry   chan struct{}
-
-	mu               sync.Mutex
-	local            *lan.Server
-	relayEnabled     bool
+	ctx              context.Context
+	slots            map[string]*officialSlot
+	name             string
+	service          *desktop.Adapter
+	dir              string
+	emitter          *jsonEmitter
+	config           func() *desktop.Config
+	updates          <-chan struct{}
+	retry            chan struct{}
 	requireHostToken bool
-	token            string
-	stopRelay        context.CancelFunc
-	relayDone        chan struct{}
-	online           atomic.Bool
-	verified         atomic.Bool
+
+	mu            sync.Mutex
+	local         *lan.Server
+	selfServer    *selfrelay.Server
+	selfStore     selfrelay.Store
+	selfURL       string
+	selfToken     string
+	activeChannel string // "", "cn", "global", or "self"
+	activeSlot    *officialSlot
+	stopRelay     context.CancelFunc
+	relayDone     chan struct{}
+}
+
+func (m *accessManager) primaryOfficialSlotLocked() *officialSlot {
+	if m.activeSlot != nil {
+		return m.activeSlot
+	}
+	if slot := m.slots[m.activeChannel]; slot != nil {
+		return slot
+	}
+	if len(m.slots) == 1 {
+		for _, slot := range m.slots {
+			return slot
+		}
+	}
+	return nil
+}
+
+func (m *accessManager) currentChannel() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeChannel
+}
+
+func (m *accessManager) isOnline() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch m.activeChannel {
+	case "cn", "global":
+		if slot := m.slots[m.activeChannel]; slot != nil {
+			return slot.online.Load()
+		}
+	case "self":
+		if m.selfServer != nil {
+			return m.selfServer.Status().Online
+		}
+	}
+	return false
 }
 
 func (m *accessManager) userID() string {
-	if m.account == nil {
-		return ""
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slot := m.primaryOfficialSlotLocked(); slot != nil && slot.account != nil {
+		return slot.account.UserID()
 	}
-	return m.account.UserID()
+	return ""
 }
 
 func (m *accessManager) deviceID() string {
-	if m.account == nil {
-		return ""
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeChannel == "self" && m.selfServer != nil {
+		return m.selfServer.DeviceID()
 	}
-	return m.account.DeviceID()
+	if slot := m.primaryOfficialSlotLocked(); slot != nil && slot.account != nil {
+		return slot.account.DeviceID()
+	}
+	return ""
 }
 
-func (m *accessManager) status() map[string]any {
-	status := lan.Status{Clients: []lan.ClientInfo{}, Invitations: []lan.Invitation{}}
+func (m *accessManager) statusLocked() map[string]any {
+	lanStatus := lan.Status{Clients: []lan.ClientInfo{}, Invitations: []lan.Invitation{}}
 	if m.local != nil {
-		status = m.local.Status()
+		lanStatus = m.local.Status()
+	}
+	selfStatus := selfrelay.Status{Clients: []selfrelay.ClientInfo{}, Invitations: []selfrelay.Invitation{}}
+	if m.selfServer != nil {
+		selfStatus = m.selfServer.Status()
+	}
+	channels := map[string]any{
+		"self": selfStatus,
+	}
+	for _, ch := range []string{"cn", "global"} {
+		slot := m.slots[ch]
+		if slot == nil {
+			channels[ch] = map[string]any{
+				"configured": false,
+				"enrolled":   false,
+				"authorized": false,
+				"online":     false,
+				"user_id":    "",
+				"device_id":  "",
+			}
+			continue
+		}
+		channels[ch] = map[string]any{
+			"configured": slot.account != nil && slot.url != "",
+			"enrolled":   slot.account != nil && slot.account.UserID() != "",
+			"authorized": slot.verified.Load(),
+			"online":     slot.online.Load(),
+			"user_id":    slot.account.UserID(),
+			"device_id":  slot.account.DeviceID(),
+		}
+	}
+
+	relayConfigured := false
+	relayEnabled := m.activeChannel != ""
+	relayAuthorized := false
+	relayOnline := false
+	switch m.activeChannel {
+	case "cn", "global":
+		if slot := m.slots[m.activeChannel]; slot != nil {
+			relayConfigured = slot.account != nil && slot.url != ""
+			relayAuthorized = slot.verified.Load()
+			relayOnline = slot.online.Load()
+		}
+	case "self":
+		relayConfigured = m.selfURL != "" && m.selfToken != ""
+		relayAuthorized = selfStatus.Online
+		relayOnline = selfStatus.Online
+	default:
+		if slot := m.primaryOfficialSlotLocked(); slot != nil {
+			relayConfigured = slot.account != nil && slot.url != ""
+			relayAuthorized = slot.verified.Load()
+			relayOnline = slot.online.Load()
+		}
 	}
 	return map[string]any{
-		"type": "access.status", "lan": status,
-		"relay_configured": m.account != nil && m.url != "", "relay_enabled": m.relayEnabled,
-		"relay_authorized": m.verified.Load(), "relay_online": m.online.Load(),
+		"type":             "access.status",
+		"active_channel":   m.activeChannel,
+		"channels":         channels,
+		"lan":              lanStatus,
+		"relay_configured": relayConfigured,
+		"relay_enabled":    relayEnabled,
+		"relay_authorized": relayAuthorized,
+		"relay_online":     relayOnline,
 	}
 }
 
-func (m *accessManager) loadLAN() error {
+func (m *accessManager) loadLANLocked() error {
 	if m.local != nil {
 		return nil
 	}
@@ -97,7 +219,7 @@ func (m *accessManager) loadLAN() error {
 	return nil
 }
 
-func (m *accessManager) loadExistingLAN() error {
+func (m *accessManager) loadExistingLANLocked() error {
 	if m.local != nil {
 		return nil
 	}
@@ -107,14 +229,95 @@ func (m *accessManager) loadExistingLAN() error {
 		}
 		return err
 	}
-	return m.loadLAN()
+	return m.loadLANLocked()
+}
+
+func (m *accessManager) loadSelfLocked() error {
+	if m.selfServer != nil {
+		return nil
+	}
+	store := m.selfStore
+	if store == nil {
+		store = namedVault(m.dir, "self.enc", "self")
+	}
+	srv, err := selfrelay.OpenServer(store, m.service)
+	if err != nil {
+		return err
+	}
+	srv.SetObserver(func(online bool, reason string) {
+		if online {
+			m.emitter.Emit(map[string]any{
+				"type":      "online",
+				"channel":   "self",
+				"device_id": srv.DeviceID(),
+				"name":      strings.TrimSpace(m.name),
+			})
+			if m.emitter == nil {
+				log.Printf("desktop self-relay online: %s", srv.DeviceID())
+			}
+		} else {
+			m.emitter.Emit(map[string]any{
+				"type":      "offline",
+				"channel":   "self",
+				"device_id": srv.DeviceID(),
+				"error":     reason,
+			})
+			if m.emitter == nil && reason != "" {
+				log.Printf("desktop self-relay offline: %s", reason)
+			}
+		}
+	})
+	m.selfServer = srv
+	m.service.SetSelfAuthority(srv.Allows)
+	return nil
+}
+
+func (m *accessManager) loadExistingSelfLocked() error {
+	if m.selfServer != nil {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(m.dir, "self.enc")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return m.loadSelfLocked()
 }
 
 func (m *accessManager) listen(address string) error {
-	if err := m.loadLAN(); err != nil {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadLANLocked(); err != nil {
 		return err
 	}
 	return m.local.Listen(m.ctx, address)
+}
+
+func (m *accessManager) resolveOfficialChannelLocked(raw string) (*officialSlot, error) {
+	ch := strings.ToLower(strings.TrimSpace(raw))
+	if ch == "self" {
+		return nil, errors.New("self-hosted relay uses pairing and does not use account tokens")
+	}
+	if ch == "" {
+		if m.activeChannel == "cn" || m.activeChannel == "global" {
+			ch = m.activeChannel
+		} else if len(m.slots) == 1 {
+			for k := range m.slots {
+				ch = k
+			}
+		} else if len(m.slots) > 1 {
+			return nil, errors.New("channel is required (cn or global)")
+		}
+	}
+	if ch != "cn" && ch != "global" {
+		return nil, fmt.Errorf("unknown official channel %q (want cn or global)", ch)
+	}
+	slot := m.slots[ch]
+	if slot == nil || slot.account == nil || slot.url == "" {
+		return nil, fmt.Errorf("official relay channel %s is not configured", ch)
+	}
+	return slot, nil
 }
 
 func (m *accessManager) command(cmd accessCommand) {
@@ -127,8 +330,10 @@ func (m *accessManager) command(cmd accessCommand) {
 	var err error
 	switch cmd.Type {
 	case "access.status":
-		err = m.loadExistingLAN()
-		result = m.status()
+		if err = m.loadExistingLANLocked(); err == nil {
+			err = m.loadExistingSelfLocked()
+		}
+		result = m.statusLocked()
 		result["request_id"] = cmd.RequestID
 	case "access.lan.set":
 		switch {
@@ -136,28 +341,20 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = errors.New("enabled is required")
 		case *cmd.Enabled:
 			if m.local == nil || !m.local.Status().Enabled {
-				err = m.listen(cmd.Address)
+				if err = m.loadLANLocked(); err == nil {
+					err = m.local.Listen(m.ctx, cmd.Address)
+				}
 			}
 		case m.local != nil:
 			m.local.Stop()
 			m.service.RefreshLANAccess()
 		}
 	case "access.relay.set":
-		switch {
-		case cmd.Enabled == nil:
+		if cmd.Enabled == nil {
 			err = errors.New("enabled is required")
-		case *cmd.Enabled && (m.account == nil || m.url == ""):
-			err = errors.New("official relay is not configured")
-		case *cmd.Enabled && m.requireHostToken && m.token == "":
-			err = errors.New("Vanora sign-in required")
-		default:
-			m.relayEnabled = *cmd.Enabled
-			if m.relayEnabled {
-				m.startRelay()
-			} else {
-				m.stopOfficial()
-			}
+			break
 		}
+		err = m.setRelayLocked(*cmd.Enabled, cmd.Channel, cmd.SignalURL, cmd.SignalToken)
 	case "access.invite.create":
 		if m.local == nil {
 			err = errors.New("LAN listener is disabled")
@@ -176,7 +373,7 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = errors.New("unknown pairing link")
 		}
 	case "access.client.revoke", "access.clients.revoke":
-		if err = m.loadExistingLAN(); err != nil {
+		if err = m.loadExistingLANLocked(); err != nil {
 			break
 		}
 		switch {
@@ -192,16 +389,65 @@ func (m *accessManager) command(cmd accessCommand) {
 		if err == nil {
 			m.service.RefreshLANAccess()
 		}
+	case "access.self.invite.create":
+		if m.selfServer == nil || !m.selfServer.Status().Enabled {
+			err = errors.New("self-hosted relay is disabled")
+			break
+		}
+		level := cmd.Access
+		if level == "" {
+			level = selfrelay.Read
+		}
+		includeToken := true
+		if cmd.IncludeToken != nil {
+			includeToken = *cmd.IncludeToken
+		}
+		var invite selfrelay.Invitation
+		var link string
+		invite, link, err = m.selfServer.Invite(level, includeToken)
+		result["type"], result["invitation"], result["link"] = "access.self.invite.created", invite, link
+	case "access.self.invite.revoke":
+		if m.selfServer == nil || !m.selfServer.RevokeInvitation(cmd.ID) {
+			err = errors.New("unknown self-relay pairing link")
+		}
+	case "access.self.client.revoke", "access.self.clients.revoke":
+		if err = m.loadExistingSelfLocked(); err != nil {
+			break
+		}
+		switch {
+		case m.selfServer == nil:
+			err = errors.New("self-hosted relay has not been opened")
+		case cmd.Type == "access.self.clients.revoke":
+			err = m.selfServer.RevokeClients("")
+		case cmd.ID == "":
+			err = errors.New("client ID required")
+		default:
+			err = m.selfServer.RevokeClients(cmd.ID)
+		}
+		if err == nil {
+			m.service.RefreshSelfAccess()
+		}
 	case "auth.token":
-		m.updateToken(cmd.Token)
+		m.updateTokenLocked(cmd.Channel, cmd.Token)
 		return
 	case "auth.logout":
-		m.stopOfficial()
-		m.token = ""
-		if m.account != nil && m.account.UserID() != "" {
-			err = m.account.Reset()
+		slot, slotErr := m.resolveOfficialChannelLocked(cmd.Channel)
+		if slotErr != nil {
+			err = slotErr
+			break
+		}
+		if m.activeChannel == slot.name {
+			m.stopOfficialLocked()
+			m.activeChannel = ""
+		}
+		slot.token = ""
+		slot.verified.Store(false)
+		slot.online.Store(false)
+		if slot.account != nil && slot.account.UserID() != "" {
+			err = slot.account.Reset()
 		}
 		result["type"] = "auth.logout.ok"
+		result["channel"] = slot.name
 	default:
 		return
 	}
@@ -210,7 +456,72 @@ func (m *accessManager) command(cmd accessCommand) {
 	}
 	m.emitter.Emit(result)
 	if err == nil && cmd.Type != "access.status" {
-		m.emitter.Emit(m.status())
+		m.emitter.Emit(m.statusLocked())
+	}
+}
+
+func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, signalToken string) error {
+	if !enabled {
+		m.stopAllWANLocked()
+		m.activeChannel = ""
+		return nil
+	}
+	ch := strings.ToLower(strings.TrimSpace(rawChannel))
+	if ch == "" {
+		if m.activeChannel != "" {
+			ch = m.activeChannel
+		} else if len(m.slots) == 1 {
+			for k := range m.slots {
+				ch = k
+			}
+		} else {
+			return errors.New("channel is required (cn, global, or self)")
+		}
+	}
+	switch ch {
+	case "cn", "global":
+		slot := m.slots[ch]
+		if slot == nil || slot.account == nil || slot.url == "" {
+			return fmt.Errorf("official relay channel %s is not configured", ch)
+		}
+		if m.requireHostToken && slot.token == "" {
+			return fmt.Errorf("Vanora sign-in required for %s channel", ch)
+		}
+		if m.activeChannel == ch && m.relayDone != nil {
+			return nil
+		}
+		m.stopAllWANLocked()
+		m.activeChannel = ch
+		return m.startOfficialLocked(slot)
+	case "self":
+		url := strings.TrimSpace(signalURL)
+		if url == "" {
+			url = m.selfURL
+		}
+		tok := strings.TrimSpace(signalToken)
+		if tok == "" {
+			tok = m.selfToken
+		}
+		if err := selfrelay.ValidateSignalURL(url); err != nil {
+			return err
+		}
+		if err := selfrelay.ValidateRelayToken(tok); err != nil {
+			return err
+		}
+		if m.activeChannel == "self" && m.selfServer != nil && m.selfServer.Status().Enabled && m.selfURL == url && m.selfToken == tok {
+			return nil
+		}
+		m.stopAllWANLocked()
+		m.selfURL = url
+		m.selfToken = tok
+		if err := m.startSelfLocked(); err != nil {
+			m.activeChannel = ""
+			return err
+		}
+		m.activeChannel = "self"
+		return nil
+	default:
+		return fmt.Errorf("unknown relay channel %q (want cn, global or self)", ch)
 	}
 }
 
@@ -221,85 +532,145 @@ func (m *accessManager) close() {
 		m.local.Stop()
 		m.service.RefreshLANAccess()
 	}
-	m.stopOfficial()
+	m.stopAllWANLocked()
 }
 
-func (m *accessManager) updateToken(token string) {
+func (m *accessManager) updateTokenLocked(rawChannel, token string) {
 	token = strings.TrimSpace(token)
-	if m.account == nil || m.url == "" || token == "" || len(token) > 16<<10 {
-		m.emitter.Emit(map[string]any{"type": "auth.error", "error": "configured official relay and a valid host token required"})
+	slot, err := m.resolveOfficialChannelLocked(rawChannel)
+	if err != nil || token == "" || len(token) > 16<<10 {
+		msg := "configured official relay and a valid host token required"
+		if err != nil {
+			msg = err.Error()
+		}
+		ev := map[string]any{"type": "auth.error", "error": msg}
+		if strings.TrimSpace(rawChannel) != "" {
+			ev["channel"] = strings.ToLower(strings.TrimSpace(rawChannel))
+		}
+		m.emitter.Emit(ev)
 		return
 	}
-	m.token = token
-	if !m.verified.Load() && m.relayDone != nil {
-		m.stopOfficial()
-	}
-	if m.relayDone == nil && m.relayEnabled {
-		m.startRelay()
+	slot.token = token
+	if m.activeChannel == slot.name {
+		if !slot.verified.Load() && m.relayDone != nil {
+			m.stopOfficialLocked()
+		}
+		if m.relayDone == nil {
+			_ = m.startOfficialLocked(slot)
+			return
+		}
+		if err := slot.account.UpdateToken(token); err != nil {
+			m.emitter.Emit(map[string]any{"type": "auth.error", "channel": slot.name, "error": err.Error()})
+			return
+		}
+		m.emitter.Emit(map[string]any{"type": "auth.ok", "channel": slot.name, "user_id": slot.account.UserID(), "device_id": slot.account.DeviceID()})
+		select {
+		case m.retry <- struct{}{}:
+		default:
+		}
 		return
 	}
-	if err := m.account.UpdateToken(token); err != nil {
-		m.emitter.Emit(map[string]any{"type": "auth.error", "error": err.Error()})
+	if err := slot.account.UpdateToken(token); err != nil {
+		m.emitter.Emit(map[string]any{"type": "auth.error", "channel": slot.name, "error": err.Error()})
 		return
 	}
-	m.emitter.Emit(map[string]any{"type": "auth.ok"})
-	select {
-	case m.retry <- struct{}{}:
+	m.emitter.Emit(map[string]any{"type": "auth.ok", "channel": slot.name, "user_id": slot.account.UserID(), "device_id": slot.account.DeviceID()})
+}
+
+func (m *accessManager) startActiveWANLocked() error {
+	switch m.activeChannel {
+	case "cn", "global":
+		slot := m.slots[m.activeChannel]
+		if slot == nil {
+			return nil
+		}
+		return m.startOfficialLocked(slot)
+	case "self":
+		return m.startSelfLocked()
 	default:
+		return nil
 	}
 }
 
-func (m *accessManager) startRelay() {
-	if m.relayDone != nil || !m.relayEnabled || (m.requireHostToken && m.token == "") || m.ctx.Err() != nil {
-		return
+func (m *accessManager) startSelfLocked() error {
+	if m.ctx.Err() != nil {
+		return m.ctx.Err()
+	}
+	if err := m.loadSelfLocked(); err != nil {
+		return err
+	}
+	return m.selfServer.Connect(m.ctx, m.selfURL, m.selfToken, m.name)
+}
+
+func (m *accessManager) stopSelfLocked() {
+	if m.selfServer != nil {
+		m.selfServer.Stop()
+		m.service.RefreshSelfAccess()
+	}
+}
+
+func (m *accessManager) stopAllWANLocked() {
+	m.stopOfficialLocked()
+	m.stopSelfLocked()
+}
+
+func (m *accessManager) startOfficialLocked(slot *officialSlot) error {
+	if slot == nil || m.relayDone != nil || (m.requireHostToken && slot.token == "") || m.ctx.Err() != nil {
+		return nil
 	}
 	ctx, cancel := context.WithCancel(m.ctx)
 	done := make(chan struct{})
-	m.stopRelay, m.relayDone = cancel, done
-	token := m.token
+	m.stopRelay, m.relayDone, m.activeSlot = cancel, done, slot
+	token := slot.token
 	go func() {
 		defer close(done)
-		defer m.verified.Store(false)
-		defer m.setOnline(false, "")
+		defer slot.verified.Store(false)
+		defer m.setOnline(slot, false, "")
 		if token != "" {
 			authCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-			err := m.account.Enroll(authCtx, token)
+			err := slot.account.Enroll(authCtx, token)
 			stop()
 			if err != nil {
 				if ctx.Err() == nil {
-					m.reportOffline(err)
-					m.emitter.Emit(map[string]any{"type": "auth.error", "error": err.Error()})
+					m.reportOffline(slot, err)
+					m.emitter.Emit(map[string]any{"type": "auth.error", "channel": slot.name, "error": err.Error()})
 				}
 				return
 			}
-			m.verified.Store(true)
-			m.emitter.Emit(map[string]any{"type": "auth.ok", "user_id": m.userID(), "device_id": m.deviceID()})
+			slot.verified.Store(true)
+			m.emitter.Emit(map[string]any{
+				"type":      "auth.ok",
+				"channel":   slot.name,
+				"user_id":   slot.account.UserID(),
+				"device_id": slot.account.DeviceID(),
+			})
 		}
-		m.runRelay(ctx)
+		m.runOfficialRelay(ctx, slot)
 	}()
+	return nil
 }
 
-func (m *accessManager) stopOfficial() {
+func (m *accessManager) stopOfficialLocked() {
 	if m.stopRelay == nil {
 		return
 	}
 	m.stopRelay()
 	<-m.relayDone
-	m.stopRelay, m.relayDone = nil, nil
+	m.stopRelay, m.relayDone, m.activeSlot = nil, nil, nil
 	m.service.SetOfficialOwner("")
 	m.service.AuthorityLost()
 }
 
-func (m *accessManager) runRelay(ctx context.Context) {
-	source := &authority{account: m.account, adapter: m.service, ca: m.ca}
+func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot) {
+	source := &authority{account: slot.account, adapter: m.service, ca: slot.ca}
 	for delay := time.Second; ctx.Err() == nil; {
-		socket, err := transport.Dial(ctx, m.url, "desktop", source, m.service)
+		socket, err := transport.Dial(ctx, slot.url, "desktop", source, m.service)
 		if err == nil {
-			err = m.publish(ctx, socket)
+			err = m.publish(ctx, slot, socket)
 			if err == nil {
-				m.verified.Store(true)
+				slot.verified.Store(true)
 				delay = time.Second
-				m.setOnline(true, "")
+				m.setOnline(slot, true, "")
 			online:
 				for {
 					select {
@@ -308,7 +679,7 @@ func (m *accessManager) runRelay(ctx context.Context) {
 					case <-socket.Done():
 						break online
 					case <-m.updates:
-						if err = m.publish(ctx, socket); err != nil {
+						if err = m.publish(ctx, slot, socket); err != nil {
 							break online
 						}
 					}
@@ -319,7 +690,7 @@ func (m *accessManager) runRelay(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		m.reportOffline(err)
+		m.reportOffline(slot, err)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -333,8 +704,8 @@ func (m *accessManager) runRelay(ctx context.Context) {
 	}
 }
 
-func (m *accessManager) publish(ctx context.Context, socket *transport.Client) error {
-	user := m.account.UserID()
+func (m *accessManager) publish(ctx context.Context, slot *officialSlot, socket *transport.Client) error {
+	user := slot.account.UserID()
 	allowed, err := guests(m.config(), user)
 	if err != nil {
 		return err
@@ -343,30 +714,39 @@ func (m *accessManager) publish(ctx context.Context, socket *transport.Client) e
 	return publish(ctx, socket, m.name, allowed)
 }
 
-func (m *accessManager) reportOffline(err error) {
+func (m *accessManager) reportOffline(slot *officialSlot, err error) {
 	reason := ""
 	if err != nil {
 		reason = err.Error()
 		if isAuthRequiredError(err) {
-			m.emitter.Emit(map[string]any{"type": "auth.required", "error": reason})
+			m.emitter.Emit(map[string]any{"type": "auth.required", "channel": slot.name, "error": reason})
 		}
 	}
-	m.setOnline(false, reason)
+	m.setOnline(slot, false, reason)
 }
 
-func (m *accessManager) setOnline(online bool, reason string) {
-	wasOnline := m.online.Swap(online)
+func (m *accessManager) setOnline(slot *officialSlot, online bool, reason string) {
+	wasOnline := slot.online.Swap(online)
 	if online {
 		m.emitter.Emit(map[string]any{
-			"type": "online", "device_id": m.deviceID(), "user_id": m.userID(), "name": strings.TrimSpace(m.name),
+			"type":      "online",
+			"channel":   slot.name,
+			"device_id": slot.account.DeviceID(),
+			"user_id":   slot.account.UserID(),
+			"name":      strings.TrimSpace(m.name),
 		})
 		if m.emitter == nil {
-			log.Printf("desktop online: %s", m.deviceID())
+			log.Printf("desktop online (%s): %s", slot.name, slot.account.DeviceID())
 		}
 	} else if wasOnline || reason != "" {
-		m.emitter.Emit(map[string]any{"type": "offline", "device_id": m.deviceID(), "error": reason})
+		m.emitter.Emit(map[string]any{
+			"type":      "offline",
+			"channel":   slot.name,
+			"device_id": slot.account.DeviceID(),
+			"error":     reason,
+		})
 		if m.emitter == nil && reason != "" {
-			log.Printf("desktop offline: %s", reason)
+			log.Printf("desktop offline (%s): %s", slot.name, reason)
 		}
 	}
 }

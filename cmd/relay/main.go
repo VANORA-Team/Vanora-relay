@@ -21,17 +21,46 @@ import (
 )
 
 func run() error {
-	key, err := identity.ParsePublicKey([]byte(strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY"))))
-	if err != nil || len(key) != ed25519.PublicKeySize {
-		return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the Ed25519 public key (hex or base64) of the identity authority")
-	}
 	channel, err := relay.ParseChannel(os.Getenv("RELAY_CHANNEL"))
 	if err != nil {
 		return err
 	}
-	entitlement, err := entitlementVerifier(channel)
-	if err != nil {
-		return err
+	var (
+		key           ed25519.PublicKey
+		allowedIssuer string
+		entitlement   relay.EntitlementVerifier
+		selfToken     string
+	)
+	if channel.IsSelfHosted() {
+		if strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY")) != "" {
+			return errors.New("RELAY_IDENTITY_PUBLIC_KEY must not be set with RELAY_CHANNEL=self (self-hosted nodes authenticate locally with RELAY_SELF_TOKEN and device pairing)")
+		}
+		if strings.TrimSpace(os.Getenv("RELAY_ALLOWED_ISSUER")) != "" {
+			return errors.New("RELAY_ALLOWED_ISSUER must not be set with RELAY_CHANNEL=self")
+		}
+		if _, err := entitlementVerifier(channel); err != nil {
+			return err
+		}
+		selfToken, err = selfAccessToken(channel)
+		if err != nil {
+			return err
+		}
+	} else {
+		key, err = identity.ParsePublicKey([]byte(strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY"))))
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the Ed25519 public key (hex or base64) of the site's identity authority")
+		}
+		allowedIssuer, err = allowedIssuerConfig(channel)
+		if err != nil {
+			return err
+		}
+		entitlement, err = entitlementVerifier(channel)
+		if err != nil {
+			return err
+		}
+		if _, err := selfAccessToken(channel); err != nil {
+			return err
+		}
 	}
 	addr := os.Getenv("RELAY_ADDR")
 	if addr == "" {
@@ -53,7 +82,15 @@ func run() error {
 		return fmt.Errorf("start STUN/TURN: %w", err)
 	}
 	defer network.Close()
-	hub := relay.New(key, entitlement, network)
+	var hub *relay.Hub
+	if channel.IsSelfHosted() {
+		hub = relay.NewSelfHosted(selfToken, network)
+	} else {
+		hub = relay.New(key, entitlement, network)
+		if allowedIssuer != "" {
+			hub.RequireIssuer(allowedIssuer)
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go hub.Run(ctx)
@@ -82,48 +119,84 @@ func run() error {
 	return err
 }
 
-// entitlementVerifier builds the entitlement check for an official channel.
-// Each site's service is configured independently: accounts sign in on one site
-// but may use a relay in either region, so the node checks every site it knows.
-// A self-hosted node checks nothing.
+// selfAccessToken returns the bearer token required on /v1/signal for a
+// self-hosted node. Official nodes must not configure one: their access is
+// governed by site entitlement, not a shared secret.
+func selfAccessToken(channel relay.Channel) (string, error) {
+	token := os.Getenv("RELAY_SELF_TOKEN")
+	if channel.ChecksEntitlement() {
+		if token != "" {
+			return "", errors.New("RELAY_SELF_TOKEN is only valid with RELAY_CHANNEL=self")
+		}
+		return "", nil
+	}
+	if len(token) < 32 || len(token) > 512 || strings.ContainsAny(token, " \t\r\n") {
+		return "", errors.New("RELAY_CHANNEL=self requires RELAY_SELF_TOKEN (32-512 bytes without whitespace)")
+	}
+	return token, nil
+}
+
+// allowedIssuerConfig validates optional RELAY_ALLOWED_ISSUER on official
+// channels to enforce defense-in-depth site isolation alongside per-site CA
+// keys. Self-hosted nodes must not configure it.
+func allowedIssuerConfig(channel relay.Channel) (string, error) {
+	issuer := strings.TrimSpace(os.Getenv("RELAY_ALLOWED_ISSUER"))
+	if issuer == "" {
+		return "", nil
+	}
+	if channel.IsSelfHosted() {
+		return "", errors.New("RELAY_ALLOWED_ISSUER must not be set with RELAY_CHANNEL=self")
+	}
+	if err := identity.ValidateIssuerURL(issuer); err != nil {
+		return "", fmt.Errorf("invalid RELAY_ALLOWED_ISSUER: %w", err)
+	}
+	return issuer, nil
+}
+
+// entitlementVerifier builds the single-site entitlement check for an official
+// channel. CN nodes consult only the CN membership service, GLOBAL nodes
+// consult only the GLOBAL membership service, and cross-site membership
+// variables fail fast at startup. Self-hosted nodes must not configure any
+// membership variables.
 func entitlementVerifier(channel relay.Channel) (relay.EntitlementVerifier, error) {
+	cnURL, cnToken := os.Getenv("RELAY_CN_MEMBERSHIP_URL"), os.Getenv("RELAY_CN_MEMBERSHIP_TOKEN")
+	globalURL, globalToken := os.Getenv("RELAY_GLOBAL_MEMBERSHIP_URL"), os.Getenv("RELAY_GLOBAL_MEMBERSHIP_TOKEN")
+	legacyURL, legacyToken := os.Getenv("RELAY_MEMBERSHIP_URL"), os.Getenv("RELAY_MEMBERSHIP_TOKEN")
+
 	if !channel.ChecksEntitlement() {
+		if cnURL != "" || cnToken != "" || globalURL != "" || globalToken != "" || legacyURL != "" || legacyToken != "" {
+			return nil, errors.New("membership variables must not be set with RELAY_CHANNEL=self")
+		}
 		return nil, nil
 	}
-	ownSite := "CN"
+
+	urlVar, tokenVar := "RELAY_CN_MEMBERSHIP_URL", "RELAY_CN_MEMBERSHIP_TOKEN"
+	otherSite, otherURLVar, otherTokenVar := "GLOBAL", "RELAY_GLOBAL_MEMBERSHIP_URL", "RELAY_GLOBAL_MEMBERSHIP_TOKEN"
+	rawURL, token := cnURL, cnToken
+	otherURL, otherToken := globalURL, globalToken
 	if channel == relay.ChannelGlobal {
-		ownSite = "GLOBAL"
+		urlVar, tokenVar = "RELAY_GLOBAL_MEMBERSHIP_URL", "RELAY_GLOBAL_MEMBERSHIP_TOKEN"
+		otherSite, otherURLVar, otherTokenVar = "CN", "RELAY_CN_MEMBERSHIP_URL", "RELAY_CN_MEMBERSHIP_TOKEN"
+		rawURL, token = globalURL, globalToken
+		otherURL, otherToken = cnURL, cnToken
 	}
-	legacyURL, legacyToken := os.Getenv("RELAY_MEMBERSHIP_URL"), os.Getenv("RELAY_MEMBERSHIP_TOKEN")
+
+	if otherURL != "" || otherToken != "" {
+		return nil, fmt.Errorf("RELAY_CHANNEL=%s must not configure %s membership variables (%s/%s); CN and GLOBAL entitlements are isolated", channel, otherSite, otherURLVar, otherTokenVar)
+	}
 	if (legacyURL == "") != (legacyToken == "") {
 		return nil, errors.New("configure both RELAY_MEMBERSHIP_URL and RELAY_MEMBERSHIP_TOKEN, or neither")
 	}
-	var sites membership.Sites
-	seen := make(map[string]bool, 2)
-	for _, site := range []struct{ name, urlVar, tokenVar string }{
-		{"CN", "RELAY_CN_MEMBERSHIP_URL", "RELAY_CN_MEMBERSHIP_TOKEN"},
-		{"GLOBAL", "RELAY_GLOBAL_MEMBERSHIP_URL", "RELAY_GLOBAL_MEMBERSHIP_TOKEN"},
-	} {
-		rawURL, token := os.Getenv(site.urlVar), os.Getenv(site.tokenVar)
-		if rawURL == "" && token == "" && site.name == ownSite {
-			rawURL, token = legacyURL, legacyToken
-		}
-		if rawURL == "" && token == "" {
-			continue
-		}
-		if rawURL == "" || len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
-			return nil, fmt.Errorf("%s and %s must both be set; the token needs at least 32 bytes without whitespace", site.urlVar, site.tokenVar)
-		}
-		if seen[rawURL] {
-			continue
-		}
-		seen[rawURL] = true
-		sites = append(sites, &membership.Client{URL: rawURL, Token: token})
+	if rawURL == "" && token == "" {
+		rawURL, token = legacyURL, legacyToken
 	}
-	if len(sites) == 0 {
-		return nil, fmt.Errorf("RELAY_CHANNEL=%s requires RELAY_%s_MEMBERSHIP_URL and RELAY_%s_MEMBERSHIP_TOKEN (legacy RELAY_MEMBERSHIP_URL/RELAY_MEMBERSHIP_TOKEN also works)", channel, ownSite, ownSite)
+	if rawURL == "" && token == "" {
+		return nil, fmt.Errorf("RELAY_CHANNEL=%s requires %s and %s (legacy RELAY_MEMBERSHIP_URL/RELAY_MEMBERSHIP_TOKEN also works)", channel, urlVar, tokenVar)
 	}
-	return sites, nil
+	if rawURL == "" || len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
+		return nil, fmt.Errorf("%s and %s must both be set; the token needs at least 32 bytes without whitespace", urlVar, tokenVar)
+	}
+	return &membership.Client{URL: rawURL, Token: token}, nil
 }
 
 func main() {

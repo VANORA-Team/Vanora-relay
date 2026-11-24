@@ -2,6 +2,8 @@ module vanora-relay
 
 go 1.25.0
 
+toolchain go1.27.4
+
 require (
 	github.com/coder/websocket v1.8.14
 	github.com/gofrs/flock v0.12.1

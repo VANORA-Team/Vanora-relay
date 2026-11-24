@@ -24,6 +24,7 @@ import (
 
 	"vanora-relay/adapter/desktop"
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
@@ -697,4 +698,284 @@ done:
 	if !strings.Contains(sessionsJSON, created.SessionID) {
 		t.Fatalf("sessions after Reconnect missing created session: %s", sessionsJSON)
 	}
+}
+
+func TestSelfRelaySharingWithoutAccount(t *testing.T) {
+	t.Setenv("VANORA_MOBILE_FAKE_CLI", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	t.Setenv("STUN_URLS", "local")
+	t.Setenv("TURN_PUBLIC_IP", "127.0.0.1")
+	t.Setenv("TURN_BIND_IP", "127.0.0.1")
+	t.Setenv("TURN_PORT", "0")
+	t.Setenv("TURN_TCP", "false")
+	t.Setenv("TURN_RELAY_MIN_PORT", "0")
+	t.Setenv("TURN_RELAY_MAX_PORT", "0")
+	network, err := ice.FromEnv()
+	must(t, err)
+	defer network.Close()
+
+	relayToken := strings.Repeat("mobile-self-", 4)
+	hub := signalserver.NewSelfHosted(relayToken, network)
+	go hub.Run(ctx)
+	relaySrv := httptest.NewServer(hub)
+	defer relaySrv.Close()
+	signalURL := "ws" + strings.TrimPrefix(relaySrv.URL, "http")
+
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	must(t, err)
+	service, err := desktop.New(&desktop.Config{
+		Executable: executable,
+		Workspaces: []desktop.WorkspaceConfig{
+			{ID: "self-only", WorkingDir: dir, SessionDir: filepath.Join(dir, "self-sessions"), Owner: "local",
+				SelfAccess: true, Tools: []string{"read"}, ApprovalPolicy: "remote"},
+			{ID: "lan-only", WorkingDir: dir, SessionDir: filepath.Join(dir, "lan-sessions"), Owner: "local",
+				LANAccess: true, Tools: []string{"read"}},
+			{ID: "private", WorkingDir: dir, SessionDir: filepath.Join(dir, "private"), Owner: "local"},
+		},
+	}, filepath.Join(dir, "state"))
+	must(t, err)
+	defer service.Close()
+
+	desktopStore := &lanTestStore{}
+	server, err := selfrelay.OpenServer(desktopStore, service)
+	must(t, err)
+	onlineCh := make(chan bool, 4)
+	server.SetObserver(func(online bool, _ string) {
+		select {
+		case onlineCh <- online:
+		default:
+		}
+	})
+	service.SetSelfAuthority(server.Allows)
+	must(t, server.Connect(ctx, signalURL, relayToken, "SelfDesktop"))
+	defer server.Stop()
+	select {
+	case ok := <-onlineCh:
+		if !ok {
+			t.Fatal("desktop self-relay did not come online")
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for desktop self-relay online")
+	}
+
+	_, controlLink, err := server.Invite(selfrelay.Control, true)
+	must(t, err)
+
+	// Wrong relay token rejected.
+	controllerStore := &lanTestStore{}
+	controller, err := NewSelfRelayClient(controllerStore)
+	must(t, err)
+	defer controller.Close()
+	if err := controller.ConnectSelfRelayWithToken(controlLink, strings.Repeat("wrong-self-", 4), "Controller"); !errors.Is(err, selfrelay.ErrUnauthorized) {
+		t.Fatalf("wrong relay token: got %v, want ErrUnauthorized", err)
+	}
+
+	// Valid pairing succeeds without any official login.
+	must(t, controller.ConnectSelfRelay(controlLink, "Controller"))
+	if controller.UserID() != "" {
+		t.Fatalf("self-relay client unexpectedly reported official user_id %q", controller.UserID())
+	}
+	saved, err := selfrelay.ParseTarget(controller.SelfRelayTarget())
+	must(t, err)
+	if saved.Pair != "" {
+		t.Fatal("SelfRelayTarget retained one-time pairing token")
+	}
+
+	// Only self_access workspace is exposed (not lan_access, not private).
+	workspaces, err := controller.ListWorkspaces()
+	must(t, err)
+	if !strings.Contains(workspaces, `"workspace_id":"self-only"`) ||
+		strings.Contains(workspaces, `"workspace_id":"lan-only"`) ||
+		strings.Contains(workspaces, `"workspace_id":"private"`) {
+		t.Fatalf("wrong self-relay workspace scope: %s", workspaces)
+	}
+
+	// One-time pairing link cannot be reused by another device.
+	readerStore := &lanTestStore{}
+	reader, err := NewSelfRelayClient(readerStore)
+	must(t, err)
+	defer reader.Close()
+	if err := reader.ConnectSelfRelay(controlLink, "Reader"); !errors.Is(err, selfrelay.ErrUnpaired) {
+		t.Fatalf("reused pairing link accepted: %v", err)
+	}
+
+	// Pair read-only device (without embedding token, supplied out-of-band).
+	_, readLinkNoToken, err := server.Invite(selfrelay.Read, false)
+	must(t, err)
+	must(t, reader.ConnectSelfRelayWithToken(readLinkNoToken, relayToken, "Reader"))
+	readerSaved := reader.SelfRelayTarget()
+	if _, err := reader.CreateSession("self-only", NewRequestID(), "Denied"); !errors.Is(err, errUnavailable) {
+		t.Fatalf("read-only self-relay client created session: %v", err)
+	}
+
+	created, err := controller.CreateSession("self-only", NewRequestID(), "Self conversation")
+	must(t, err)
+	var sess struct {
+		ID string `json:"session_id"`
+	}
+	must(t, json.Unmarshal([]byte(created), &sess))
+	_, err = reader.OpenSession(sess.ID)
+	must(t, err)
+	if _, err := reader.StartRun(sess.ID, NewRequestID(), "Denied"); err == nil || err.Error() != "tool_denied" {
+		t.Fatalf("read-only self-relay client started run: %v", err)
+	}
+
+	// Start run on controller, wait for approval UI, ensure official AuthorityLost does not disrupt it.
+	_, err = controller.OpenSession(sess.ID)
+	must(t, err)
+	_, err = controller.StartRun(sess.ID, NewRequestID(), "Request approval")
+	must(t, err)
+	for {
+		if ctx.Err() != nil {
+			t.Fatal("self-relay run did not reach approval")
+		}
+		raw, err := controller.NextEvent(100)
+		must(t, err)
+		if strings.Contains(raw, `"kind":"ui.request"`) {
+			break
+		}
+	}
+	service.AuthorityLost()
+	_, err = controller.OpenSession(sess.ID)
+	must(t, err)
+
+	// Revoke controller -> active run stops with self_access_revoked and reconnect fails with ErrUnpaired.
+	controllerID := ""
+	for _, cl := range server.Status().Clients {
+		if cl.Name == "Controller" {
+			controllerID = cl.ID
+		}
+	}
+	if controllerID == "" {
+		t.Fatal("controller missing from self-relay clients")
+	}
+	must(t, server.RevokeClients(controllerID))
+	service.RefreshSelfAccess()
+	if err := controller.Reconnect(); !errors.Is(err, selfrelay.ErrUnpaired) {
+		t.Fatalf("revoked self-relay device reconnected: %v", err)
+	}
+	for {
+		if ctx.Err() != nil {
+			t.Fatal("run continued after self-relay controller revocation")
+		}
+		raw, err := reader.NextEvent(100)
+		must(t, err)
+		if strings.Contains(raw, `"reason":"authority_lost"`) {
+			t.Fatalf("official authority loss stopped self-relay run: %s", raw)
+		}
+		if strings.Contains(raw, `"reason":"self_access_revoked"`) {
+			break
+		}
+	}
+
+	// Persistence across desktop restart: Reader reconnects without pairing token.
+	reader.Close()
+	server.Stop()
+	restarted, err := selfrelay.OpenServer(desktopStore, service)
+	must(t, err)
+	defer restarted.Stop()
+	restartedOnline := make(chan bool, 4)
+	restarted.SetObserver(func(online bool, _ string) {
+		select {
+		case restartedOnline <- online:
+		default:
+		}
+	})
+	service.SetSelfAuthority(restarted.Allows)
+	must(t, restarted.Connect(ctx, signalURL, relayToken, "SelfDesktop"))
+	<-restartedOnline
+	returning, err := NewSelfRelayClient(readerStore)
+	must(t, err)
+	defer returning.Close()
+	must(t, returning.ConnectSelfRelay(readerSaved, "Reader"))
+	if got := restarted.Status().Clients; len(got) != 1 || got[0].Name != "Reader" {
+		t.Fatalf("self-relay paired clients did not persist: %+v", got)
+	}
+}
+
+func TestOfficialDualSiteIsolation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cnSigner := identitytest.NewAuthority(10 * time.Minute)
+	globalSigner := identitytest.NewAuthority(10 * time.Minute)
+
+	cnHub := signalserver.New(cnSigner.PublicKey(), nil, nil)
+	cnHub.RequireIssuer("https://auth.cn.example/realms/vanora")
+	go cnHub.Run(ctx)
+	cnSrv := httptest.NewServer(cnHub)
+	defer cnSrv.Close()
+	cnSignalURL := "ws" + strings.TrimPrefix(cnSrv.URL, "http")
+
+	globalHub := signalserver.New(globalSigner.PublicKey(), nil, nil)
+	globalHub.RequireIssuer("https://auth.global.example/realms/vanora")
+	go globalHub.Run(ctx)
+	globalSrv := httptest.NewServer(globalHub)
+	defer globalSrv.Close()
+	globalSignalURL := "ws" + strings.TrimPrefix(globalSrv.URL, "http")
+
+	issueFor := func(signer *identitytest.Authority, issuer, subject string) transport.IdentitySource {
+		_, k, err := ed25519.GenerateKey(rand.Reader)
+		must(t, err)
+		return &siteTestIdentity{key: k, signer: signer, issuer: issuer, subject: subject}
+	}
+
+	cnPhone := issueFor(cnSigner, "https://auth.cn.example/realms/vanora", "user-cn")
+	globalPhone := issueFor(globalSigner, "https://auth.global.example/realms/vanora", "user-global")
+
+	// Cross-site dialing MUST fail at signaling handshake.
+	cnToGlobal := newClient(globalSignalURL, cnPhone)
+	defer cnToGlobal.Close()
+	if _, err := cnToGlobal.Devices(); err == nil {
+		t.Fatal("CN account was accepted by GLOBAL relay")
+	}
+	globalToCN := newClient(cnSignalURL, globalPhone)
+	defer globalToCN.Close()
+	if _, err := globalToCN.Devices(); err == nil {
+		t.Fatal("GLOBAL account was accepted by CN relay")
+	}
+
+	// Same-site dialing succeeds independently for both sites.
+	cnClient := newClient(cnSignalURL, cnPhone)
+	defer cnClient.Close()
+	if _, err := cnClient.Devices(); err != nil {
+		t.Fatalf("CN client failed on CN relay: %v", err)
+	}
+	globalClient := newClient(globalSignalURL, globalPhone)
+	defer globalClient.Close()
+	if _, err := globalClient.Devices(); err != nil {
+		t.Fatalf("GLOBAL client failed on GLOBAL relay: %v", err)
+	}
+}
+
+type siteTestIdentity struct {
+	key     ed25519.PrivateKey
+	signer  *identitytest.Authority
+	issuer  string
+	subject string
+}
+
+func (s *siteTestIdentity) Current(context.Context) (*endpoint.Credentials, endpoint.LeaseProof, error) {
+	now := time.Now()
+	cert, err := s.signer.IssueWithKey(s.issuer, s.subject, s.key.Public().(ed25519.PublicKey), now)
+	if err != nil {
+		return nil, endpoint.LeaseProof{}, err
+	}
+	p, err := identity.VerifyCertificate(cert, s.signer.PublicKey(), now)
+	if err != nil {
+		return nil, endpoint.LeaseProof{}, err
+	}
+	nonce := make([]byte, 24)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, endpoint.LeaseProof{}, err
+	}
+	lease, _, err := s.signer.IssueLease(p, cert, base64.RawURLEncoding.EncodeToString(nonce), now, 60*time.Second)
+	if err != nil {
+		return nil, endpoint.LeaseProof{}, err
+	}
+	c, err := endpoint.OpenCredentials(cert, s.key, s.signer.PublicKey(), now)
+	return c, endpoint.LeaseProof{Certificate: cert, Lease: lease}, err
 }

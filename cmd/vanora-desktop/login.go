@@ -13,6 +13,7 @@ import (
 )
 
 type loginOptions struct {
+	channel    string
 	token      string
 	tokenStdin bool
 	in         io.Reader
@@ -50,11 +51,15 @@ func login(parent context.Context, a *account.Account, opts loginOptions) error 
 		return err
 	}
 	if opts.emitter != nil {
-		opts.emitter.Emit(map[string]any{
+		ev := map[string]any{
 			"type":      "login.ok",
 			"user_id":   a.UserID(),
 			"device_id": a.DeviceID(),
-		})
+		}
+		if opts.channel != "" {
+			ev["channel"] = opts.channel
+		}
+		opts.emitter.Emit(ev)
 		return nil
 	}
 	fmt.Printf("user_id=%s\ndevice_id=%s\n", a.UserID(), a.DeviceID())

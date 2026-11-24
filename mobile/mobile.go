@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"vanora-relay/adapter/account"
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
 )
 
@@ -31,6 +33,9 @@ type Client struct {
 	lanKey        string
 	lanTarget     *lan.Target
 	lanName       string
+	selfKey       string
+	selfTarget    *selfrelay.Target
+	selfName      string
 	ctx           context.Context
 	stop          context.CancelFunc
 	op            sync.Mutex // dial, selection, subscription setup and link recovery
@@ -62,7 +67,9 @@ type event struct {
 	payload string
 }
 
-// NewClient opens the configured secure identity store. No network is opened until login or discovery.
+// NewClient opens the configured secure identity store for one official site
+// channel (CN or GLOBAL). Use a separate Store slot per site. No network is
+// opened until login or discovery.
 func NewClient(identityURL, signalURL, publicKeyHex string, store Store) (*Client, error) {
 	if store == nil {
 		return nil, errors.New("secure storage required")
@@ -84,6 +91,18 @@ func NewLANClient(store Store) (*Client, error) {
 	}
 	c := newClient("", nil)
 	c.lanKey = key
+	return c, nil
+}
+
+// NewSelfRelayClient creates an account-free client for a user-hosted relay
+// (RELAY_CHANNEL=self). Use a secure store dedicated to self-hosted pairing.
+func NewSelfRelayClient(store Store) (*Client, error) {
+	key, err := selfrelay.LoadClientKey(store)
+	if err != nil {
+		return nil, err
+	}
+	c := newClient("", nil)
+	c.selfKey = key
 	return c, nil
 }
 
@@ -321,6 +340,63 @@ func (c *Client) LANAddress() string {
 	return c.lanTarget.Link()
 }
 
+// ConnectSelfRelay pairs with a desktop through a self-hosted relay using a
+// pairing link (which embeds the relay token) or reconnects using SelfRelayTarget.
+func (c *Client) ConnectSelfRelay(link, clientName string) error {
+	return c.ConnectSelfRelayWithToken(link, "", clientName)
+}
+
+// ConnectSelfRelayWithToken pairs or reconnects through a self-hosted relay,
+// allowing the caller to supply the relay bearer token out-of-band when the
+// pairing link omitted it.
+func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) error {
+	if c.selfKey == "" {
+		return errors.New("self-hosted relay requires a self-relay client")
+	}
+	target, err := selfrelay.ParseTarget(link)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(relayToken) != "" {
+		if err := selfrelay.ValidateRelayToken(strings.TrimSpace(relayToken)); err != nil {
+			return err
+		}
+		target.Token = strings.TrimSpace(relayToken)
+	}
+	if target.Token == "" {
+		return errors.New("selfrelay: relay token required")
+	}
+	c.op.Lock()
+	defer c.op.Unlock()
+	if c.selfTarget != nil && (c.selfTarget.SignalURL != target.SignalURL || c.selfTarget.Token != target.Token) && c.selfTarget.Pin == target.Pin {
+		c.mu.Lock()
+		old := c.peer
+		c.detachLocked()
+		c.mu.Unlock()
+		if old != nil {
+			old.Close()
+		}
+	}
+	c.selfTarget = &target
+	c.selfName = clientName
+	if err := c.selectDesktop(target.Pin, "self"); err != nil {
+		return err
+	}
+	c.selfTarget.Pair = ""
+	return nil
+}
+
+// SelfRelayTarget returns the paired self-hosted relay target with the
+// one-time pairing token stripped so the host app can store it for reconnects.
+func (c *Client) SelfRelayTarget() string {
+	c.op.Lock()
+	defer c.op.Unlock()
+	if c.selfTarget == nil || c.selfTarget.Pair != "" {
+		return ""
+	}
+	return c.selfTarget.Link()
+}
+
 func (c *Client) selectDesktop(deviceID, ownerID string) error {
 	c.mu.Lock()
 	same := deviceID == c.device && ownerID == c.owner
@@ -406,6 +482,13 @@ func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) 
 		}
 		return p, start, err
 	}
+	if c.selfTarget != nil {
+		p, start, err := selfrelay.Dial(c.ctx, *c.selfTarget, c.selfKey, c.selfName, (*handler)(c))
+		if err == nil {
+			c.selfTarget.Pair = ""
+		}
+		return p, start, err
+	}
 	s, err := c.dial()
 	if err != nil {
 		return nil, nil, err
@@ -452,6 +535,8 @@ func (c *Client) Disconnect() { c.op.Lock(); defer c.op.Unlock(); c.disconnect()
 func (c *Client) disconnect() {
 	c.lanTarget = nil
 	c.lanName = ""
+	c.selfTarget = nil
+	c.selfName = ""
 	c.mu.Lock()
 	p := c.peer
 	c.device = ""
@@ -506,16 +591,19 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 }
 
 func (c *Client) handleAuthError(err error) bool {
-	lanAccessRequired := errors.Is(err, lan.ErrUnpaired)
-	if !lanAccessRequired && !isLoginRequiredError(err) {
+	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired)
+	relayTokenInvalid := errors.Is(err, selfrelay.ErrUnauthorized)
+	if !pairingRequired && !relayTokenInvalid && !isLoginRequiredError(err) {
 		return false
 	}
 	c.mu.Lock()
 	c.setStateLocked("disconnected", "", err.Error())
 	if len(c.events) < 256 {
 		eventType, state := "auth.state", "login_required"
-		if lanAccessRequired {
+		if pairingRequired {
 			eventType, state = "access.state", "pairing_required"
+		} else if relayTokenInvalid {
+			eventType, state = "access.state", "relay_token_invalid"
 		}
 		payload, _ := json.Marshal(map[string]string{
 			"type":  eventType,

@@ -311,3 +311,159 @@ func TestSidecarSubprocessExitsOnStdinEOF(t *testing.T) {
 		t.Fatalf("sidecar lifecycle incomplete: ready=%v gate=%v auth_ok=%v online=%v logout=%v shutdown=%v", sawReady, sawGate, sawAuthOK, sawOnline, sawLogout, sawShutdown)
 	}
 }
+
+func TestSidecarDualSiteHotSwitchAndSelfRelay(t *testing.T) {
+	cnAuthSrv, cnAuth := newTestTokenAuthority(t, map[string]string{"cn-token": "cn-user"})
+	globalAuthSrv, globalAuth := newTestTokenAuthority(t, map[string]string{"global-token": "global-user"})
+
+	cnAccount, err := account.New(cnAuthSrv.URL, hex.EncodeToString(cnAuth.PublicKey()), &memVault{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalAccount, err := account.New(globalAuthSrv.URL, hex.EncodeToString(globalAuth.PublicKey()), &memVault{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cnHub := signalserver.New(cnAuth.PublicKey(), nil, nil)
+	go cnHub.Run(ctx)
+	cnRelay := httptest.NewServer(cnHub)
+	defer cnRelay.Close()
+
+	globalHub := signalserver.New(globalAuth.PublicKey(), nil, nil)
+	go globalHub.Run(ctx)
+	globalRelay := httptest.NewServer(globalHub)
+	defer globalRelay.Close()
+
+	selfToken := strings.Repeat("self-sidecar-", 4)
+	selfHub := signalserver.NewSelfHosted(selfToken, nil)
+	go selfHub.Run(ctx)
+	selfRelay := httptest.NewServer(selfHub)
+	defer selfRelay.Close()
+
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "desktop.json")
+	cfgRaw, _ := json.Marshal(map[string]any{"executable": exe})
+	if err := os.WriteFile(cfgPath, cfgRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStdin := os.Stdin
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = inR
+	defer func() { os.Stdin = oldStdin }()
+	defer inW.Close()
+
+	outR, outW := io.Pipe()
+	defer outR.Close()
+
+	slots := map[string]*officialSlotConfig{
+		"cn":     {name: "cn", account: cnAccount, ca: cnAuth.PublicKey(), signalURL: "ws" + strings.TrimPrefix(cnRelay.URL, "http")},
+		"global": {name: "global", account: globalAccount, ca: globalAuth.PublicKey(), signalURL: "ws" + strings.TrimPrefix(globalRelay.URL, "http")},
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		err := serveMulti(ctx, slots, "DualHost", cfgPath, filepath.Join(dir, "state"), true, &jsonEmitter{out: outW}, accessOptions{selfStore: &memVault{}})
+		_ = outW.Close()
+		serveDone <- err
+	}()
+
+	commands := json.NewEncoder(inW)
+	scanner := bufio.NewScanner(outR)
+	var seen []map[string]any
+	nextEvent := func(desc string) map[string]any {
+		t.Helper()
+		for scanner.Scan() {
+			var ev map[string]any
+			if json.Unmarshal(scanner.Bytes(), &ev) == nil {
+				seen = append(seen, ev)
+				return ev
+			}
+		}
+		t.Fatalf("sidecar stdout closed unexpectedly while waiting for %s; seen=%v", desc, seen)
+		return nil
+	}
+	waitFor := func(match func(map[string]any) bool, desc string) map[string]any {
+		t.Helper()
+		for {
+			ev := nextEvent(desc)
+			if match(ev) {
+				return ev
+			}
+		}
+	}
+
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "ready" }, "ready")
+
+	// 1. Enabling CN without CN login must fail.
+	_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "cn-denied", "channel": "cn", "enabled": true})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "access.error" && ev["request_id"] == "cn-denied" }, "cn denied")
+
+	// 2. Inject CN token, enable CN -> CN comes online.
+	_ = commands.Encode(map[string]any{"type": "auth.token", "channel": "cn", "token": "cn-token"})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "auth.ok" && ev["channel"] == "cn" }, "cn token stored")
+	_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "cn-on", "channel": "cn", "enabled": true})
+	cnOnline := waitFor(func(ev map[string]any) bool { return ev["type"] == "online" && ev["channel"] == "cn" }, "cn online")
+	cnDevID, _ := cnOnline["device_id"].(string)
+	if cnDevID == "" {
+		t.Fatalf("missing cn device_id: %v", cnOnline)
+	}
+
+	// 3. CN login must NOT allow switching to GLOBAL.
+	_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "gl-denied", "channel": "global", "enabled": true})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "access.error" && ev["request_id"] == "gl-denied" }, "global denied")
+
+	// 4. Inject GLOBAL token and hot-switch to GLOBAL -> GLOBAL comes online without losing CN identity.
+	_ = commands.Encode(map[string]any{"type": "auth.token", "channel": "global", "token": "global-token"})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "auth.ok" && ev["channel"] == "global" }, "global token stored")
+	_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "gl-on", "channel": "global", "enabled": true})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "online" && ev["channel"] == "global" }, "global online")
+
+	// 5. Hot-switch back to CN -> keeps same CN device_id!
+	_ = commands.Encode(map[string]any{"type": "access.relay.set", "request_id": "cn-back", "channel": "cn", "enabled": true})
+	cnOnlineAgain := waitFor(func(ev map[string]any) bool { return ev["type"] == "online" && ev["channel"] == "cn" }, "cn online again")
+	if cnOnlineAgain["device_id"] != cnDevID {
+		t.Fatalf("cn device_id changed after hot-switch: %v vs %v", cnOnlineAgain["device_id"], cnDevID)
+	}
+
+	// 6. Log out BOTH official accounts, then enable account-free self-hosted relay and create pairing link!
+	_ = commands.Encode(map[string]any{"type": "auth.logout", "request_id": "out-cn", "channel": "cn"})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "auth.logout.ok" && ev["channel"] == "cn" }, "cn logged out")
+	_ = commands.Encode(map[string]any{"type": "auth.logout", "request_id": "out-gl", "channel": "global"})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "auth.logout.ok" && ev["channel"] == "global" }, "global logged out")
+
+	_ = commands.Encode(map[string]any{
+		"type":         "access.relay.set",
+		"request_id":   "self-on",
+		"channel":      "self",
+		"enabled":      true,
+		"signal_url":   "ws" + strings.TrimPrefix(selfRelay.URL, "http"),
+		"signal_token": selfToken,
+	})
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "online" && ev["channel"] == "self" }, "self online")
+
+	_ = commands.Encode(map[string]any{"type": "access.self.invite.create", "request_id": "self-inv", "access": "control"})
+	invEv := waitFor(func(ev map[string]any) bool { return ev["type"] == "access.self.invite.created" && ev["request_id"] == "self-inv" }, "self invite")
+	link, _ := invEv["link"].(string)
+	if !strings.Contains(link, "#mode=self") || !strings.Contains(link, "pair=") {
+		t.Fatalf("unexpected self pairing link: %q", link)
+	}
+
+	_ = inW.Close()
+	waitFor(func(ev map[string]any) bool { return ev["type"] == "shutdown" }, "shutdown")
+	for scanner.Scan() {
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serveMulti failed: %v", err)
+	}
+}

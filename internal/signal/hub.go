@@ -4,17 +4,22 @@ package signal
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
 	"vanora-relay/internal/identity"
 	"vanora-relay/protocol"
 )
+
+const selfTurnWindow = 10 * time.Minute
 
 // EntitlementVerifier checks whether the account that signed in with issuer
 // and subject may use TURN relay. A zero time with a nil error means the
@@ -28,18 +33,23 @@ type iceService interface {
 }
 
 type Hub struct {
-	key         ed25519.PublicKey
-	entitlement EntitlementVerifier
-	ice         iceService
-	slots       chan struct{}
-	mu          sync.Mutex
-	peers       map[string]*peer
-	links       map[string]*link
+	key           ed25519.PublicKey
+	allowedIssuer string
+	selfHosted    bool
+	entitlement   EntitlementVerifier
+	ice           iceService
+	accessToken   [sha256.Size]byte
+	requireToken  bool
+	slots         chan struct{}
+	mu            sync.Mutex
+	peers         map[string]*peer
+	links         map[string]*link
 }
 
 type peer struct {
 	id         identity.Principal
 	cert, role string
+	selfHosted bool
 	card       protocol.Message
 	lease      time.Time
 	online     bool
@@ -59,11 +69,49 @@ type link struct {
 	phoneSeq, hostSeq  uint64
 }
 
-// New creates a hub. entitlement nil means the node does not check relay
-// entitlement at all, which is the self-hosted channel; official channels pass
-// a verifier backed by their site's membership service.
+// New creates an official-site hub that verifies endpoint certificates against
+// key and checks TURN entitlement via entitlement.
 func New(key ed25519.PublicKey, entitlement EntitlementVerifier, network iceService) *Hub {
-	return &Hub{key: key, entitlement: entitlement, ice: network, slots: make(chan struct{}, 1024), peers: make(map[string]*peer), links: make(map[string]*link)}
+	return &Hub{
+		key:         key,
+		entitlement: entitlement,
+		ice:         network,
+		slots:       make(chan struct{}, 1024),
+		peers:       make(map[string]*peer),
+		links:       make(map[string]*link),
+	}
+}
+
+// NewSelfHosted creates an account-free self-hosted hub. Access to /v1/signal
+// is gated by accessToken and endpoint proof-of-possession over self-generated
+// Ed25519 keys; desktop authorization is enforced end-to-end via one-time
+// pairing on the desktop.
+func NewSelfHosted(accessToken string, network iceService) *Hub {
+	h := &Hub{
+		selfHosted: true,
+		ice:        network,
+		slots:      make(chan struct{}, 1024),
+		peers:      make(map[string]*peer),
+		links:      make(map[string]*link),
+	}
+	if accessToken != "" {
+		h.RequireAccessToken(accessToken)
+	}
+	return h
+}
+
+// RequireIssuer restricts an official hub to endpoint certificates whose iss
+// claim exactly matches issuer. Call it before serving requests.
+func (h *Hub) RequireIssuer(issuer string) {
+	h.allowedIssuer = strings.TrimSpace(issuer)
+}
+
+// RequireAccessToken restricts WebSocket upgrades to clients that present
+// token as a bearer credential. A self-hosted node uses it so a leaked URL
+// does not let strangers relay traffic. Call it before serving requests.
+func (h *Hub) RequireAccessToken(token string) {
+	h.accessToken = sha256.Sum256([]byte(token))
+	h.requireToken = true
 }
 
 func (p *peer) send(m protocol.Message) {
@@ -76,11 +124,26 @@ func (p *peer) send(m protocol.Message) {
 }
 
 func (host *peer) allows(visitor *peer) bool {
-	return host.online && host.role == "desktop" && (host.id.RemoteUserID() == visitor.id.RemoteUserID() || host.grants[visitor.id.RemoteUserID()])
+	if !host.online || host.role != "desktop" {
+		return false
+	}
+	if host.selfHosted {
+		return visitor.selfHosted && visitor.role == "mobile"
+	}
+	if visitor.selfHosted {
+		return false
+	}
+	return host.id.RemoteUserID() == visitor.id.RemoteUserID() || host.grants[visitor.id.RemoteUserID()]
 }
 
 func (p *peer) live(now time.Time) bool {
-	return p.ctx.Err() == nil && now.Before(p.lease) && now.Before(p.id.Expires)
+	if p.ctx.Err() != nil {
+		return false
+	}
+	if p.selfHosted {
+		return true
+	}
+	return now.Before(p.lease) && now.Before(p.id.Expires)
 }
 
 func (h *Hub) drop(l *link, reason string) {
@@ -149,6 +212,9 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 	}
 	switch m.Type {
 	case "auth.lease":
+		if h.selfHosted {
+			return errors.New("lease_unsupported")
+		}
 		var update struct {
 			Lease       string `json:"lease"`
 			Certificate string `json:"certificate"`
@@ -164,6 +230,9 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			if err != nil || next.DeviceID != p.id.DeviceID || !next.PublicKey.Equal(p.id.PublicKey) || next.RemoteUserID() != p.id.RemoteUserID() {
 				return errors.New("identity_changed")
 			}
+			if h.allowedIssuer != "" && next.Issuer != h.allowedIssuer {
+				return errors.New("issuer_not_allowed")
+			}
 		}
 		until, err := identity.VerifyEndpointLease(update.Lease, h.key, time.Now(), cert, next)
 		if err != nil {
@@ -177,7 +246,22 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			Card   protocol.Message `json:"card"`
 			Guests []string         `json:"guests"`
 		}
-		if p.role != "desktop" || json.Unmarshal(m.Data, &d) != nil || d.Card.Certificate != p.cert || len(d.Guests) > 256 {
+		if p.role != "desktop" || json.Unmarshal(m.Data, &d) != nil {
+			return errors.New("invalid_device")
+		}
+		if h.selfHosted {
+			if d.Card.Certificate != "" || len(d.Guests) != 0 || d.Card.Type != "device.card" || d.Card.From != p.id.DeviceID || d.Card.To != "self" || d.Card.Connection != "" || d.Card.Round != 0 || d.Card.Seq != 0 {
+				return errors.New("invalid_device")
+			}
+			nameBytes, err := d.Card.Verify(p.id.PublicKey)
+			if err != nil || !validSelfName(string(nameBytes)) {
+				return errors.New("invalid_device")
+			}
+			p.card, p.online = d.Card, true
+			p.send(protocol.Message{Type: "device.registered"})
+			return nil
+		}
+		if d.Card.Certificate != p.cert || len(d.Guests) > 256 {
 			return errors.New("invalid_device")
 		}
 		if _, err := endpoint.VerifyDevice(d.Card, h.key, time.Now()); err != nil {
@@ -199,6 +283,9 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 		p.send(protocol.Message{Type: "device.registered"})
 		return nil
 	case "devices.list":
+		if h.selfHosted {
+			return errors.New("directory_unavailable")
+		}
 		found := []protocol.Message{}
 		for _, host := range h.peers {
 			if host.allows(p) && host.live(time.Now()) {
@@ -238,7 +325,9 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			return errors.New("connection_limit")
 		}
 		h.links[m.Connection] = &link{id: m.Connection, phone: p, host: host, phoneSeq: m.Seq, created: time.Now()}
-		m.Certificate = p.cert
+		if !h.selfHosted {
+			m.Certificate = p.cert
+		}
 		host.send(m)
 		return nil
 	}
@@ -256,7 +345,11 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 		return errors.New("invalid_peer_or_sequence")
 	}
 	if m.Type == "connect.close" {
-		h.drop(l, "peer_closed")
+		reason := "peer_closed"
+		if !l.accepted && p == l.host {
+			reason = "access_denied"
+		}
+		h.drop(l, reason)
 		return nil
 	}
 	if !l.accepted {
@@ -311,7 +404,12 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 	phoneExpires := l.phone.id.Expires
 	h.mu.Unlock()
 	var until time.Time
-	if h.entitlement != nil {
+	switch {
+	case h.selfHosted:
+		// Self-hosted nodes do not consult an external membership service; grant
+		// a bounded sliding window renewed via ice.refresh while the link stays live.
+		until = time.Now().Add(selfTurnWindow)
+	case h.entitlement != nil:
 		ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
 		var err error
 		until, err = h.entitlement.Check(ctx, issuer, subject)
@@ -319,9 +417,7 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 		if err != nil {
 			until = time.Time{}
 		}
-	} else {
-		// A self-hosted node has no site membership service to consult, so
-		// the grant lasts as long as both authenticated endpoints do.
+	default:
 		until = phoneExpires
 	}
 	h.mu.Lock()
@@ -329,28 +425,42 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 	if h.links[m.Connection] != l || !l.host.allows(l.phone) || !l.host.live(time.Now()) || !l.phone.live(time.Now()) {
 		return errors.New("connection_expired")
 	}
-	if until.After(l.phone.id.Expires) {
-		until = l.phone.id.Expires
-	}
-	if until.After(l.host.id.Expires) {
-		until = l.host.id.Expires
+	if !h.selfHosted {
+		if until.After(l.phone.id.Expires) {
+			until = l.phone.id.Expires
+		}
+		if until.After(l.host.id.Expires) {
+			until = l.host.id.Expires
+		}
 	}
 	if !until.After(time.Now()) {
 		h.ice.Revoke(l.id)
 		until = time.Time{}
 	}
-	servers, err := h.ice.Config(l.id, l.phone.id.RemoteUserID(), until)
+	visitor := l.phone.id.RemoteUserID()
+	if h.selfHosted {
+		visitor = l.phone.id.DeviceID
+	}
+	servers, err := h.ice.Config(l.id, visitor, until)
 	if err != nil {
 		h.drop(l, "ice_unavailable")
 		return errors.New("ice_unavailable")
 	}
 	if accepting {
 		l.accepted, l.hostSeq = true, m.Seq
-		m.Certificate = p.cert
+		if !h.selfHosted {
+			m.Certificate = p.cert
+		}
 		l.phone.send(m)
 	}
 	cfg := protocol.Message{Type: "ice.config", Connection: l.id, Data: protocol.Encode(servers)}
 	l.phone.send(cfg)
 	l.host.send(cfg)
 	return nil
+}
+
+func validSelfName(name string) bool {
+	return len(name) > 0 && len(name) <= 128 && strings.TrimSpace(name) == name && strings.IndexFunc(name, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+	}) < 0
 }

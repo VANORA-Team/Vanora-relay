@@ -24,6 +24,7 @@ import (
 	"github.com/gofrs/flock"
 	"vanora-relay/adapter/account"
 	"vanora-relay/adapter/desktop"
+	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
@@ -32,9 +33,19 @@ import (
 // Optional build-time defaults injected via -ldflags when embedding
 // vanora-desktop as a sidecar inside Vanora.
 var (
+	// Legacy single-channel build defaults.
 	defaultIdentityURL = ""
 	defaultSignalURL   = ""
 	defaultCAHex       = ""
+
+	// Official dual-site build defaults (CN and GLOBAL use independent
+	// identity authorities, Ed25519 public keys, and relay endpoints).
+	defaultCNIdentityURL     = ""
+	defaultCNSignalURL       = ""
+	defaultCNCAHex           = ""
+	defaultGlobalIdentityURL = ""
+	defaultGlobalSignalURL   = ""
+	defaultGlobalCAHex       = ""
 )
 
 type jsonEmitter struct {
@@ -70,8 +81,67 @@ func main() {
 	}
 }
 
+type officialSlotConfig struct {
+	name      string
+	account   *account.Account
+	ca        ed25519.PublicKey
+	signalURL string
+}
+
+func parseChannelFlag(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case "cn":
+		return "cn", nil
+	case "global":
+		return "global", nil
+	case "self":
+		return "self", nil
+	default:
+		return "", fmt.Errorf("unknown channel %q (want cn, global or self)", raw)
+	}
+}
+
+func openOfficialSlot(dir, vaultChannel, name, identityURL, caFile, caHexFlag, signalURL string) (*officialSlotConfig, error) {
+	identityURL = strings.TrimSpace(identityURL)
+	caFile = strings.TrimSpace(caFile)
+	caHexFlag = strings.TrimSpace(caHexFlag)
+	signalURL = strings.TrimSpace(signalURL)
+	hasCA := caFile != "" || caHexFlag != ""
+	if identityURL == "" && !hasCA && signalURL == "" {
+		return nil, nil
+	}
+	if identityURL == "" || !hasCA {
+		return nil, fmt.Errorf("channel %s requires identity URL and pinned public key (-ca or -ca-hex)", name)
+	}
+	pubRaw := []byte(caHexFlag)
+	if caFile != "" {
+		var err error
+		pubRaw, err = os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ca, err := identity.ParsePublicKey(pubRaw)
+	if err != nil {
+		return nil, err
+	}
+	caHex := hex.EncodeToString(ca)
+	a, err := account.New(identityURL, caHex, openChannelVault(dir, vaultChannel, identityURL, caHex))
+	if err != nil {
+		return nil, err
+	}
+	return &officialSlotConfig{
+		name:      name,
+		account:   a,
+		ca:        ca,
+		signalURL: signalURL,
+	}, nil
+}
+
 func run(args []string) error {
-	const usage = "usage: vanora-desktop login|serve|whoami|status|logout [-identity URL -ca PUBLIC_KEY_FILE|-ca-hex HEX -signal WSS_URL -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
+	const usage = "usage: vanora-desktop login|serve|whoami|status|logout [-channel cn|global|self -identity URL -ca FILE|-ca-hex HEX -signal WSS_URL -cn-identity URL -cn-ca FILE|-cn-ca-hex HEX -cn-signal WSS_URL -global-identity URL -global-ca FILE|-global-ca-hex HEX -global-signal WSS_URL -self-signal WSS_URL -self-token TOKEN -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
@@ -82,13 +152,33 @@ func run(args []string) error {
 		return errors.New(usage)
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	channelFlag := fs.String("channel", envOrDefault("VANORA_RELAY_CHANNEL", ""), "relay channel: cn, global, or self")
+
+	// Legacy single-channel flags (retained for standalone CLI compatibility).
 	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
 	caFile := fs.String("ca", "", "pinned identity public key file")
 	caHexFlag := fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)")
-	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	signalURL := fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL")
+	signalToken := fs.String("signal-token", envOrDefault("VANORA_RELAY_SIGNAL_TOKEN", ""), "bearer token for a self-hosted relay (alias for -self-token)")
+
+	// Per-site official channel flags for simultaneous CN and GLOBAL slots.
+	cnIdentityURL := fs.String("cn-identity", envOrDefault("VANORA_RELAY_CN_IDENTITY_URL", defaultCNIdentityURL), "CN site identity authority URL")
+	cnCAFile := fs.String("cn-ca", "", "CN site pinned identity public key file")
+	cnCAHex := fs.String("cn-ca-hex", envOrDefault("VANORA_RELAY_CN_CA_PUBLIC_KEY", defaultCNCAHex), "CN site pinned identity public key (hex or base64)")
+	cnSignalURL := fs.String("cn-signal", envOrDefault("VANORA_RELAY_CN_SIGNAL_URL", defaultCNSignalURL), "CN site official relay WebSocket URL")
+
+	globalIdentityURL := fs.String("global-identity", envOrDefault("VANORA_RELAY_GLOBAL_IDENTITY_URL", defaultGlobalIdentityURL), "GLOBAL site identity authority URL")
+	globalCAFile := fs.String("global-ca", "", "GLOBAL site pinned identity public key file")
+	globalCAHex := fs.String("global-ca-hex", envOrDefault("VANORA_RELAY_GLOBAL_CA_PUBLIC_KEY", defaultGlobalCAHex), "GLOBAL site pinned identity public key (hex or base64)")
+	globalSignalURL := fs.String("global-signal", envOrDefault("VANORA_RELAY_GLOBAL_SIGNAL_URL", defaultGlobalSignalURL), "GLOBAL site official relay WebSocket URL")
+
+	// Account-free self-hosted relay flags.
+	selfSignalURL := fs.String("self-signal", envOrDefault("VANORA_RELAY_SELF_SIGNAL_URL", ""), "self-hosted relay WebSocket URL")
+	selfToken := fs.String("self-token", envOrDefault("VANORA_RELAY_SELF_TOKEN", ""), "bearer token for a self-hosted relay (RELAY_SELF_TOKEN)")
+
+	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	lanListen := fs.String("lan-listen", "", "listen for paired LAN clients on a private IP address and port")
-	relayEnabled := fs.Bool("relay", true, "enable the configured official relay")
+	relayEnabled := fs.Bool("relay", true, "enable the configured WAN relay channel")
 	config := fs.String("config", "", "local Vanora session and permission config")
 	hostname, _ := os.Hostname()
 	name := fs.String("name", hostname, "published desktop name")
@@ -105,12 +195,10 @@ func run(args []string) error {
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
-	*identityURL = strings.TrimSpace(*identityURL)
-	*signalURL = strings.TrimSpace(*signalURL)
-	hasCA := strings.TrimSpace(*caFile) != "" || strings.TrimSpace(*caHexFlag) != ""
-	cloudConfigured := *identityURL != "" && hasCA
-	if !cloudConfigured && (cmd != "serve" || *identityURL != "" || hasCA || *signalURL != "") {
-		return errors.New("identity URL and pinned public key (-ca or -ca-hex) required")
+
+	channel, err := parseChannelFlag(*channelFlag)
+	if err != nil {
+		return err
 	}
 	if *sidecar {
 		*jsonOutput = true
@@ -143,67 +231,165 @@ func run(args []string) error {
 	}
 	defer lock.Unlock()
 
-	var a *account.Account
-	var ca ed25519.PublicKey
-	if cloudConfigured {
-		pubRaw := []byte(strings.TrimSpace(*caHexFlag))
-		if strings.TrimSpace(*caFile) != "" {
-			pubRaw, err = os.ReadFile(*caFile)
-			if err != nil {
-				return err
-			}
+	resolvedSelfSignal := strings.TrimSpace(*selfSignalURL)
+	resolvedSelfToken := strings.TrimSpace(*selfToken)
+	if resolvedSelfToken == "" {
+		resolvedSelfToken = strings.TrimSpace(*signalToken)
+	}
+	legacyID := strings.TrimSpace(*identityURL)
+	legacyCAFile := strings.TrimSpace(*caFile)
+	legacyCAHex := strings.TrimSpace(*caHexFlag)
+	legacySig := strings.TrimSpace(*signalURL)
+
+	if channel == "self" {
+		if resolvedSelfSignal == "" {
+			resolvedSelfSignal = legacySig
 		}
-		ca, err = identity.ParsePublicKey(pubRaw)
+		legacySig = ""
+	}
+
+	slots := make(map[string]*officialSlotConfig, 2)
+	cnSlot, err := openOfficialSlot(dir, "cn", "cn", *cnIdentityURL, *cnCAFile, *cnCAHex, *cnSignalURL)
+	if err != nil {
+		return err
+	}
+	if cnSlot != nil {
+		slots["cn"] = cnSlot
+	}
+	globalSlot, err := openOfficialSlot(dir, "global", "global", *globalIdentityURL, *globalCAFile, *globalCAHex, *globalSignalURL)
+	if err != nil {
+		return err
+	}
+	if globalSlot != nil {
+		slots["global"] = globalSlot
+	}
+
+	hasLegacy := legacyID != "" || legacyCAFile != "" || legacyCAHex != "" || legacySig != ""
+	if hasLegacy {
+		slotName := "cn"
+		vaultChannel := ""
+		if channel == "global" {
+			slotName = "global"
+			vaultChannel = "global"
+		} else if channel == "cn" {
+			slotName = "cn"
+			vaultChannel = "cn"
+		}
+		if _, exists := slots[slotName]; exists {
+			return fmt.Errorf("channel %s cannot be configured with both legacy flags and -%s-* flags", slotName, slotName)
+		}
+		legacySlot, err := openOfficialSlot(dir, vaultChannel, slotName, legacyID, legacyCAFile, legacyCAHex, legacySig)
 		if err != nil {
 			return err
 		}
-		caHex := hex.EncodeToString(ca)
-		a, err = account.New(*identityURL, caHex, openVault(dir, *identityURL, caHex))
-		if err != nil {
-			return err
+		if legacySlot != nil {
+			slots[slotName] = legacySlot
 		}
 	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	selectOfficialSlot := func(action string) (*officialSlotConfig, error) {
+		if channel == "self" {
+			return nil, fmt.Errorf("self-hosted relay uses pairing and does not support %s", action)
+		}
+		if channel != "" {
+			slot := slots[channel]
+			if slot == nil {
+				return nil, fmt.Errorf("channel %s is not configured (identity URL and pinned public key required)", channel)
+			}
+			return slot, nil
+		}
+		if len(slots) == 0 {
+			return nil, errors.New("identity URL and pinned public key (-ca or -ca-hex) required")
+		}
+		if len(slots) == 1 {
+			for _, slot := range slots {
+				return slot, nil
+			}
+		}
+		return nil, fmt.Errorf("multiple official channels configured; specify -channel cn or -channel global for %s", action)
+	}
+
 	switch cmd {
 	case "whoami", "status":
-		enrolled := a.UserID() != ""
+		if channel == "" && len(slots) > 1 {
+			channelsOut := map[string]any{}
+			for _, name := range []string{"cn", "global"} {
+				if slot := slots[name]; slot != nil {
+					channelsOut[name] = map[string]any{
+						"enrolled":  slot.account.UserID() != "",
+						"user_id":   slot.account.UserID(),
+						"device_id": slot.account.DeviceID(),
+					}
+				}
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{
+					"type":      "status",
+					"channels":  channelsOut,
+					"state_dir": dir,
+				})
+				return nil
+			}
+			for _, name := range []string{"cn", "global"} {
+				if slot := slots[name]; slot != nil {
+					fmt.Printf("[%s]\nenrolled=%t\nuser_id=%s\ndevice_id=%s\n", name, slot.account.UserID() != "", slot.account.UserID(), slot.account.DeviceID())
+				}
+			}
+			return nil
+		}
+		slot, err := selectOfficialSlot(cmd)
+		if err != nil {
+			return err
+		}
+		enrolled := slot.account.UserID() != ""
 		if emitter != nil {
 			emitter.Emit(map[string]any{
 				"type":      "status",
+				"channel":   slot.name,
 				"enrolled":  enrolled,
-				"user_id":   a.UserID(),
-				"device_id": a.DeviceID(),
+				"user_id":   slot.account.UserID(),
+				"device_id": slot.account.DeviceID(),
 				"state_dir": dir,
 			})
 			return nil
 		}
-		fmt.Printf("enrolled=%t\nuser_id=%s\ndevice_id=%s\n", enrolled, a.UserID(), a.DeviceID())
+		fmt.Printf("enrolled=%t\nuser_id=%s\ndevice_id=%s\n", enrolled, slot.account.UserID(), slot.account.DeviceID())
 		return nil
 	case "logout":
-		if err := a.Reset(); err != nil {
+		slot, err := selectOfficialSlot("logout")
+		if err != nil {
+			return err
+		}
+		if err := slot.account.Reset(); err != nil {
 			return err
 		}
 		if emitter != nil {
-			emitter.Emit(map[string]any{"type": "logout.ok"})
+			emitter.Emit(map[string]any{"type": "logout.ok", "channel": slot.name})
 			return nil
 		}
 		fmt.Println("logged out")
 		return nil
 	case "login":
-		return login(ctx, a, loginOptions{
+		slot, err := selectOfficialSlot("login")
+		if err != nil {
+			return err
+		}
+		return login(ctx, slot.account, loginOptions{
+			channel:    slot.name,
 			token:      *tokenFlag,
 			tokenStdin: *tokenStdin,
 			in:         os.Stdin,
 			emitter:    emitter,
 		})
 	case "serve":
-		if *config == "" || (*lanListen == "" && !*sidecar && (*signalURL == "" || !*relayEnabled)) {
-			return errors.New("serve requires -config and an enabled -signal, -lan-listen, or -sidecar")
+		if *config == "" {
+			return errors.New("serve requires -config and an enabled relay channel, -lan-listen, or -sidecar")
 		}
 		if *tokenStdin && *sidecar {
-			return errors.New("-token-stdin cannot be combined with -sidecar; send {\"type\":\"auth.token\",\"token\":\"...\"} on stdin or set VANORA_CLIENT_TOKEN")
+			return errors.New("-token-stdin cannot be combined with -sidecar; send {\"type\":\"auth.token\",\"channel\":\"cn|global\",\"token\":\"...\"} on stdin or set VANORA_CLIENT_TOKEN")
 		}
 		tok := strings.TrimSpace(*tokenFlag)
 		if *tokenStdin {
@@ -212,24 +398,74 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if !*sidecar && *lanListen == "" && (a == nil || (a.UserID() == "" && tok == "")) {
-			return errors.New("endpoint not enrolled; run vanora-desktop login or provide -token / VANORA_CLIENT_TOKEN")
-		}
-		if !*sidecar && *lanListen == "" && tok != "" {
-			if a.UserID() == "" {
-				enrollCtx, cancelEnroll := context.WithTimeout(ctx, 30*time.Second)
-				err = a.Enroll(enrollCtx, tok)
-				cancelEnroll()
-			} else {
-				err = a.UpdateToken(tok)
+
+		activeChannel := channel
+		if activeChannel == "" && *relayEnabled {
+			if len(slots) == 1 {
+				for name := range slots {
+					activeChannel = name
+				}
+			} else if len(slots) == 0 && resolvedSelfSignal != "" {
+				activeChannel = "self"
 			}
-			if err != nil {
+		}
+		if !*relayEnabled {
+			activeChannel = ""
+		}
+
+		if !*sidecar && *lanListen == "" && activeChannel == "" {
+			return errors.New("serve requires -config and an enabled relay channel, -lan-listen, or -sidecar")
+		}
+		if activeChannel == "self" {
+			if err := selfrelay.ValidateSignalURL(resolvedSelfSignal); err != nil {
 				return err
 			}
-			tok = ""
+			if err := selfrelay.ValidateRelayToken(resolvedSelfToken); err != nil {
+				return err
+			}
 		}
-		return serve(ctx, a, ca, *signalURL, *name, *config, dir, *sidecar, emitter, accessOptions{
-			lanListen: *lanListen, relayEnabled: *relayEnabled, token: tok,
+		if activeChannel == "cn" || activeChannel == "global" {
+			slot := slots[activeChannel]
+			if slot == nil || slot.signalURL == "" {
+				return fmt.Errorf("channel %s requires configured identity, public key, and signal URL", activeChannel)
+			}
+			if !*sidecar && *lanListen == "" && slot.account.UserID() == "" && tok == "" {
+				return errors.New("endpoint not enrolled; run vanora-desktop login or provide -token / VANORA_CLIENT_TOKEN")
+			}
+			if !*sidecar && *lanListen == "" && tok != "" {
+				if slot.account.UserID() == "" {
+					enrollCtx, cancelEnroll := context.WithTimeout(ctx, 30*time.Second)
+					err = slot.account.Enroll(enrollCtx, tok)
+					cancelEnroll()
+				} else {
+					err = slot.account.UpdateToken(tok)
+				}
+				if err != nil {
+					return err
+				}
+				tok = ""
+			}
+		}
+
+		initialTokens := map[string]string{}
+		if tok != "" {
+			target := activeChannel
+			if target == "" && len(slots) == 1 {
+				for name := range slots {
+					target = name
+				}
+			}
+			if target == "cn" || target == "global" {
+				initialTokens[target] = tok
+			}
+		}
+		return serveMulti(ctx, slots, *name, *config, dir, *sidecar, emitter, accessOptions{
+			lanListen:     *lanListen,
+			relayEnabled:  *relayEnabled && activeChannel != "",
+			activeChannel: activeChannel,
+			selfURL:       resolvedSelfSignal,
+			selfToken:     resolvedSelfToken,
+			tokens:        initialTokens,
 		})
 	default:
 		return errors.New("unknown subcommand")
@@ -302,14 +538,38 @@ func guests(cfg *desktop.Config, owner string) ([]string, error) {
 	return out, nil
 }
 
+// serve keeps single-channel call signature for focused tests.
 func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, name, path, dir string, sidecar bool, emitter *jsonEmitter, options accessOptions) error {
+	slots := map[string]*officialSlotConfig{}
+	if a != nil {
+		ch := options.activeChannel
+		if ch != "cn" && ch != "global" {
+			ch = "cn"
+		}
+		slots[ch] = &officialSlotConfig{name: ch, account: a, ca: ca, signalURL: url}
+		if options.relayEnabled && options.activeChannel == "" {
+			options.activeChannel = ch
+		}
+		if options.token != "" {
+			if options.tokens == nil {
+				options.tokens = map[string]string{}
+			}
+			options.tokens[ch] = options.token
+		}
+	}
+	return serveMulti(ctx, slots, name, path, dir, sidecar, emitter, options)
+}
+
+func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig, name, path, dir string, sidecar bool, emitter *jsonEmitter, options accessOptions) error {
 	cfg, err := desktop.LoadConfig(path)
 	if err != nil {
 		return err
 	}
-	if !sidecar && options.lanListen == "" && a != nil && a.UserID() != "" {
-		if _, err := guests(cfg, a.UserID()); err != nil {
-			return err
+	if !sidecar && options.lanListen == "" && (options.activeChannel == "cn" || options.activeChannel == "global") {
+		if slot := slotConfigs[options.activeChannel]; slot != nil && slot.account != nil && slot.account.UserID() != "" {
+			if _, err := guests(cfg, slot.account.UserID()); err != nil {
+				return err
+			}
 		}
 	}
 	service, err := desktop.New(cfg, filepath.Join(dir, "sessions"))
@@ -329,11 +589,41 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 	fail := make(chan error, 1)
 	var currentConfig atomic.Pointer[desktop.Config]
 	currentConfig.Store(cfg)
+
+	slots := make(map[string]*officialSlot, len(slotConfigs))
+	for k, sc := range slotConfigs {
+		if sc == nil || sc.account == nil {
+			continue
+		}
+		slot := &officialSlot{
+			name:    k,
+			account: sc.account,
+			ca:      sc.ca,
+			url:     sc.signalURL,
+		}
+		if options.tokens != nil {
+			slot.token = strings.TrimSpace(options.tokens[k])
+		}
+		slots[k] = slot
+	}
+
 	access := &accessManager{
-		ctx: ctx, account: a, ca: ca, url: url, name: name, service: service,
-		dir: dir, emitter: emitter, config: currentConfig.Load, updates: updates,
-		retry: make(chan struct{}, 1), relayEnabled: options.relayEnabled && url != "" && a != nil,
-		token: options.token, requireHostToken: sidecar,
+		ctx:              ctx,
+		slots:            slots,
+		name:             name,
+		service:          service,
+		dir:              dir,
+		emitter:          emitter,
+		config:           currentConfig.Load,
+		updates:          updates,
+		retry:            make(chan struct{}, 1),
+		requireHostToken: sidecar,
+		selfStore:        options.selfStore,
+		selfURL:          strings.TrimSpace(options.selfURL),
+		selfToken:        strings.TrimSpace(options.selfToken),
+	}
+	if options.relayEnabled && options.activeChannel != "" {
+		access.activeChannel = options.activeChannel
 	}
 	if options.lanListen != "" {
 		if err := access.listen(options.lanListen); err != nil {
@@ -388,8 +678,11 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 
 	if sidecar {
 		ready := map[string]any{
-			"type": "ready", "user_id": access.userID(), "device_id": access.deviceID(),
-			"name": strings.TrimSpace(name),
+			"type":           "ready",
+			"active_channel": access.activeChannel,
+			"user_id":        access.userID(),
+			"device_id":      access.deviceID(),
+			"name":           strings.TrimSpace(name),
 		}
 		// Watch parent stdin: EOF shuts down the sidecar cleanly so parent exit
 		// never leaves an orphaned process. JSONL control commands are also handled.
@@ -416,8 +709,11 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 					}
 				case "status":
 					emitter.Emit(map[string]any{
-						"type": "status", "online": access.online.Load(),
-						"user_id": access.userID(), "device_id": access.deviceID(),
+						"type":           "status",
+						"active_channel": access.currentChannel(),
+						"online":         access.isOnline(),
+						"user_id":        access.userID(),
+						"device_id":      access.deviceID(),
 					})
 				default:
 					access.command(cmd)
@@ -428,7 +724,7 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 		emitter.Emit(ready)
 	}
 	access.mu.Lock()
-	access.startRelay()
+	_ = access.startActiveWANLocked()
 	access.mu.Unlock()
 	<-ctx.Done()
 	access.close()
@@ -442,6 +738,7 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 		return nil
 	}
 }
+
 func publish(ctx context.Context, s *transport.Client, name string, users []string) error {
 	c, stop := context.WithTimeout(ctx, 10*time.Second)
 	defer stop()

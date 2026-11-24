@@ -1,8 +1,10 @@
 # Vanora Identity Verification & External Authority Contract
 
-`internal/identity` implements **verification and client proof-of-possession (PoP) helpers only**. Device certificate signing, account authentication, and key management are intentionally NOT shipped in this open-source repository—they run inside the deployment's external identity backend, which is the sole holder of the Ed25519 signing private key.
+`internal/identity` implements **verification and client proof-of-possession (PoP) helpers only**. Device certificate signing, account authentication, and key management are intentionally NOT shipped in this open-source repository—they run inside each official site's external identity backend (`cn` and `global` deploy independent signing keys and issuers), which is the sole holder of its Ed25519 signing private key.
 
-The relay (`cmd/relay`), desktop adapter (`cmd/vanora-desktop`), and mobile SDK (`mobile`) pin only the authority's 32-byte Ed25519 public key and verify certificates (`vanc1`) and liveness leases (`vanl1`) offline.
+The official-channel relay (`cmd/relay` with `RELAY_CHANNEL=cn|global`), desktop adapter (`cmd/vanora-desktop`), and mobile SDK (`mobile`) pin only the target site's 32-byte Ed25519 public key and verify certificates (`vanc1`) and liveness leases (`vanl1`) offline.
+
+> **Self-hosted nodes (`RELAY_CHANNEL=self`) do not use this external authority protocol.** They run account-free with `RELAY_SELF_TOKEN` and locally generated Ed25519 keys, using only `SelfDeviceID` (`sdev_<26-char-base32>`) and `SelfPairProof` (HMAC-SHA256 over `"vanora-self-pair-v1\n<connection_id>\n<mobile_pub>\n<desktop_pub>"`) from this package.
 
 ```text
 native client (with host auth token)      external identity authority (private)

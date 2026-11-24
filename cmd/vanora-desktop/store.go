@@ -23,6 +23,15 @@ func openVault(dir, authority, ca string) *vault {
 	return namedVault(dir, "account.enc", authority+"\x00"+ca)
 }
 
+func openChannelVault(dir, channel, authority, ca string) *vault {
+	switch channel {
+	case "cn", "global":
+		return namedVault(dir, "account-"+channel+".enc", channel+"\x00"+authority+"\x00"+ca)
+	default:
+		return openVault(dir, authority, ca)
+	}
+}
+
 func namedVault(dir, name, scope string) *vault {
 	file := filepath.Join(dir, name)
 	hash := sha256.Sum256([]byte(file + "\x00" + scope))

@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 )
 
 // Config is the local allowlist. It is the only source of sessions, working
@@ -96,7 +97,8 @@ type SessionConfig struct {
 	// submit model prompts; a Read-only user can only read shared context.
 	Owner string `json:"owner"`
 
-	LANAccess bool `json:"lan_access,omitempty"`
+	LANAccess  bool `json:"lan_access,omitempty"`
+	SelfAccess bool `json:"self_access,omitempty"`
 
 	// Tools selects the local tool set. Empty means --no-tools: the user may
 	// still hold a text-only conversation, with extensions and MCP disabled.
@@ -136,6 +138,7 @@ type WorkspaceConfig struct {
 	SessionDir     string   `json:"session_dir,omitempty"`
 	Owner          string   `json:"owner"`
 	LANAccess      bool     `json:"lan_access,omitempty"`
+	SelfAccess     bool     `json:"self_access,omitempty"`
 	Tools          []string `json:"tools,omitempty"`
 	Arguments      []string `json:"arguments,omitempty"`
 	ShowThinking   bool     `json:"show_thinking,omitempty"`
@@ -189,6 +192,7 @@ type normalizedWorkspace struct {
 	owner          string
 	officialOwner  string
 	lanAccess      bool
+	selfAccess     bool
 	tools          []string
 	arguments      []string
 	showThinking   bool
@@ -206,6 +210,7 @@ type normalizedSession struct {
 	owner          string
 	officialOwner  string
 	lanAccess      bool
+	selfAccess     bool
 	tools          []string
 	arguments      []string
 	showThinking   bool
@@ -223,6 +228,18 @@ func (s *normalizedSession) grant(userID string) (Grant, bool) {
 			return Grant{}, false
 		}
 		control := access == lan.Control
+		return Grant{
+			UserID: userID, Read: true, Tools: control,
+			ShowThinking: control && s.showThinking,
+			ShowTools:    control && s.showTools,
+			Approve:      control && s.remoteApproval(),
+		}, true
+	}
+	if access := selfrelay.Access(userID); access != "" {
+		if !s.selfAccess {
+			return Grant{}, false
+		}
+		control := access == selfrelay.Control
 		return Grant{
 			UserID: userID, Read: true, Tools: control,
 			ShowThinking: control && s.showThinking,
@@ -258,6 +275,9 @@ func owns(owner, officialOwner, userID string) bool {
 func (w *normalizedWorkspace) canCreate(userID string) bool {
 	if access := lan.Access(userID); access != "" {
 		return w.lanAccess && access == lan.Control
+	}
+	if access := selfrelay.Access(userID); access != "" {
+		return w.selfAccess && access == selfrelay.Control
 	}
 	return owns(w.owner, w.officialOwner, userID)
 }
@@ -554,6 +574,7 @@ func normalizeSession(in *SessionConfig) (*normalizedSession, error) {
 		sessionFile:    sessionFile,
 		owner:          owner,
 		lanAccess:      in.LANAccess,
+		selfAccess:     in.SelfAccess,
 		tools:          tools,
 		arguments:      args,
 		showThinking:   in.ShowThinking,
@@ -613,6 +634,7 @@ func normalizeWorkspace(in *WorkspaceConfig) (*normalizedWorkspace, error) {
 		sessionDir:     sessionDir,
 		owner:          owner,
 		lanAccess:      in.LANAccess,
+		selfAccess:     in.SelfAccess,
 		tools:          tools,
 		arguments:      args,
 		showThinking:   in.ShowThinking,

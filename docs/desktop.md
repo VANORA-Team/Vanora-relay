@@ -2,77 +2,84 @@
 
 [← 文档目录](README.md) · [返回主页](../README.md)
 
-`vanora-desktop` 运行在本机电脑上，负责托管本机 Vanora RPC 进程、执行本地会话与工具访问控制（ACL），并通过加密 WebRTC DataChannel 与移动端通信。
+`vanora-desktop` 运行在本机电脑上，负责托管本机 Vanora RPC 进程、执行本地会话与工具访问控制（ACL），并通过加密 WebRTC DataChannel（官方 / 自建中转）或 mTLS WebSocket（局域网）与移动端通信。
 
-## 1. 构建与设备注册（复用宿主客户端令牌）
+## 1. 构建与独立 CLI 使用
 
 ```sh
 go build -o vanora-desktop ./cmd/vanora-desktop
 
-# 推荐通过 stdin 传入宿主 AI 客户端已有的认证令牌（避免令牌出现在进程命令行中）
-printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
-  -identity https://identity.example.com \
-  -ca identity-signing-key.pub \
+# 官方渠道按站注册设备（复用宿主客户端对应站点的认证令牌，推荐通过 stdin 传入）
+printf '%s\n' "$CN_CLIENT_TOKEN" | ./vanora-desktop login \
+  -channel cn \
+  -cn-identity https://cn-identity.example.com \
+  -cn-ca cn-identity-signing-key.pub \
+  -token-stdin
+
+printf '%s\n' "$GLOBAL_CLIENT_TOKEN" | ./vanora-desktop login \
+  -channel global \
+  -global-identity https://global-identity.example.com \
+  -global-ca global-identity-signing-key.pub \
   -token-stdin
 ```
 
 - **Windows**：可将产物名设为 `vanora-desktop.exe`。
-- **令牌传入方式**：支持 `-token-stdin`（推荐）、环境变量 `VANORA_CLIENT_TOKEN` 或 `-token`。`vanora-desktop` 仅将宿主令牌用于向外部身份后端交换短期设备证书，**不会**持久化或打印宿主令牌。
-- **账号管理子命令**：支持 `whoami` / `status`（查看当前 `enrolled`、`user_id`、`device_id`）与 `logout`（安全重置本地设备密钥与绑定）。
-- **凭据与状态目录**：可通过 `-state-dir` 指定配置档目录，默认位于当前用户配置目录下的 `Vanora/relay`。端点私钥保存在系统凭据库中，运行 `serve` 时须使用同一桌面用户身份。
+- **令牌传入方式**：支持 `-token-stdin`（推荐）、环境变量 `VANORA_CLIENT_TOKEN` 或 `-token`。`vanora-desktop` 仅将宿主令牌用于向对应站点的外部身份后端交换短期设备证书，**不会**持久化或打印宿主令牌。
+- **账号管理子命令**：支持 `whoami` / `status` 与 `logout`（双站同时配置时通过 `-channel cn|global` 指定目标站；`self` 自建渠道免账号，不支持 `login` / `logout`）。
+- **单渠道兼容参数**：独立运行时仍兼容旧参数 `-identity` / `-ca` / `-ca-hex` / `-signal`（未指定 `-channel` 且未传 `-cn-*`/`-global-*` 时兼容沿用旧 `account.enc` 槽位）。
+- **分槽安全存储**：同一 `-state-dir`（默认 `<UserConfigDir>/Vanora/relay`）内按渠道物理隔离存储，互不覆盖：
+  - `account-cn.enc`：CN 站端点密钥、证书与刷新句柄
+  - `account-global.enc`：GLOBAL 站端点密钥、证书与刷新句柄
+  - `self.enc`：自建中转本机设备密钥与已配对手机白名单
+  - `lan.enc`：局域网服务端密钥与已配对局域网设备白名单
 
-## 2. Sidecar 内嵌模式
+## 2. Sidecar 内嵌模式（双站分槽 + 热切换）
 
 将 `vanora-desktop` 作为子进程嵌入宿主程序（如 Vanora 桌面端或 CLI）时：
 
-- **编译期注入默认服务配置**：可通过 `-ldflags` 注入默认值（运行时仍可用 `-identity` / `-signal` / `-ca` / `-ca-hex` 或环境变量覆盖）：
+- **编译期注入双站默认服务配置**：可通过 `-ldflags` 同时注入 CN 与 GLOBAL 两套官方配置（均为公钥与入口地址，无私钥；运行时也可用对应 `-cn-*` / `-global-*` 参数或 `VANORA_RELAY_CN_*` / `VANORA_RELAY_GLOBAL_*` 环境变量覆盖）：
 
   ```sh
-  go build -ldflags "-X main.defaultIdentityURL=... -X main.defaultSignalURL=... -X main.defaultCAHex=..." \
+  go build -ldflags "\
+    -X main.defaultCNIdentityURL=... -X main.defaultCNSignalURL=... -X main.defaultCNCAHex=... \
+    -X main.defaultGlobalIdentityURL=... -X main.defaultGlobalSignalURL=... -X main.defaultGlobalCAHex=..." \
     -o vanora-desktop ./cmd/vanora-desktop
   ```
 
-- **自动注册与热更新令牌**：启动 `serve -sidecar` 时可通过环境变量 `VANORA_CLIENT_TOKEN` 传入当前宿主令牌（未注册设备会自动完成注册，已注册设备会更新内存令牌）；宿主刷新令牌后通过 `stdin` 发送 `{"type":"auth.token","token":"..."}` 即可无感续期（收到 `{"type":"auth.required",...}` 时亦可推送新令牌恢复）。
-- **结构化状态事件**：以 `serve -sidecar` 启动后会向 `stdout` 输出 JSON-lines 状态事件（`ready`、`online`、`offline`、`auth.ok`、`auth.required`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等）。
-- **生命周期控制**：支持通过 `stdin` 发送 `{"type":"auth.token"|"reload"|"status"|"shutdown"}`，并在父进程退出（`stdin` EOF）时自动干净退出。
+- **单活跃广域网热切换 + 并发局域网**：
+  - 同一个 Sidecar 进程内，广域网中转同一时刻在 `cn`、`global`、`self` 中至多启用 1 条（也可关闭），同时可与 `lan` 局域网服务并发运行。
+  - 通过 `stdin` 发送 `access.relay.set` 切换渠道时**无需重启 Sidecar**，不中断正在运行的本机 Vanora 任务与局域网连接，也不会丢失另一站已经注册好的设备密钥与 `device_id`。
+- **模型与中转交叉使用**：
+  - 宿主在供应商侧可同时登录 CN 站与 GLOBAL 站，并按需在电脑本机调用任一站的模型；
+  - 手机互联通道独立按站门控：启用 `cn` 必须已注入 CN 站令牌，启用 `global` 必须已注入 GLOBAL 站令牌（两站令牌与权益绝不互通），启用 `self` 无需任何官方登录态。
+- **结构化状态事件与生命周期**：`serve -sidecar` 向 `stdout` 输出 JSONL 事件（`ready`、`online`、`offline`、`auth.ok`、`auth.error`、`auth.required`、`auth.logout.ok`、`access.status`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等，其中认证与在线事件携带 `"channel": "cn"|"global"|"self"`），并在父进程关闭 `stdin`（EOF）时自动干净退出。
 
-### 中转渠道选择（cn / global / 自建）
+### 中转渠道选择（`cn` / `global` / `self`）
 
-`vanora-desktop` 不内置渠道枚举。一个渠道由一组服务参数确定，宿主按用户选择的渠道传入：
+| 渠道 | 登录要求 | 鉴权与信任根 | TURN 权益 | 桌面资源暴露规则 |
+| --- | --- | --- | --- | --- |
+| `cn` | 必须登录 CN 站 | CN 身份后端 + CN 公钥 | 仅查 CN 站权益 | 归属当前 CN 账号（`"owner": "local"` 或指定 `user_id`）及 `users` 访客 |
+| `global` | 必须登录 GLOBAL 站 | GLOBAL 身份后端 + GLOBAL 公钥 | 仅查 GLOBAL 站权益 | 归属当前 GLOBAL 账号（`"owner": "local"` 或指定 `user_id`）及 `users` 访客 |
+| `self` | **免登录任何官方账号** | `RELAY_SELF_TOKEN` + 本机 Ed25519 公钥 + 一次性配对 | 不查外部权益 | **仅配对可用**：仅暴露显式开启 `"self_access": true` 的工作区与会话 |
 
-| 渠道 | `-identity` / `-ca` | `-signal` | 中继权益 |
-| --- | --- | --- | --- |
-| `cn` | CN 站身份后端及对应公钥 | CN 站官方中转 `wss://<relay>/v1/signal` | 按账号登录站校验 |
-| `global` | GLOBAL 站身份后端及对应公钥 | GLOBAL 站官方中转 | 按账号登录站校验 |
-| 自建 | 用户接入的身份后端及对应公钥 | 用户自建 `relay` 的 `wss://<host>/v1/signal` | 不校验（`RELAY_CHANNEL=self`） |
+### Sidecar `stdin` 控制指令
 
-- **同一渠道成套使用**：`login` 的 `-identity` / `-ca` 与 `serve` 的 `-signal` 必须属于同一个渠道；`-ldflags` 注入的 `defaultIdentityURL` / `defaultSignalURL` / `defaultCAHex` 也只对应一个渠道。切换渠道时由宿主重启 Sidecar 并传入新的一组参数。
-- **凭据按渠道隔离**：设备状态绑定首次登录时的身份后端公钥。若两个渠道的身份根不同，复用同一状态目录会返回 `account: stored state belongs to another authority`，且 `logout` 只在原身份根下重置、无法就地改绑。为每个渠道使用独立的 `-state-dir`。
-- **令牌来源一致**：`VANORA_CLIENT_TOKEN` / `auth.token` 必须是该渠道对应站点的登录令牌，身份后端才会签发设备证书。
-- **跨站账号**：CN 站账号可以使用 GLOBAL 官方中转，反之亦然。节点按账号登录站校验权益（运营方需为两个站点都配置权益服务），客户端不需要改变登录流程；只有登录站无有效权益时才降级为仅直连。
-- **`-relay=false` 不是切换渠道**：它只关闭当前渠道的官方中继路径，局域网配对继续可用；渠道本身由上述参数决定。
-- **自建渠道**：用户只需把 `-signal` 换成 `wss://<host>/v1/signal`，登录与续期仍走原 `-identity` 身份后端；节点设置 `RELAY_CHANNEL=self`，且 `RELAY_IDENTITY_PUBLIC_KEY` 必须与客户端 `-ca` / `-ca-hex` 指向同一把公钥。若改用自建身份后端，还必须同时提供其 `-identity`、公钥以及该后端接受的宿主令牌；只填中转 URL 无法完成鉴权。
+| `type` | 请求字段 | 行为与结果 |
+| --- | --- | --- |
+| `access.status` | `request_id?` | 返回 `active_channel`、`channels`（`cn`、`global`、`self` 各自配置/在线/配对明细）与 `lan` 状态 |
+| `auth.token` | `channel: "cn" \| "global"`, `token` | 更新指定站点的宿主令牌；若该站为当前活跃渠道则立即注册或续期；绝不跨站复用 |
+| `auth.logout` | `channel: "cn" \| "global"`, `request_id?` | 仅重置并断开对应站点，不影响另一站凭据、自建通道或局域网；返回 `auth.logout.ok` |
+| `access.relay.set` | `enabled`, `channel?: "cn" \| "global" \| "self"`, `signal_url?`, `signal_token?` | 启停或热切换广域网中转：`cn`/`global` 校验对应站令牌，`self` 校验 `signal_url` 与 `signal_token`（免登录） |
+| `access.self.invite.create` | `access?: "read" \| "control"`, `include_token?: bool` | 生成自建中转 5 分钟一次性配对链接与邀请（默认 `include_token: true` 将节点令牌写入 `#fragment` 方便扫码） |
+| `access.self.invite.revoke` | `id` | 撤销待用的自建配对链接 |
+| `access.self.client.revoke` / `access.self.clients.revoke` | `id?` | 撤销指定或全部已配对的自建手机，立即断开连接、切断 TURN 并取消其运行中任务 |
+| `access.lan.set` | `enabled`, `address?` | 启停局域网监听（启用时传私有 IP 与端口，如 `192.168.1.42:3773`） |
+| `access.invite.create` / `revoke` | `access?`, `id?` | 创建或撤销局域网一次性配对链接（参考 T3 Code [配对授权](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/PairingGrantStore.ts)与[客户端会话](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/SessionStore.ts)） |
+| `access.client.revoke` / `access.clients.revoke` | `id?` | 撤销指定或全部已配对局域网设备并取消运行中任务 |
+| `reload` / `status` / `shutdown` | — | 热重载配置、查询简要状态、优雅退出 |
 
-### 共享与访问
-
-一次性邀请与客户端撤权流程参考 T3 Code 的 [配对授权](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/PairingGrantStore.ts)和[客户端会话](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/SessionStore.ts)。
-
-宿主可以在用户未登录时启动 Sidecar，并通过 `-lan-listen 192.168.1.42:3773` 或 `access.lan.set` 启用局域网。地址必须指定本机私有 IP 与端口。`127.0.0.1` 也可用于本机调试。局域网入口默认关闭，手机使用桌面生成的链接配对。桌面验证手机设备私钥，并将配对授权保存在与账号凭据独立的系统凭据库中。
-
-同一个 Sidecar 可同时服务已配对的局域网设备和登录 Vanora 的官方中继客户端。Sidecar 要求宿主提供当前登录令牌才会连接官方中继。使用 `-relay=false` 可把官方中继初始设为关闭。宿主退出账号或切换账号时发送 `auth.logout`，等待 `auth.logout.ok` 后再发送新账号的 `auth.token`。退出只关闭官方路径，局域网授权继续有效。
-
-| `stdin` 命令的 `type` | 字段与结果 |
-| --- | --- |
-| `access.status` | 返回 `lan.enabled`、监听地址、已授权客户端和待用邀请，以及官方中继的配置、开关、认证和在线状态 |
-| `access.lan.set` | 用 `enabled` 启用或关闭局域网。启用时传 `address`，如 `192.168.1.42:3773` |
-| `access.relay.set` | 用 `enabled` 启用或关闭官方中继。开启需要已签入 Vanora |
-| `access.invite.create` | 可传 `access: "read"`（默认）或 `"control"`。`access.invite.created` 返回一次性 `link` 和 `invitation`，五分钟内有效。宿主可以把 `link` 编为二维码 |
-| `access.invite.revoke` | 用邀请 `id` 取消待用链接 |
-| `access.client.revoke` / `access.clients.revoke` | 按客户端 `id` 撤权，或撤销全部局域网客户端和待用邀请。会关闭对应连接并取消该设备的运行中任务 |
-
-命令可带 `request_id`，响应回传该值。`access.status` 不显示邀请密钥。宿主可在收到 `peer.connected` 或 `peer.disconnected` 后刷新列表。更改已有设备的权限时，先撤销该设备，再生成对应权限的配对链接。
-
-为允许局域网访问，在指定会话或工作区配置 `lan_access: true`。仅开启监听不会分享任何资源。`read` 客户端可以读已分享会话。`control` 也可以在允许的工作区创建会话、提交提示词，并按会话的工具与审批设置工作。使用 `"owner": "local"` 时，桌面登录后的官方账号可接续本地会话。也可在 `owner` 填入指定账号的官方 `user_id`，将所有者权限绑定到该账号。
+> [!NOTE]
+> 所有命令可携带 `request_id`，响应原样回传。`access.status` 不会回显邀请令牌或节点令牌。需要变更已配对设备的 `read`/`control` 权限时，先撤销该设备，再重新生成目标权限的配对链接。
 
 ## 3. 会话与工作区配置（`desktop.json`）
 
@@ -87,7 +94,9 @@ printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
       "id": "project",
       "title": "项目工作区",
       "working_dir": "/abs/path/to/project",
-      "owner": "本机注册输出的 user_id",
+      "owner": "local",
+      "lan_access": true,
+      "self_access": true,
       "tools": ["read", "edit", "write", "bash", "ask"],
       "show_thinking": true,
       "show_tools": true,
@@ -100,7 +109,9 @@ printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
       "title": "已有对话",
       "working_dir": "/abs/path/to/project",
       "session_file": "/abs/path/to/sessions/project.jsonl",
-      "owner": "本机注册输出的 user_id",
+      "owner": "local",
+      "lan_access": true,
+      "self_access": false,
       "tools": ["read", "bash"],
       "show_thinking": true,
       "show_tools": true,
@@ -118,22 +129,33 @@ printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
 - **`executable` / `launcher_args`**：直接运行本机 Vanora 可执行文件时，仅填 `executable` 并省略 `launcher_args`；通过 Node 启动 `dist/cli.js` 时按上方示例配置。
 - **`workspaces`**：远程新建会话的白名单工作目录。手机端只能选择已授权的 `workspace_id`，无法传入任意本机路径；默认按 Vanora 原生目录 `~/.vanora/agent/sessions/--<path>--/` 写入 v3 JSONL 会话文件（与终端 `vanora --resume` 直接互通），也可通过 `session_dir` 覆盖。
 - **`working_dir` / `session_file`**：均须为绝对路径，且 `working_dir` 必须与会话 JSONL 首行记录的 `cwd` 一致。
-- **`owner`**：填写 `login` 输出的 `user_id`；同账号手机自动享有主人权限。
-- **`users`**：显式授权的访客列表。`read: true` 允许读取文本消息；`tools: true` 允许提交提示词（需同时开启 `read`）；访客默认**不**可见思考过程、工具调用详情与审批弹窗，除非显式设置 `show_thinking` / `show_tools` / `approve`。
+- **`owner`**：设为 `"local"` 时自动归属当前活跃官方渠道（CN 或 GLOBAL）已登录账号；也可填入指定官方账号的 `user_id` 固定绑定。
+- **`lan_access` / `self_access`**：彼此完全独立的布尔开关（均默认 `false`）。`lan_access: true` 仅对已配对的局域网设备开放；`self_access: true` 仅对已配对的自建中转设备开放，避免仅限局域网的资源在开启公网自建中转后被意外暴露。两者均支持按配对邀请区分 `read` 与 `control` 权限。
+- **`users`**：官方渠道的显式访客授权列表。`read: true` 允许读取文本消息；`tools: true` 允许提交提示词（需同时开启 `read`）；访客默认**不**可见思考过程、工具调用详情与审批弹窗，除非显式设置 `show_thinking` / `show_tools` / `approve`。
 - **`tools`**：决定本机 Vanora 实际启用的本地工具白名单；空数组 `[]` 表示运行纯文本对话。
-- **`show_thinking` / `show_tools`**：是否向主人展示模型思考过程及工具调用/执行输出（默认关闭，开启后仅对具备对应权限的查看者下发，未授权访客收到无信息泄露的 `sync` 占位序号）。
+- **`show_thinking` / `show_tools`**：是否向主人及 `control` 配对设备展示模型思考过程及工具调用/执行输出（默认关闭，开启后仅对具备对应权限的查看者下发，未授权访客收到无信息泄露的 `sync` 占位序号）。
 - **`approval_policy`**：`"none"`（默认，本地自动取消所有交互弹窗）或 `"remote"`（自动通过 `--no-extensions -e <guard>` 加载内置审批守卫扩展，仅拦截写入/破坏性/开放世界工具并通过加密通道推送给手机确认，同时支持 Vanora 内置 `ask` 提问弹窗；超时或租约失联自动拒绝）。可通过顶层 `approval_extension` 指定自定义 `.mjs`/`.js` 守卫脚本。
-- **模型凭据**：沿用当前桌面用户本机的 Vanora 配置。
+- **模型凭据**：沿用当前桌面用户本机的 Vanora 配置（与当前中转渠道无关）。
 
-## 4. 启动服务
+## 4. 独立启动服务示例
 
 ```sh
+# 1. 官方 CN 渠道
 ./vanora-desktop serve \
-  -identity https://identity.example.com \
-  -ca identity-signing-key.pub \
-  -signal wss://relay.example.com/v1/signal \
+  -channel cn \
+  -cn-identity https://cn-identity.example.com \
+  -cn-ca cn-identity-signing-key.pub \
+  -cn-signal wss://cn-relay.example.com/v1/signal \
   -config desktop.json \
   -name Office
+
+# 2. 自建免账号渠道（无需任何身份后端参数或登录令牌）
+./vanora-desktop serve \
+  -channel self \
+  -self-signal wss://relay.example.com/v1/signal \
+  -self-token "$RELAY_SELF_TOKEN" \
+  -config desktop.json \
+  -name HomePC
 ```
 
 > [!WARNING]
