@@ -92,6 +92,23 @@ export STUN_URLS=local
 go run ./cmd/relay
 ```
 
+### 自建节点的身份与鉴权
+
+`relay` 不校验账号密码，也不接触宿主令牌；它只验签设备证书（`vanc1` / `vanl1`）。因此自建中转的鉴权完全取决于节点固定的身份公钥，而不是中转 URL 本身：
+
+- **复用现有身份后端（推荐，用户只需填写中转 URL）**：客户端仍登录原站点、向原身份后端取得短期证书，只把信令地址换成 `wss://<你的服务器>/v1/signal`。节点设置 `RELAY_CHANNEL=self`，`RELAY_IDENTITY_PUBLIC_KEY` 填该身份后端的公钥，即手机/桌面客户端已经固定的同一把公钥。登录、续期、吊销流程全部不变，自建节点只跳过 TURN 权益校验。
+- **自建身份后端（需要自定义客户端接入）**：按 [外部身份签发协议](../internal/identity/README.md) 实现四个 `/v1/identity/*` 接口与宿主令牌校验，由签发服务生成并保管 Ed25519 私钥、导出公钥。此时客户端不能只填中转 URL，还必须同时配置该后端的地址、公钥，并能提供该后端接受的登录令牌；三者缺一不可。
+
+公钥来源：由实际签发证书的身份后端生成并导出（hex、base64 或 32 字节文件），本仓库不含签发端，也不提供在线 JWKS / 公钥发现。复用官方身份后端时，向该站点的运营方获取其公钥（官方客户端构建已内置同一把）。以下三处必须一致：
+
+| 位置 | 配置 |
+| --- | --- |
+| `relay` | `RELAY_IDENTITY_PUBLIC_KEY` |
+| 桌面端 | `-ca <文件>` 或 `-ca-hex` / `VANORA_RELAY_CA_PUBLIC_KEY` |
+| 移动端 | `NewClient(identityURL, signalURL, publicKeyHex, store)` 的 `publicKeyHex` |
+
+更换公钥等于更换信任根：已注册设备必须清理状态后重新登录，否则会返回 `account: stored state belongs to another authority`；没有在线轮换机制，新公钥需要重新分发。
+
 ## 3. 端口、探针与运维说明
 
 | 服务 | 默认监听 | 健康探针 | 部署与防火墙要求 |

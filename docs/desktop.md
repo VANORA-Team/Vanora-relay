@@ -51,7 +51,7 @@ printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
 - **令牌来源一致**：`VANORA_CLIENT_TOKEN` / `auth.token` 必须是该渠道对应站点的登录令牌，身份后端才会签发设备证书。
 - **跨站账号**：CN 站账号可以使用 GLOBAL 官方中转，反之亦然。节点按账号登录站校验权益（运营方需为两个站点都配置权益服务），客户端不需要改变登录流程；只有登录站无有效权益时才降级为仅直连。
 - **`-relay=false` 不是切换渠道**：它只关闭当前渠道的官方中继路径，局域网配对继续可用；渠道本身由上述参数决定。
-- **自建渠道**：用户需自行部署 `relay` 并设置 `RELAY_CHANNEL=self`，同时提供可验证设备证书的身份后端公钥给 `-ca`；自建节点不校验会员权益，但仍要求有效证书。
+- **自建渠道**：用户只需把 `-signal` 换成 `wss://<host>/v1/signal`，登录与续期仍走原 `-identity` 身份后端；节点设置 `RELAY_CHANNEL=self`，且 `RELAY_IDENTITY_PUBLIC_KEY` 必须与客户端 `-ca` / `-ca-hex` 指向同一把公钥。若改用自建身份后端，还必须同时提供其 `-identity`、公钥以及该后端接受的宿主令牌；只填中转 URL 无法完成鉴权。
 
 ### 共享与访问
 
