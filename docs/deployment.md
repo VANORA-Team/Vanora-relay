@@ -20,9 +20,10 @@ go build ./cmd/relay
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `RELAY_CHANNEL` | 否 | `cn` | 中转渠道：`cn`、`global` 或 `self`（用户自建）。见下文「渠道与权益校验」 |
 | `RELAY_IDENTITY_PUBLIC_KEY` | 是 | — | 外部身份后端对应的 Ed25519 公钥（hex 或 base64） |
-| `RELAY_MEMBERSHIP_URL` | 是 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP） |
-| `RELAY_MEMBERSHIP_TOKEN` | 是 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
+| `RELAY_MEMBERSHIP_URL` | 官方渠道必填 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP）。`self` 渠道不需要 |
+| `RELAY_MEMBERSHIP_TOKEN` | 官方渠道必填 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符）。`self` 渠道不需要 |
 | `TURN_PUBLIC_IP` | 是 | — | 本机或 NAT 对外公布的可达 IPv4（本地开发可用 `127.0.0.1`） |
 | `STUN_URLS` | 否 | 小米和哔哩哔哩公共 STUN | 逗号分隔的 `stun:host[:port]`，可混用国内外服务。设为 `local` 时使用 `relay` 内置 STUN |
 | `RELAY_ADDR` | 否 | `127.0.0.1:8787` | 信令监听地址；非回环监听须配置 TLS |
@@ -30,6 +31,20 @@ go build ./cmd/relay
 
 > [!NOTE]
 > `RELAY_MEMBERSHIP_URL` 指向的权益路由属于内部服务接口，跨主机部署时建议通过私有网络与 HTTPS 入口暴露。完整 `TURN_*` 配置（端口范围、绑定网卡、并发上限等）见 [internal/ice/README.md](../internal/ice/README.md)。
+
+### 渠道与权益校验
+
+每个 `relay` 节点只服务一个渠道，客户端按渠道选择对应的信令地址：
+
+| `RELAY_CHANNEL` | 面向用户 | 权益校验 |
+| --- | --- | --- |
+| `cn`（默认） | 在 CN 站登录的账号 | 用 `RELAY_MEMBERSHIP_URL` 指向的 **CN 站**权益服务校验 `(issuer, subject)` |
+| `global` | 在 GLOBAL 站登录的账号 | 用 `RELAY_MEMBERSHIP_URL` 指向的 **GLOBAL 站**权益服务校验 `(issuer, subject)` |
+| `self` | 用户自建节点 | **不校验**中转资格；认证通过的连接直接获得 TURN 授权 |
+
+`cn` / `global` 节点的权益服务需与对应站点同源部署，证书中的 `iss` 必须是该站点的登录 issuer，`sub` 是站点账号标识。校验失败或超时一律降级为仅 STUN 直连，不会中断信令。
+
+`self` 节点不查询会员系统，TURN 授权有效期随两端设备证书到期而结束（客户端会周期刷新）。因此自建节点仍必须接入有效的身份签发后端，不能匿名转发。
 
 `relay` 通过 `ice.config` 把 STUN 列表发给手机和电脑，由两端直接向这些地址收集直连候选。下面的 `STUN_URLS` 配置将默认列表替换为小米和 Cloudflare。
 
@@ -40,9 +55,21 @@ export STUN_URLS='stun:stun.miwifi.com:3478,stun:stun.cloudflare.com:3478'
 本地开发可使用以下配置启用内置 STUN。
 
 ```sh
+export RELAY_CHANNEL=cn
 export RELAY_IDENTITY_PUBLIC_KEY="<外部身份后端导出的 Ed25519 公钥>"
 export RELAY_MEMBERSHIP_URL=https://entitlement.internal.example.com
 export RELAY_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
+export TURN_PUBLIC_IP=127.0.0.1
+export STUN_URLS=local
+
+go run ./cmd/relay
+```
+
+用户自建节点把渠道设为 `self`，此时无需 `RELAY_MEMBERSHIP_*`：
+
+```sh
+export RELAY_CHANNEL=self
+export RELAY_IDENTITY_PUBLIC_KEY="<外部身份后端导出的 Ed25519 公钥>"
 export TURN_PUBLIC_IP=127.0.0.1
 export STUN_URLS=local
 
@@ -65,9 +92,9 @@ go run ./cmd/relay
 - **目标地址过滤**：公网部署默认拒绝私网、回环、保留段等非公网单播目标 IP。
 - **受限网络说明**：TURN 支持 UDP / TCP 控制传输与 UDP relay；仅放行 HTTPS 的网络环境仍可能无法连通。
 
-## 4. 权益校验接口（TURN 授权）
+## 4. 权益校验接口（TURN 授权，仅 CN / GLOBAL 渠道）
 
-`relay` 不内置订阅数据库，而是通过一个简单的 HTTP 内部接口向外部权益服务（可对接自建后端或会员系统）查询**发起访问的手机账号**是否允许使用 TURN 中继。
+`relay` 不内置订阅数据库。`cn` 与 `global` 渠道的节点通过一个简单的 HTTP 内部接口向对应站点的权益服务查询**发起访问的手机账号**是否允许使用 TURN 中继；`self` 渠道不调用该接口。
 
 ```http
 POST /internal/v1/relay/entitlement

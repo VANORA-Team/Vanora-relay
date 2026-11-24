@@ -7,6 +7,7 @@
 - **独立身份信任根（签发闭源、验签开源）**：本仓库仅开源端点证书/租约验签、客户端密钥持有证明（PoP）、信令与端到端适配器；设备证书签发私钥与账号鉴权流程由部署方的外部身份后端独立持有，信令与权益服务均无法伪造端点身份。
 - **直接复用宿主客户端登录态**：桌面端与移动端直接复用宿主 AI 客户端已有的认证令牌完成设备注册与续期，不引入独立的账号密码体系。
 - **直连优先、按需中继**：优先通过 STUN 建立端到端直连，具备中继权益时自动支持 TURN 转发；AI 对话正文只在两端加密 DataChannel 内流转。
+- **多渠道中转**：官方 `cn` / `global` 渠道分别向登录站点校验中继权益；用户可设置 `RELAY_CHANNEL=self` 自建节点，自建渠道不校验中转资格。
 
 ---
 
@@ -25,7 +26,7 @@ flowchart LR
     Desktop -- "复用客户端令牌 / 签发设备证书与租约" --> Identity
     Mobile -- "WSS 签名信令" --> Relay
     Desktop -- "WSS 签名信令" --> Relay
-    Relay -- "校验手机账号中继权益" --> Entitlement
+    Relay -- "cn / global 渠道校验手机账号中继权益" --> Entitlement
     Mobile <-- "WebRTC DataChannel (直连或 TURN 加密转发)" --> Desktop
     Desktop <-- "本机 RPC" --> Vanora
 ```

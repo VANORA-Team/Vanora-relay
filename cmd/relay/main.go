@@ -25,9 +25,17 @@ func run() error {
 	if err != nil || len(key) != ed25519.PublicKeySize {
 		return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the Ed25519 public key (hex or base64) of the identity authority")
 	}
-	billing := &membership.Client{URL: os.Getenv("RELAY_MEMBERSHIP_URL"), Token: os.Getenv("RELAY_MEMBERSHIP_TOKEN")}
-	if billing.URL == "" || len(billing.Token) < 32 {
-		return errors.New("configure RELAY_MEMBERSHIP_URL and RELAY_MEMBERSHIP_TOKEN (at least 32 characters)")
+	channel, err := relay.ParseChannel(os.Getenv("RELAY_CHANNEL"))
+	if err != nil {
+		return err
+	}
+	var entitlement relay.EntitlementVerifier
+	if channel.ChecksEntitlement() {
+		billing := &membership.Client{URL: os.Getenv("RELAY_MEMBERSHIP_URL"), Token: os.Getenv("RELAY_MEMBERSHIP_TOKEN")}
+		if billing.URL == "" || len(billing.Token) < 32 {
+			return fmt.Errorf("RELAY_CHANNEL=%s requires RELAY_MEMBERSHIP_URL and RELAY_MEMBERSHIP_TOKEN (at least 32 characters) for the matching site", channel)
+		}
+		entitlement = billing
 	}
 	addr := os.Getenv("RELAY_ADDR")
 	if addr == "" {
@@ -49,7 +57,7 @@ func run() error {
 		return fmt.Errorf("start STUN/TURN: %w", err)
 	}
 	defer network.Close()
-	hub := relay.New(key, billing, network)
+	hub := relay.New(key, entitlement, network)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go hub.Run(ctx)
@@ -66,7 +74,7 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
-	log.Printf("Vanora signaling listening on %s", addr)
+	log.Printf("Vanora signaling (%s channel) listening on %s", channel, addr)
 	if cert != "" {
 		err = server.ListenAndServeTLS(cert, keyfile)
 	} else {

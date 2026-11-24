@@ -80,8 +80,9 @@ func login(t *testing.T, ctx context.Context, url, role, subject string, signer 
 }
 
 func TestAuthorizedGuestWebRTC(t *testing.T) {
-	t.Run("direct_without_membership", func(t *testing.T) { exerciseGuestWebRTC(t, false) })
-	t.Run("relay_only_with_membership", func(t *testing.T) { exerciseGuestWebRTC(t, true) })
+	t.Run("direct_when_membership_denies", func(t *testing.T) { exerciseGuestWebRTC(t, true, false) })
+	t.Run("relay_only_with_membership", func(t *testing.T) { exerciseGuestWebRTC(t, true, true) })
+	t.Run("relay_only_self_hosted", func(t *testing.T) { exerciseGuestWebRTC(t, false, true) })
 }
 
 func receive[T any](t *testing.T, ctx context.Context, ch <-chan T) T {
@@ -96,7 +97,7 @@ func receive[T any](t *testing.T, ctx context.Context, ch <-chan T) T {
 	}
 }
 
-func exerciseGuestWebRTC(t *testing.T, entitled bool) {
+func exerciseGuestWebRTC(t *testing.T, verifiesEntitlement, entitled bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -114,17 +115,21 @@ func exerciseGuestWebRTC(t *testing.T, entitled bool) {
 	check(t, err)
 	signer, err := identitytest.NewAuthorityWithKey(key, time.Minute*10)
 	check(t, err)
-	token := strings.Repeat("a", 40)
-	billing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var who struct{ Issuer, Subject string }
-		if r.Method != "POST" || r.URL.Path != "/internal/v1/relay/entitlement" || r.Header.Get("Authorization") != "Bearer "+token || json.NewDecoder(r.Body).Decode(&who) != nil || who.Issuer != "https://issuer.example" || who.Subject != "guest" {
-			http.Error(w, "unexpected identity", 403)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{"relay_allowed": entitled, "valid_until": time.Now().Add(time.Hour).Unix()}})
-	}))
-	defer billing.Close()
-	h := signal.New(signer.PublicKey(), &membership.Client{URL: billing.URL, Token: token}, network)
+	var verifier signal.EntitlementVerifier
+	if verifiesEntitlement {
+		token := strings.Repeat("a", 40)
+		billing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var who struct{ Issuer, Subject string }
+			if r.Method != "POST" || r.URL.Path != "/internal/v1/relay/entitlement" || r.Header.Get("Authorization") != "Bearer "+token || json.NewDecoder(r.Body).Decode(&who) != nil || who.Issuer != "https://issuer.example" || who.Subject != "guest" {
+				http.Error(w, "unexpected identity", 403)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{"relay_allowed": entitled, "valid_until": time.Now().Add(time.Hour).Unix()}})
+		}))
+		defer billing.Close()
+		verifier = &membership.Client{URL: billing.URL, Token: token}
+	}
+	h := signal.New(signer.PublicKey(), verifier, network)
 	go h.Run(ctx)
 	srv := httptest.NewServer(h)
 	defer srv.Close()

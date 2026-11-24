@@ -16,7 +16,10 @@ import (
 	"vanora-relay/protocol"
 )
 
-type membership interface {
+// EntitlementVerifier checks whether the account that signed in with issuer
+// and subject may use TURN relay. A zero time with a nil error means the
+// account is definitively not entitled.
+type EntitlementVerifier interface {
 	Check(context.Context, string, string) (time.Time, error)
 }
 type iceService interface {
@@ -25,13 +28,13 @@ type iceService interface {
 }
 
 type Hub struct {
-	key     ed25519.PublicKey
-	billing membership
-	ice     iceService
-	slots   chan struct{}
-	mu      sync.Mutex
-	peers   map[string]*peer
-	links   map[string]*link
+	key         ed25519.PublicKey
+	entitlement EntitlementVerifier
+	ice         iceService
+	slots       chan struct{}
+	mu          sync.Mutex
+	peers       map[string]*peer
+	links       map[string]*link
 }
 
 type peer struct {
@@ -56,8 +59,11 @@ type link struct {
 	phoneSeq, hostSeq  uint64
 }
 
-func New(key ed25519.PublicKey, billing membership, network iceService) *Hub {
-	return &Hub{key: key, billing: billing, ice: network, slots: make(chan struct{}, 1024), peers: make(map[string]*peer), links: make(map[string]*link)}
+// New creates a hub. entitlement nil means the node does not check relay
+// entitlement at all, which is the self-hosted channel; official channels pass
+// a verifier backed by their site's membership service.
+func New(key ed25519.PublicKey, entitlement EntitlementVerifier, network iceService) *Hub {
+	return &Hub{key: key, entitlement: entitlement, ice: network, slots: make(chan struct{}, 1024), peers: make(map[string]*peer), links: make(map[string]*link)}
 }
 
 func (p *peer) send(m protocol.Message) {
@@ -302,12 +308,21 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 	}
 	l.lastConfig = time.Now()
 	issuer, subject := l.phone.id.Issuer, l.phone.id.Subject
+	phoneExpires := l.phone.id.Expires
 	h.mu.Unlock()
-	ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
-	defer cancel()
-	until, err := h.billing.Check(ctx, issuer, subject)
-	if err != nil {
-		until = time.Time{}
+	var until time.Time
+	if h.entitlement != nil {
+		ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+		var err error
+		until, err = h.entitlement.Check(ctx, issuer, subject)
+		cancel()
+		if err != nil {
+			until = time.Time{}
+		}
+	} else {
+		// A self-hosted node has no site membership service to consult, so
+		// the grant lasts as long as both authenticated endpoints do.
+		until = phoneExpires
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
