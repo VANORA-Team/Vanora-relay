@@ -5,15 +5,16 @@ import (
 	"strings"
 )
 
-// Channel identifies which Vanora site a relay node serves. The CN and global
-// channels check relay entitlement against the site the account signed in on;
-// a self-hosted channel belongs to the operator and skips that check.
+// Channel identifies whether a relay node is an official Vanora node or a
+// user-hosted one. Official nodes verify relay entitlement with the site the
+// account signed in on; a self-hosted channel belongs to the operator and skips
+// that check.
 type Channel string
 
 const (
-	// ChannelCN serves accounts signed in on the CN site.
+	// ChannelCN is an official node in the CN region.
 	ChannelCN Channel = "cn"
-	// ChannelGlobal serves accounts signed in on the global site.
+	// ChannelGlobal is an official node in the GLOBAL region.
 	ChannelGlobal Channel = "global"
 	// ChannelSelf is a user-hosted relay that does not check relay
 	// entitlement.
@@ -36,7 +37,7 @@ func ParseChannel(value string) (Channel, error) {
 }
 
 // ChecksEntitlement reports whether a node on this channel verifies relay
-// entitlement with a Vanora site. Self-hosted nodes do not.
+// entitlement. Self-hosted nodes do not.
 func (c Channel) ChecksEntitlement() bool {
 	return c == ChannelCN || c == ChannelGlobal
 }

@@ -20,10 +20,14 @@ go build ./cmd/relay
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `RELAY_CHANNEL` | 否 | `cn` | 中转渠道：`cn`、`global` 或 `self`（用户自建）。见下文「渠道与权益校验」 |
+| `RELAY_CHANNEL` | 否 | `cn` | 中转渠道：`cn`、`global` 或 `self`（用户自建）。决定是否校验权益，见下文「渠道与权益校验」 |
 | `RELAY_IDENTITY_PUBLIC_KEY` | 是 | — | 外部身份后端对应的 Ed25519 公钥（hex 或 base64） |
-| `RELAY_MEMBERSHIP_URL` | 官方渠道必填 | — | 权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP）。`self` 渠道不需要 |
-| `RELAY_MEMBERSHIP_TOKEN` | 官方渠道必填 | — | 调用权益接口的随机服务密钥（至少 32 字节，不可含空白字符）。`self` 渠道不需要 |
+| `RELAY_CN_MEMBERSHIP_URL` | 官方渠道配置 CN 站时 | — | CN 站权益校验后端地址（生产须 HTTPS，本地开发允许回环 HTTP） |
+| `RELAY_CN_MEMBERSHIP_TOKEN` | 同上 | — | 调用 CN 站权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
+| `RELAY_GLOBAL_MEMBERSHIP_URL` | 官方渠道配置 GLOBAL 站时 | — | GLOBAL 站权益校验后端地址 |
+| `RELAY_GLOBAL_MEMBERSHIP_TOKEN` | 同上 | — | 调用 GLOBAL 站权益接口的随机服务密钥（至少 32 字节，不可含空白字符） |
+| `RELAY_MEMBERSHIP_URL` | 否 | — | 兼容变量：节点所属站点的两个专用变量都为空时，作为该站点的权益地址 |
+| `RELAY_MEMBERSHIP_TOKEN` | 否 | — | 兼容变量，与 `RELAY_MEMBERSHIP_URL` 成对使用；`self` 渠道不需要任何权益变量 |
 | `TURN_PUBLIC_IP` | 是 | — | 本机或 NAT 对外公布的可达 IPv4（本地开发可用 `127.0.0.1`） |
 | `STUN_URLS` | 否 | 小米和哔哩哔哩公共 STUN | 逗号分隔的 `stun:host[:port]`，可混用国内外服务。设为 `local` 时使用 `relay` 内置 STUN |
 | `RELAY_ADDR` | 否 | `127.0.0.1:8787` | 信令监听地址；非回环监听须配置 TLS |
@@ -34,15 +38,23 @@ go build ./cmd/relay
 
 ### 渠道与权益校验
 
-每个 `relay` 节点只服务一个渠道，客户端按渠道选择对应的信令地址：
+`RELAY_CHANNEL` 决定节点是否校验中转资格，以及兼容变量 `RELAY_MEMBERSHIP_*` 归属哪个站点；客户端按渠道选择信令地址：
 
-| `RELAY_CHANNEL` | 面向用户 | 权益校验 |
+| `RELAY_CHANNEL` | 节点 | 权益校验 |
 | --- | --- | --- |
-| `cn`（默认） | 在 CN 站登录的账号 | 用 `RELAY_MEMBERSHIP_URL` 指向的 **CN 站**权益服务校验 `(issuer, subject)` |
-| `global` | 在 GLOBAL 站登录的账号 | 用 `RELAY_MEMBERSHIP_URL` 指向的 **GLOBAL 站**权益服务校验 `(issuer, subject)` |
+| `cn`（默认） | CN 区域官方节点 | 校验；`RELAY_MEMBERSHIP_*` 归属 CN 站 |
+| `global` | GLOBAL 区域官方节点 | 校验；`RELAY_MEMBERSHIP_*` 归属 GLOBAL 站 |
 | `self` | 用户自建节点 | **不校验**中转资格；认证通过的连接直接获得 TURN 授权 |
 
-`cn` / `global` 节点的权益服务需与对应站点同源部署，证书中的 `iss` 必须是该站点的登录 issuer，`sub` 是站点账号标识。校验失败或超时一律降级为仅 STUN 直连，不会中断信令。
+跨站账号（CN 站账号使用 GLOBAL 节点，或反之）是正常场景，因此官方节点应同时配置两个站点的权益服务，至少配置一个：
+
+| 变量对 | 说明 |
+| --- | --- |
+| `RELAY_CN_MEMBERSHIP_URL` / `RELAY_CN_MEMBERSHIP_TOKEN` | CN 站权益服务 |
+| `RELAY_GLOBAL_MEMBERSHIP_URL` / `RELAY_GLOBAL_MEMBERSHIP_TOKEN` | GLOBAL 站权益服务 |
+| `RELAY_MEMBERSHIP_URL` / `RELAY_MEMBERSHIP_TOKEN` | 兼容变量，仅当节点所属站点的两个专用变量都未设置时作为该站点的服务地址 |
+
+节点并行查询所有已配置站点的 `/internal/v1/relay/entitlement`，任一站点放行即授予 TURN 并取最晚的有效期。账号只存在于其登录站点，其余站点会明确返回未授权，所以实际生效的仍是登录站点的订阅。全部站点拒绝时降级为仅 STUN；无站点放行且至少一个站点报错时同样按拒绝处理（错误写入服务日志）。证书中的 `iss` 必须是登录站点的 issuer，`sub` 是站点账号标识。
 
 `self` 节点不查询会员系统，TURN 授权有效期随两端设备证书到期而结束（客户端会周期刷新）。因此自建节点仍必须接入有效的身份签发后端，不能匿名转发。
 
@@ -57,15 +69,19 @@ export STUN_URLS='stun:stun.miwifi.com:3478,stun:stun.cloudflare.com:3478'
 ```sh
 export RELAY_CHANNEL=cn
 export RELAY_IDENTITY_PUBLIC_KEY="<外部身份后端导出的 Ed25519 公钥>"
-export RELAY_MEMBERSHIP_URL=https://entitlement.internal.example.com
-export RELAY_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
+export RELAY_CN_MEMBERSHIP_URL=https://cn-entitlement.internal.example.com
+export RELAY_CN_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
+export RELAY_GLOBAL_MEMBERSHIP_URL=https://global-entitlement.internal.example.com
+export RELAY_GLOBAL_MEMBERSHIP_TOKEN="<至少32字节的随机服务密钥>"
 export TURN_PUBLIC_IP=127.0.0.1
 export STUN_URLS=local
 
 go run ./cmd/relay
 ```
 
-用户自建节点把渠道设为 `self`，此时无需 `RELAY_MEMBERSHIP_*`：
+只配置一个站点也能启动，但该节点只会放行该站点的账号；另一个站点的账号连接时因查不到订阅而退化为仅直连。
+
+用户自建节点把渠道设为 `self`，此时无需任何 `*_MEMBERSHIP_*` 变量：
 
 ```sh
 export RELAY_CHANNEL=self
@@ -92,9 +108,9 @@ go run ./cmd/relay
 - **目标地址过滤**：公网部署默认拒绝私网、回环、保留段等非公网单播目标 IP。
 - **受限网络说明**：TURN 支持 UDP / TCP 控制传输与 UDP relay；仅放行 HTTPS 的网络环境仍可能无法连通。
 
-## 4. 权益校验接口（TURN 授权，仅 CN / GLOBAL 渠道）
+## 4. 权益校验接口（TURN 授权，仅官方渠道）
 
-`relay` 不内置订阅数据库。`cn` 与 `global` 渠道的节点通过一个简单的 HTTP 内部接口向对应站点的权益服务查询**发起访问的手机账号**是否允许使用 TURN 中继；`self` 渠道不调用该接口。
+`relay` 不内置订阅数据库。`cn` 与 `global` 节点通过一个简单的 HTTP 内部接口，向**所有已配置站点**的权益服务查询**发起访问的手机账号**是否允许使用 TURN 中继；`self` 渠道不调用该接口。每个站点使用自己的 `RELAY_CN_MEMBERSHIP_*` 或 `RELAY_GLOBAL_MEMBERSHIP_*`（未配置时回退到 `RELAY_MEMBERSHIP_*`）。
 
 ```http
 POST /internal/v1/relay/entitlement
@@ -102,7 +118,7 @@ Authorization: Bearer <RELAY_MEMBERSHIP_TOKEN>
 Content-Type: application/json
 ```
 
-> 若 `RELAY_MEMBERSHIP_URL` 未以 `/internal/v1/relay/entitlement` 结尾，客户端会自动拼接该路径；请求不跟随 HTTP 重定向。
+> 若站点的 URL 未以 `/internal/v1/relay/entitlement` 结尾，客户端会自动拼接该路径；请求不跟随 HTTP 重定向。
 
 **请求体：**
 

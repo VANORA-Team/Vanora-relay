@@ -29,13 +29,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var entitlement relay.EntitlementVerifier
-	if channel.ChecksEntitlement() {
-		billing := &membership.Client{URL: os.Getenv("RELAY_MEMBERSHIP_URL"), Token: os.Getenv("RELAY_MEMBERSHIP_TOKEN")}
-		if billing.URL == "" || len(billing.Token) < 32 {
-			return fmt.Errorf("RELAY_CHANNEL=%s requires RELAY_MEMBERSHIP_URL and RELAY_MEMBERSHIP_TOKEN (at least 32 characters) for the matching site", channel)
-		}
-		entitlement = billing
+	entitlement, err := entitlementVerifier(channel)
+	if err != nil {
+		return err
 	}
 	addr := os.Getenv("RELAY_ADDR")
 	if addr == "" {
@@ -85,6 +81,51 @@ func run() error {
 	}
 	return err
 }
+
+// entitlementVerifier builds the entitlement check for an official channel.
+// Each site's service is configured independently: accounts sign in on one site
+// but may use a relay in either region, so the node checks every site it knows.
+// A self-hosted node checks nothing.
+func entitlementVerifier(channel relay.Channel) (relay.EntitlementVerifier, error) {
+	if !channel.ChecksEntitlement() {
+		return nil, nil
+	}
+	ownSite := "CN"
+	if channel == relay.ChannelGlobal {
+		ownSite = "GLOBAL"
+	}
+	legacyURL, legacyToken := os.Getenv("RELAY_MEMBERSHIP_URL"), os.Getenv("RELAY_MEMBERSHIP_TOKEN")
+	if (legacyURL == "") != (legacyToken == "") {
+		return nil, errors.New("configure both RELAY_MEMBERSHIP_URL and RELAY_MEMBERSHIP_TOKEN, or neither")
+	}
+	var sites membership.Sites
+	seen := make(map[string]bool, 2)
+	for _, site := range []struct{ name, urlVar, tokenVar string }{
+		{"CN", "RELAY_CN_MEMBERSHIP_URL", "RELAY_CN_MEMBERSHIP_TOKEN"},
+		{"GLOBAL", "RELAY_GLOBAL_MEMBERSHIP_URL", "RELAY_GLOBAL_MEMBERSHIP_TOKEN"},
+	} {
+		rawURL, token := os.Getenv(site.urlVar), os.Getenv(site.tokenVar)
+		if rawURL == "" && token == "" && site.name == ownSite {
+			rawURL, token = legacyURL, legacyToken
+		}
+		if rawURL == "" && token == "" {
+			continue
+		}
+		if rawURL == "" || len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
+			return nil, fmt.Errorf("%s and %s must both be set; the token needs at least 32 bytes without whitespace", site.urlVar, site.tokenVar)
+		}
+		if seen[rawURL] {
+			continue
+		}
+		seen[rawURL] = true
+		sites = append(sites, &membership.Client{URL: rawURL, Token: token})
+	}
+	if len(sites) == 0 {
+		return nil, fmt.Errorf("RELAY_CHANNEL=%s requires RELAY_%s_MEMBERSHIP_URL and RELAY_%s_MEMBERSHIP_TOKEN (legacy RELAY_MEMBERSHIP_URL/RELAY_MEMBERSHIP_TOKEN also works)", channel, ownSite, ownSite)
+	}
+	return sites, nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)

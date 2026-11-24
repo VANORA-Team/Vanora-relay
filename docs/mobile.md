@@ -11,6 +11,21 @@
 
 两种客户端共用会话和事件接口。局域网客户端使用独立于官方账号的安全存储槽。宿主退出官方账号后可保留局域网客户端与其配对记录。
 
+### 中转渠道选择（cn / global / 自建）
+
+SDK 不提供渠道枚举：一个渠道由 `identityURL` + `signalURL` + 固定的身份公钥确定，宿主按用户选择传入 `NewClient`：
+
+| 渠道 | `identityURL` | `signalURL` | TURN 权益 |
+| --- | --- | --- | --- |
+| `cn` | CN 站身份后端 | CN 站官方中转 | 按账号登录站校验 |
+| `global` | GLOBAL 站身份后端 | GLOBAL 站官方中转 | 按账号登录站校验 |
+| 自建 | 用户接入的身份后端 | 用户自建 `relay`（`RELAY_CHANNEL=self`） | 不校验 |
+
+- **跨站账号**：CN 站账号可以使用 GLOBAL 官方中转，反之亦然。节点并行查询已配置站点的权益服务，账号只在其登录站存在，因此实际按登录站放行；只有登录站没有有效权益时才降级为仅直连，`connectionState()` 的路径显示为 `direct` 而非 `relay`。
+- **切换渠道**：用目标渠道的地址和公钥创建新的 `Client`，并为每个渠道使用独立的 `Store` 槽位（Android `AndroidAccountStore(context, "<channel>")`，iOS `VanoraAccountStore(profile:)`）。设备状态绑定身份后端公钥；身份根不同却复用同一槽位时，`NewClient` 会返回 `account: stored state belongs to another authority`。`reset()` 只会在原身份根下重置，不能把槽位改绑到另一个身份根，因此不要共用槽位。
+- **令牌来源一致**：`enroll(hostAccessToken)` / `updateToken` 传入的必须是该渠道对应站点的登录令牌，身份后端才会为该渠道签发设备证书。
+- **自建渠道**：用户需自行部署 `relay` 并提供 `wss://<host>/v1/signal`、身份后端地址及其公钥；节点不校验会员权益，但仍要求有效的设备证书。
+
 ## Android
 
 **环境依赖**：JDK、Go、Python 3、Android SDK（设置 `ANDROID_HOME`）及 NDK（可选设置 `ANDROID_NDK_HOME`）。

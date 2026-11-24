@@ -36,6 +36,23 @@ printf '%s\n' "$CLIENT_AUTH_TOKEN" | ./vanora-desktop login \
 - **结构化状态事件**：以 `serve -sidecar` 启动后会向 `stdout` 输出 JSON-lines 状态事件（`ready`、`online`、`offline`、`auth.ok`、`auth.required`、`peer.connected`、`session.created`、`ui.request`、`shutdown` 等）。
 - **生命周期控制**：支持通过 `stdin` 发送 `{"type":"auth.token"|"reload"|"status"|"shutdown"}`，并在父进程退出（`stdin` EOF）时自动干净退出。
 
+### 中转渠道选择（cn / global / 自建）
+
+`vanora-desktop` 不内置渠道枚举。一个渠道由一组服务参数确定，宿主按用户选择的渠道传入：
+
+| 渠道 | `-identity` / `-ca` | `-signal` | 中继权益 |
+| --- | --- | --- | --- |
+| `cn` | CN 站身份后端及对应公钥 | CN 站官方中转 `wss://<relay>/v1/signal` | 按账号登录站校验 |
+| `global` | GLOBAL 站身份后端及对应公钥 | GLOBAL 站官方中转 | 按账号登录站校验 |
+| 自建 | 用户接入的身份后端及对应公钥 | 用户自建 `relay` 的 `wss://<host>/v1/signal` | 不校验（`RELAY_CHANNEL=self`） |
+
+- **同一渠道成套使用**：`login` 的 `-identity` / `-ca` 与 `serve` 的 `-signal` 必须属于同一个渠道；`-ldflags` 注入的 `defaultIdentityURL` / `defaultSignalURL` / `defaultCAHex` 也只对应一个渠道。切换渠道时由宿主重启 Sidecar 并传入新的一组参数。
+- **凭据按渠道隔离**：设备状态绑定首次登录时的身份后端公钥。若两个渠道的身份根不同，复用同一状态目录会返回 `account: stored state belongs to another authority`，且 `logout` 只在原身份根下重置、无法就地改绑。为每个渠道使用独立的 `-state-dir`。
+- **令牌来源一致**：`VANORA_CLIENT_TOKEN` / `auth.token` 必须是该渠道对应站点的登录令牌，身份后端才会签发设备证书。
+- **跨站账号**：CN 站账号可以使用 GLOBAL 官方中转，反之亦然。节点按账号登录站校验权益（运营方需为两个站点都配置权益服务），客户端不需要改变登录流程；只有登录站无有效权益时才降级为仅直连。
+- **`-relay=false` 不是切换渠道**：它只关闭当前渠道的官方中继路径，局域网配对继续可用；渠道本身由上述参数决定。
+- **自建渠道**：用户需自行部署 `relay` 并设置 `RELAY_CHANNEL=self`，同时提供可验证设备证书的身份后端公钥给 `-ca`；自建节点不校验会员权益，但仍要求有效证书。
+
 ### 共享与访问
 
 一次性邀请与客户端撤权流程参考 T3 Code 的 [配对授权](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/PairingGrantStore.ts)和[客户端会话](https://github.com/pingdotgg/t3code/blob/11224f63d2a3d444ca1fd1f67cd3ff21c1f5f8a1/apps/server/src/auth/SessionStore.ts)。
