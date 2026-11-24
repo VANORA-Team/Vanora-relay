@@ -44,6 +44,9 @@ var (
 	ErrVisitorMismatch = errors.New("ice: connection already belongs to another visitor")
 	// ErrTooManyGrants is returned when the server is at its active-grant limit.
 	ErrTooManyGrants = errors.New("ice: too many active relay grants")
+	// ErrVisitorGrantLimit is returned when one visitor reaches the per-visitor
+	// concurrent active-grant cap.
+	ErrVisitorGrantLimit = errors.New("ice: too many active relay grants for visitor")
 )
 
 const maxIdentifierLen = 256
@@ -60,8 +63,10 @@ type Server struct {
 	turnURLs    []string
 
 	maxGrants              int
+	maxGrantsPerVisitor    int
 	maxAllocationsPerGrant int
 	allowUnsafePeers       bool
+	localAddrs             map[netip.Addr]struct{}
 	onRemove               func(removal)
 
 	// localRelays maps an advertised relay address to its socket so
@@ -80,17 +85,26 @@ type Server struct {
 }
 
 type grant struct {
-	connectionID string
-	visitor      string
-	username     string
-	password     string
-	key          []byte
-	until        time.Time
-	gen          uint64
-	timer        *time.Timer
-	allocations  map[string]*relayConn
-	relayed      uint64
-	removed      bool
+	connectionID  string
+	visitor       string
+	username      string
+	password      string
+	key           []byte
+	until         time.Time
+	gen           uint64
+	timer         *time.Timer
+	allocations   map[string]*relayConn
+	pendingAllocs map[string]time.Time
+	relayed       uint64
+	removed       bool
+}
+
+func (g *grant) prunePendingLocked(now time.Time) {
+	for src, exp := range g.pendingAllocs {
+		if !now.Before(exp) {
+			delete(g.pendingAllocs, src)
+		}
+	}
 }
 
 type visitorUsage struct {
@@ -158,6 +172,9 @@ func (s *Server) Config(connectionID, visitor string, until time.Time) ([]ICESer
 	if len(s.grants) >= s.maxGrants {
 		return nil, ErrTooManyGrants
 	}
+	if v := s.visitors[visitor]; v != nil && s.maxGrantsPerVisitor > 0 && v.grants >= s.maxGrantsPerVisitor {
+		return nil, ErrVisitorGrantLimit
+	}
 
 	username, err := randomToken()
 	if err != nil {
@@ -169,13 +186,14 @@ func (s *Server) Config(connectionID, visitor string, until time.Time) ([]ICESer
 	}
 
 	g := &grant{
-		connectionID: connectionID,
-		visitor:      visitor,
-		username:     username,
-		password:     password,
-		key:          turn.GenerateAuthKey(username, s.realm, password),
-		until:        until,
-		allocations:  make(map[string]*relayConn),
+		connectionID:  connectionID,
+		visitor:       visitor,
+		username:      username,
+		password:      password,
+		key:           turn.GenerateAuthKey(username, s.realm, password),
+		until:         until,
+		allocations:   make(map[string]*relayConn),
+		pendingAllocs: make(map[string]time.Time),
 	}
 	g.gen = 1
 	gen := g.gen

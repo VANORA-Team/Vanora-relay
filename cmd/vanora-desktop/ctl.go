@@ -1,0 +1,483 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gofrs/flock"
+	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/remote"
+	"vanora-relay/adapter/selfrelay"
+	"vanora-relay/adapter/transport"
+)
+
+type noopHandler struct{}
+
+func (noopHandler) Open(transport.Peer)            {}
+func (noopHandler) Message(transport.Peer, []byte) {}
+func (noopHandler) Closed(transport.Peer)          {}
+
+type ctlProvider struct {
+	ctx       context.Context
+	dir       string
+	name      string
+	slots     map[string]*officialSlotConfig
+	tokens    map[string]string
+	selfURL   string
+	selfToken string
+
+	mu         sync.Mutex
+	selfServer *selfrelay.Server
+	lanServer  *lan.Server
+}
+
+func (p *ctlProvider) DesktopName() string { return strings.TrimSpace(p.name) }
+
+func (p *ctlProvider) ListOfficialChannels() []string {
+	out := make([]string, 0, len(p.slots))
+	for k, slot := range p.slots {
+		if slot != nil && slot.account != nil && slot.signalURL != "" {
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (p *ctlProvider) Official(channel string) (*remote.OfficialChannel, error) {
+	ch := strings.ToLower(strings.TrimSpace(channel))
+	slot := p.slots[ch]
+	if slot == nil || slot.account == nil || slot.signalURL == "" {
+		return nil, fmt.Errorf("official relay channel %s is not configured", ch)
+	}
+	if tok := strings.TrimSpace(p.tokens[ch]); tok != "" {
+		if slot.account.UserID() == "" {
+			enrollCtx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+			err := slot.account.Enroll(enrollCtx, tok)
+			cancel()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			if err := slot.account.UpdateToken(tok); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &remote.OfficialChannel{
+		Channel:   ch,
+		SignalURL: slot.signalURL,
+		Account:   slot.account,
+		Source:    slot.account,
+	}, nil
+}
+
+func (p *ctlProvider) Self() (*remote.SelfChannel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.selfServer == nil {
+		srv, err := selfrelay.OpenServer(namedVault(p.dir, "self.enc", "self"), noopHandler{})
+		if err != nil {
+			return nil, err
+		}
+		p.selfServer = srv
+	}
+	return &remote.SelfChannel{
+		SignalURL: p.selfURL,
+		Token:     p.selfToken,
+		Server:    p.selfServer,
+	}, nil
+}
+
+func (p *ctlProvider) LAN() (*remote.LANChannel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lanServer == nil {
+		srv, err := lan.OpenServer(namedVault(p.dir, "lan.enc", "lan"), noopHandler{})
+		if err != nil {
+			return nil, err
+		}
+		p.lanServer = srv
+	}
+	return &remote.LANChannel{Server: p.lanServer}, nil
+}
+
+func runCtl(args []string) error {
+	const usage = "usage: vanora-desktop ctl pair|peers|workspaces|sessions|create|open|run|cancel [flags]"
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	action := strings.ToLower(strings.TrimSpace(args[0]))
+	switch action {
+	case "pair", "peers", "workspaces", "sessions", "create", "open", "run", "cancel":
+	default:
+		return errors.New(usage)
+	}
+	fs := flag.NewFlagSet("ctl "+action, flag.ContinueOnError)
+	channelFlag := fs.String("channel", envOrDefault("VANORA_RELAY_CHANNEL", ""), "channel: cn, global, self, or lan")
+
+	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
+	caFile := fs.String("ca", "", "pinned identity public key file")
+	caHexFlag := fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)")
+	signalURL := fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL")
+	signalToken := fs.String("signal-token", envOrDefault("VANORA_RELAY_SIGNAL_TOKEN", ""), "bearer token for a self-hosted relay")
+
+	cnIdentityURL := fs.String("cn-identity", envOrDefault("VANORA_RELAY_CN_IDENTITY_URL", defaultCNIdentityURL), "CN site identity authority URL")
+	cnCAFile := fs.String("cn-ca", "", "CN site pinned identity public key file")
+	cnCAHex := fs.String("cn-ca-hex", envOrDefault("VANORA_RELAY_CN_CA_PUBLIC_KEY", defaultCNCAHex), "CN site pinned identity public key (hex or base64)")
+	cnSignalURL := fs.String("cn-signal", envOrDefault("VANORA_RELAY_CN_SIGNAL_URL", defaultCNSignalURL), "CN site official relay WebSocket URL")
+
+	globalIdentityURL := fs.String("global-identity", envOrDefault("VANORA_RELAY_GLOBAL_IDENTITY_URL", defaultGlobalIdentityURL), "GLOBAL site identity authority URL")
+	globalCAFile := fs.String("global-ca", "", "GLOBAL site pinned identity public key file")
+	globalCAHex := fs.String("global-ca-hex", envOrDefault("VANORA_RELAY_GLOBAL_CA_PUBLIC_KEY", defaultGlobalCAHex), "GLOBAL site pinned identity public key (hex or base64)")
+	globalSignalURL := fs.String("global-signal", envOrDefault("VANORA_RELAY_GLOBAL_SIGNAL_URL", defaultGlobalSignalURL), "GLOBAL site official relay WebSocket URL")
+
+	selfSignalURL := fs.String("self-signal", envOrDefault("VANORA_RELAY_SELF_SIGNAL_URL", ""), "self-hosted relay WebSocket URL (or LAN IP:PORT for bare LAN pairing code)")
+	selfToken := fs.String("self-token", envOrDefault("VANORA_RELAY_SELF_TOKEN", ""), "bearer token for a self-hosted relay")
+
+	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
+	hostname, _ := os.Hostname()
+	name := fs.String("name", hostname, "local desktop name")
+	tokenFlag := fs.String("token", envOrDefault("VANORA_CLIENT_TOKEN", ""), "existing client auth token")
+	tokenStdin := fs.Bool("token-stdin", false, "read client auth token from stdin")
+	jsonOutput := fs.Bool("json", false, "emit structured JSON lines on stdout")
+
+	inputFlag := fs.String("input", "", "pairing link or 16-character pairing code")
+	grantAccess := fs.String("grant-access", "", "for self/lan pairing: reverse access granted to peer (read or control)")
+	peerFlag := fs.String("peer", "", "target remote desktop peer_id")
+	workspaceFlag := fs.String("workspace", "", "target workspace_id for session creation")
+	titleFlag := fs.String("title", "", "optional session title")
+	sessionFlag := fs.String("session", "", "target session_id")
+	runFlag := fs.String("run", "", "target run_id for cancel")
+	textFlag := fs.String("text", "", "prompt text for run")
+	requestIDFlag := fs.String("request-id", "", "optional idempotency request_id")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+
+	channel := strings.ToLower(strings.TrimSpace(*channelFlag))
+	if channel != "" && channel != "cn" && channel != "global" && channel != "self" && channel != "lan" {
+		return fmt.Errorf("unknown channel %q (want cn, global, self or lan)", channel)
+	}
+	if *root == "" {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return err
+		}
+		*root = filepath.Join(dir, "Vanora", "relay")
+	}
+	dir, err := filepath.Abs(*root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	lock := flock.New(filepath.Join(dir, "profile.lock"))
+	ok, err := lock.TryLock()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("desktop profile is already open (use Sidecar remote.* commands while serve is running, or specify another -state-dir)")
+	}
+	defer lock.Unlock()
+
+	resolvedSelfSignal := strings.TrimSpace(*selfSignalURL)
+	resolvedSelfToken := strings.TrimSpace(*selfToken)
+	if resolvedSelfToken == "" {
+		resolvedSelfToken = strings.TrimSpace(*signalToken)
+	}
+	legacyID := strings.TrimSpace(*identityURL)
+	legacyCAFile := strings.TrimSpace(*caFile)
+	legacyCAHex := strings.TrimSpace(*caHexFlag)
+	legacySig := strings.TrimSpace(*signalURL)
+	if channel == "self" {
+		if resolvedSelfSignal == "" {
+			resolvedSelfSignal = legacySig
+		}
+		legacySig = ""
+	}
+
+	slots := make(map[string]*officialSlotConfig, 2)
+	if cnSlot, err := openOfficialSlot(dir, "cn", "cn", *cnIdentityURL, *cnCAFile, *cnCAHex, *cnSignalURL); err != nil {
+		return err
+	} else if cnSlot != nil {
+		slots["cn"] = cnSlot
+	}
+	if globalSlot, err := openOfficialSlot(dir, "global", "global", *globalIdentityURL, *globalCAFile, *globalCAHex, *globalSignalURL); err != nil {
+		return err
+	} else if globalSlot != nil {
+		slots["global"] = globalSlot
+	}
+	if legacyID != "" || legacyCAFile != "" || legacyCAHex != "" || legacySig != "" {
+		slotName, vaultChannel := "cn", ""
+		if channel == "global" {
+			slotName, vaultChannel = "global", "global"
+		} else if channel == "cn" {
+			slotName, vaultChannel = "cn", "cn"
+		}
+		if _, exists := slots[slotName]; !exists {
+			if legacySlot, err := openOfficialSlot(dir, vaultChannel, slotName, legacyID, legacyCAFile, legacyCAHex, legacySig); err != nil {
+				return err
+			} else if legacySlot != nil {
+				slots[slotName] = legacySlot
+			}
+		}
+	}
+
+	tok := strings.TrimSpace(*tokenFlag)
+	if *tokenStdin {
+		tok, err = readTokenInput("", true, os.Stdin)
+		if err != nil {
+			return err
+		}
+	}
+	tokens := map[string]string{}
+	if tok != "" {
+		if channel == "cn" || channel == "global" {
+			tokens[channel] = tok
+		} else if len(slots) == 1 {
+			for k := range slots {
+				tokens[k] = tok
+			}
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	var emitter *jsonEmitter
+	if *jsonOutput {
+		emitter = &jsonEmitter{out: os.Stdout}
+	}
+	runDone := make(chan string, 1)
+	var activeRunID string
+	var runMu sync.Mutex
+
+	provider := &ctlProvider{
+		ctx:       ctx,
+		dir:       dir,
+		name:      *name,
+		slots:     slots,
+		tokens:    tokens,
+		selfURL:   resolvedSelfSignal,
+		selfToken: resolvedSelfToken,
+	}
+	rm := remote.NewManager(ctx, provider, func(ev map[string]any) {
+		if action == "run" && ev["type"] == "remote.event" {
+			kind, _ := ev["kind"].(string)
+			runID, _ := ev["run_id"].(string)
+			if emitter != nil {
+				emitter.Emit(ev)
+			} else {
+				printCtlEvent(kind, ev["data"])
+			}
+			runMu.Lock()
+			targetRun := activeRunID
+			runMu.Unlock()
+			if (targetRun == "" || runID == targetRun) &&
+				(kind == "run.completed" || kind == "run.cancelled" || kind == "run.failed") {
+				select {
+				case runDone <- kind:
+				default:
+				}
+			}
+		}
+	})
+	defer rm.Close()
+
+	printJSON := func(v any) error {
+		b, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
+	switch action {
+	case "pair":
+		info, err := rm.Pair(ctx, remote.PairOptions{
+			Channel:     channel,
+			Input:       *inputFlag,
+			SignalURL:   resolvedSelfSignal,
+			SignalToken: resolvedSelfToken,
+			GrantAccess: *grantAccess,
+		})
+		if err != nil {
+			return err
+		}
+		// Give pairnet.state a short moment to arrive so reverse peer info persists.
+		time.Sleep(150 * time.Millisecond)
+		if emitter != nil {
+			emitter.Emit(map[string]any{"type": "remote.paired", "peer": info})
+			return nil
+		}
+		return printJSON(info)
+	case "peers":
+		peers, err := rm.ListPeers(ctx, channel)
+		if err != nil {
+			return err
+		}
+		if emitter != nil {
+			emitter.Emit(map[string]any{"type": "remote.peers", "peers": peers})
+			return nil
+		}
+		return printJSON(peers)
+	default:
+		if strings.TrimSpace(*peerFlag) == "" {
+			return errors.New("-peer is required")
+		}
+		info, err := rm.Connect(ctx, channel, *peerFlag)
+		if err != nil {
+			return err
+		}
+		ch := info.Channel
+		peerID := info.PeerID
+		switch action {
+		case "workspaces":
+			data, err := rm.ListWorkspaces(ctx, ch, peerID)
+			if err != nil {
+				return err
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+				return nil
+			}
+			fmt.Println(string(data))
+			return nil
+		case "sessions":
+			data, err := rm.ListSessions(ctx, ch, peerID)
+			if err != nil {
+				return err
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+				return nil
+			}
+			fmt.Println(string(data))
+			return nil
+		case "create":
+			if strings.TrimSpace(*workspaceFlag) == "" {
+				return errors.New("-workspace is required")
+			}
+			data, err := rm.CreateSession(ctx, ch, peerID, *workspaceFlag, *requestIDFlag, *titleFlag)
+			if err != nil {
+				return err
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+				return nil
+			}
+			fmt.Println(string(data))
+			return nil
+		case "open":
+			if strings.TrimSpace(*sessionFlag) == "" {
+				return errors.New("-session is required")
+			}
+			data, err := rm.OpenSession(ctx, ch, peerID, *sessionFlag)
+			if err != nil {
+				return err
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+				return nil
+			}
+			fmt.Println(string(data))
+			return nil
+		case "cancel":
+			if strings.TrimSpace(*sessionFlag) == "" || strings.TrimSpace(*runFlag) == "" {
+				return errors.New("-session and -run are required")
+			}
+			data, err := rm.CancelRun(ctx, ch, peerID, *sessionFlag, *runFlag)
+			if err != nil {
+				return err
+			}
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+				return nil
+			}
+			fmt.Println(string(data))
+			return nil
+		case "run":
+			if strings.TrimSpace(*sessionFlag) == "" || strings.TrimSpace(*textFlag) == "" {
+				return errors.New("-session and -text are required")
+			}
+			if _, err := rm.OpenSession(ctx, ch, peerID, *sessionFlag); err != nil {
+				return err
+			}
+			data, err := rm.StartRun(ctx, ch, peerID, *sessionFlag, *requestIDFlag, *textFlag)
+			if err != nil {
+				return err
+			}
+			var started struct {
+				RunID string `json:"run_id"`
+			}
+			_ = json.Unmarshal(data, &started)
+			runMu.Lock()
+			activeRunID = started.RunID
+			runMu.Unlock()
+			if emitter != nil {
+				emitter.Emit(map[string]any{"type": "remote.result", "peer_id": peerID, "data": data})
+			}
+			select {
+			case kind := <-runDone:
+				if emitter == nil {
+					fmt.Println()
+				}
+				if kind == "run.failed" {
+					return errors.New("remote run failed")
+				}
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return nil
+}
+
+func printCtlEvent(kind string, raw any) {
+	b, ok := raw.(json.RawMessage)
+	if !ok {
+		return
+	}
+	switch kind {
+	case "text.delta":
+		var d struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(b, &d) == nil {
+			fmt.Print(d.Text)
+		}
+	case "thinking.delta":
+		var d struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(b, &d) == nil {
+			fmt.Fprint(os.Stderr, d.Text)
+		}
+	case "run.failed":
+		fmt.Fprintf(os.Stderr, "\n[run.failed] %s\n", string(b))
+	case "run.cancelled":
+		fmt.Fprintln(os.Stderr, "\n[run.cancelled]")
+	}
+}

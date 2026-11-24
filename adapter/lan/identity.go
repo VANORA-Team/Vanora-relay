@@ -86,6 +86,14 @@ func fingerprint(key ed25519.PublicKey) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+func ClientID(seed string) string {
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(seed)
+	if err != nil || len(raw) != ed25519.SeedSize {
+		return ""
+	}
+	return fingerprint(ed25519.NewKeyFromSeed(raw).Public().(ed25519.PublicKey))
+}
+
 func peerFingerprint(state tls.ConnectionState) string {
 	if len(state.PeerCertificates) != 1 {
 		return ""

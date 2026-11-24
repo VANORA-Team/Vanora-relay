@@ -1,0 +1,1138 @@
+package remote
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"strings"
+	"sync"
+	"time"
+
+	"vanora-relay/adapter/account"
+	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
+	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/pairing"
+	"vanora-relay/internal/pairnet"
+	"vanora-relay/protocol"
+)
+
+var (
+	errSnapshot    = errors.New("snapshot_required")
+	errUnavailable = errors.New("unavailable")
+)
+
+type rpcReply struct {
+	data json.RawMessage
+	err  error
+}
+
+type sessionCursor struct {
+	applied   int64
+	delivered int64
+}
+
+// RemotePeer maintains one authenticated outbound control connection to a
+// single remote desktop, including reconnect, pairnet sync, RPC correlation,
+// and per-session event cursors.
+type RemotePeer struct {
+	manager *Manager
+	channel string
+	peerID  string
+
+	ctx  context.Context
+	stop context.CancelFunc
+
+	op sync.Mutex // serializes dial, reconnect, openSession, resume, disconnect
+
+	mu             sync.Mutex
+	owner          string
+	name           string
+	address        string
+	signalURL      string
+	lanTarget      *lan.Target
+	selfTarget     *selfrelay.Target
+	officialInvite *pairing.Official
+	group          *pairnet.Group
+	socket         *transport.Client
+	ownsSocket     bool
+	peer           transport.Peer
+	wantReconnect  bool
+	connState      string
+	connPath       string
+	connErr        string
+	pending        map[string]chan rpcReply
+	subscriptions  map[string]*sessionCursor
+	lastSynced     pairnet.Roster
+
+	retry chan struct{}
+}
+
+func newRemotePeer(m *Manager, channel, peerID string) *RemotePeer {
+	ctx, stop := context.WithCancel(m.ctx)
+	rp := &RemotePeer{
+		manager:       m,
+		channel:       channel,
+		peerID:        peerID,
+		ctx:           ctx,
+		stop:          stop,
+		connState:     "disconnected",
+		pending:       make(map[string]chan rpcReply),
+		subscriptions: make(map[string]*sessionCursor),
+		retry:         make(chan struct{}, 1),
+	}
+	go rp.recoverLoop()
+	return rp
+}
+
+// Info returns a snapshot of this peer's current metadata and connection state.
+func (rp *RemotePeer) Info() PeerInfo {
+	rp.mu.Lock()
+	info := PeerInfo{
+		PeerID:    rp.peerID,
+		Channel:   rp.channel,
+		Role:      "desktop",
+		Name:      rp.name,
+		Owner:     rp.owner,
+		Address:   rp.address,
+		SignalURL: rp.signalURL,
+		State:     rp.connState,
+		Path:      rp.connPath,
+		Error:     rp.connErr,
+	}
+	p := rp.peer
+	rp.mu.Unlock()
+	if info.State == "connected" && p != nil {
+		if live := peerPath(p); live != "" {
+			info.Path = live
+		}
+	}
+	return info
+}
+
+func (rp *RemotePeer) pairLAN(ctx context.Context, target lan.Target) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.dropLinkLocked()
+	rp.mu.Lock()
+	rp.owner = "lan"
+	rp.address = target.Address
+	rp.lanTarget = &target
+	rp.wantReconnect = true
+	rp.setStateLocked("connecting", "", "")
+	rp.mu.Unlock()
+	err := rp.connectLocked(ctx)
+	if err != nil {
+		if !rp.handleAuthError(err) {
+			signalCh(rp.retry)
+		}
+		return err
+	}
+	return nil
+}
+
+func (rp *RemotePeer) pairSelf(ctx context.Context, target selfrelay.Target) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.dropLinkLocked()
+	rp.mu.Lock()
+	rp.owner = "self"
+	rp.signalURL = target.SignalURL
+	rp.selfTarget = &target
+	rp.wantReconnect = true
+	rp.setStateLocked("connecting", "", "")
+	rp.mu.Unlock()
+	err := rp.connectLocked(ctx)
+	if err != nil {
+		if !rp.handleAuthError(err) {
+			signalCh(rp.retry)
+		}
+		return err
+	}
+	return nil
+}
+
+func (rp *RemotePeer) pairOfficial(ctx context.Context, target pairing.Official) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.dropLinkLocked()
+	rp.mu.Lock()
+	rp.owner = target.Owner
+	rp.signalURL = target.Relay
+	rp.officialInvite = &target
+	rp.wantReconnect = true
+	rp.setStateLocked("connecting", "", "")
+	rp.mu.Unlock()
+	err := rp.connectLocked(ctx)
+	if err != nil {
+		if !rp.handleAuthError(err) {
+			signalCh(rp.retry)
+		}
+		return err
+	}
+	return nil
+}
+
+// ConnectExisting connects using stored pairing network credentials (without an
+// invitation).
+func (rp *RemotePeer) ConnectExisting(ctx context.Context) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.mu.Lock()
+	if rp.peer != nil && rp.peer.Allows(false) {
+		rp.mu.Unlock()
+		return nil
+	}
+	rp.officialInvite = nil
+	rp.wantReconnect = true
+	rp.setStateLocked("connecting", "", "")
+	rp.mu.Unlock()
+	err := rp.connectLocked(ctx)
+	if err != nil {
+		if !rp.handleAuthError(err) {
+			signalCh(rp.retry)
+		}
+		return err
+	}
+	return nil
+}
+
+// Reconnect drops the active link and immediately redials while keeping
+// subscribed session cursors.
+func (rp *RemotePeer) Reconnect(ctx context.Context) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.dropLinkLocked()
+	rp.mu.Lock()
+	rp.wantReconnect = true
+	rp.setStateLocked("reconnecting", "", "")
+	rp.mu.Unlock()
+	err := rp.connectLocked(ctx)
+	if err != nil {
+		if !rp.handleAuthError(err) {
+			signalCh(rp.retry)
+		}
+		return err
+	}
+	return nil
+}
+
+// Disconnect closes the connection and stops background reconnection.
+func (rp *RemotePeer) Disconnect() {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	rp.disconnectLocked()
+}
+
+// Close shuts down this peer permanently.
+func (rp *RemotePeer) Close() {
+	rp.stop()
+	rp.Disconnect()
+}
+
+func (rp *RemotePeer) disconnectLocked() {
+	rp.mu.Lock()
+	rp.wantReconnect = false
+	rp.officialInvite = nil
+	oldPeer := rp.peer
+	oldSock := rp.socket
+	owns := rp.ownsSocket
+	rp.socket = nil
+	rp.ownsSocket = false
+	rp.detachLocked()
+	clear(rp.subscriptions)
+	rp.setStateLocked("disconnected", "", "")
+	rp.mu.Unlock()
+	if oldPeer != nil {
+		oldPeer.Close()
+	}
+	if owns && oldSock != nil {
+		oldSock.Close()
+	}
+}
+
+func (rp *RemotePeer) dropLinkLocked() {
+	rp.mu.Lock()
+	oldPeer := rp.peer
+	oldSock := rp.socket
+	owns := rp.ownsSocket
+	rp.socket = nil
+	rp.ownsSocket = false
+	rp.detachLocked()
+	rp.mu.Unlock()
+	if oldPeer != nil {
+		oldPeer.Close()
+	}
+	if owns && oldSock != nil {
+		oldSock.Close()
+	}
+}
+
+func (rp *RemotePeer) connectLocked(ctx context.Context) error {
+	p, start, group, err := rp.dialPeer(ctx)
+	if err != nil {
+		rp.mu.Lock()
+		if rp.wantReconnect {
+			rp.setStateLocked("reconnecting", "", err.Error())
+		} else {
+			rp.setStateLocked("disconnected", "", err.Error())
+		}
+		rp.mu.Unlock()
+		return err
+	}
+	rp.mu.Lock()
+	if !p.Allows(true) {
+		rp.setStateLocked("reconnecting", "", "desktop authorization expired")
+		rp.mu.Unlock()
+		p.Close()
+		return errors.New("desktop authorization expired")
+	}
+	rp.peer = p
+	rp.group = group
+	rp.setStateLocked("connected", peerPath(p), "")
+	resume := make(map[string]int64, len(rp.subscriptions))
+	for id, cur := range rp.subscriptions {
+		resume[id] = cur.applied
+	}
+	rp.mu.Unlock()
+
+	if start != nil {
+		start()
+	}
+	if group != nil {
+		if err := rp.syncPeer(p, group); err != nil {
+			p.Close()
+			return err
+		}
+	}
+	for id, seq := range resume {
+		if _, err := rp.subscribe(ctx, p, id, seq); err != nil {
+			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
+				rp.mu.Lock()
+				delete(rp.subscriptions, id)
+				rp.mu.Unlock()
+				rp.emitSubError(id, err.Error())
+				continue
+			}
+			p.Close()
+			return err
+		}
+	}
+	return nil
+}
+
+func (rp *RemotePeer) dialPeer(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+	switch rp.channel {
+	case ChannelLAN:
+		return rp.dialLAN(ctx)
+	case ChannelSelf:
+		return rp.dialSelf(ctx)
+	case ChannelCN, ChannelGlobal:
+		return rp.dialOfficial(ctx)
+	default:
+		return nil, nil, nil, fmt.Errorf("remote: unsupported channel %q", rp.channel)
+	}
+}
+
+func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+	lanCh, err := rp.manager.provider.LAN()
+	if err != nil || lanCh == nil || lanCh.Server == nil {
+		if err == nil {
+			err = errors.New("remote: LAN channel unavailable")
+		}
+		return nil, nil, nil, err
+	}
+	group := lanCh.Server.Network()
+	rp.mu.Lock()
+	var target lan.Target
+	if rp.lanTarget != nil {
+		target = *rp.lanTarget
+	}
+	rp.mu.Unlock()
+
+	if target.Pin == "" {
+		mem, ok := group.Get(rp.peerID)
+		if !ok || mem.Role != "desktop" || !group.Allows(rp.peerID) || mem.Address == "" {
+			return nil, nil, nil, lan.ErrUnpaired
+		}
+		target = lan.Target{Address: mem.Address, Pin: mem.Pin}
+	} else if target.Token == "" {
+		if mem, ok := group.Get(rp.peerID); ok {
+			if !group.Allows(rp.peerID) {
+				return nil, nil, nil, lan.ErrUnpaired
+			}
+			if mem.Address != "" {
+				target.Address = mem.Address
+			}
+		}
+	}
+
+	localName := rp.manager.desktopName()
+	localAddr := lanCh.Server.Address()
+	p, start, err := lan.DialWithOptions(rp.ctx, target, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	invited := target.Token != ""
+	localMem := pairnet.Member{ID: lanCh.Server.Pin(), Pin: lanCh.Server.Pin(), Role: "desktop", Name: localName, Address: localAddr}
+	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop", Address: target.Address}
+	if err := group.Admit(localMem, remoteMem, invited); err != nil {
+		p.Close()
+		return nil, nil, nil, err
+	}
+	target.Token = ""
+	rp.mu.Lock()
+	rp.owner = "lan"
+	rp.address = target.Address
+	rp.lanTarget = &target
+	if mem, ok := group.Get(rp.peerID); ok && mem.Name != "" {
+		rp.name = mem.Name
+	}
+	rp.mu.Unlock()
+	return p, start, group, nil
+}
+
+func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+	selfCh, err := rp.manager.provider.Self()
+	if err != nil || selfCh == nil || selfCh.Server == nil {
+		if err == nil {
+			err = errors.New("remote: self-hosted relay unavailable")
+		}
+		return nil, nil, nil, err
+	}
+	rp.mu.Lock()
+	var target selfrelay.Target
+	if rp.selfTarget != nil {
+		target = *rp.selfTarget
+	}
+	rp.mu.Unlock()
+
+	if target.SignalURL == "" {
+		sig := strings.TrimSpace(selfCh.SignalURL)
+		tok := strings.TrimSpace(selfCh.Token)
+		prof := selfCh.Server.Profile()
+		if sig == "" {
+			sig = strings.TrimSpace(prof.Service)
+		}
+		if tok == "" && (prof.Service == "" || prof.Service == sig) {
+			tok = strings.TrimSpace(prof.Token)
+		}
+		if sig == "" {
+			return nil, nil, nil, selfrelay.ErrUnpaired
+		}
+		sig, err = selfrelay.NormalizeSignalURL(sig)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		target.SignalURL = sig
+		target.Token = tok
+	}
+	if target.Token == "" {
+		if tok := strings.TrimSpace(selfCh.Token); tok != "" {
+			target.Token = tok
+		} else if prof := selfCh.Server.Profile(); prof.Service == target.SignalURL && prof.Token != "" {
+			target.Token = prof.Token
+		}
+	}
+	group, localMem, err := selfCh.Server.GroupFor(target.SignalURL, rp.manager.desktopName())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if target.Pin == "" {
+		mem, ok := group.Get(rp.peerID)
+		if !ok || mem.Role != "desktop" || !group.Allows(rp.peerID) {
+			return nil, nil, nil, selfrelay.ErrUnpaired
+		}
+		target.Pin = mem.Pin
+	} else if target.Pair == "" && !group.Allows(rp.peerID) {
+		return nil, nil, nil, selfrelay.ErrUnpaired
+	}
+
+	localName := rp.manager.desktopName()
+	p, start, err := selfrelay.DialWithRole(rp.ctx, target, selfCh.Server.Seed(), localName, "desktop", (*peerHandler)(rp))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	invited := target.Pair != ""
+	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop"}
+	if err := group.Admit(localMem, remoteMem, invited); err != nil {
+		p.Close()
+		return nil, nil, nil, err
+	}
+	_ = selfCh.Server.SetProfile(pairnet.Profile{Service: target.SignalURL, Token: target.Token, Name: localName})
+	target.Pair = ""
+	rp.mu.Lock()
+	rp.owner = "self"
+	rp.signalURL = target.SignalURL
+	rp.selfTarget = &target
+	if mem, ok := group.Get(rp.peerID); ok && mem.Name != "" {
+		rp.name = mem.Name
+	}
+	rp.mu.Unlock()
+	return p, start, group, nil
+}
+
+func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+	occ, err := rp.manager.provider.Official(rp.channel)
+	if err != nil || occ == nil || occ.Account == nil || occ.SignalURL == "" {
+		if err == nil {
+			err = fmt.Errorf("remote: official channel %s is not configured", rp.channel)
+		}
+		return nil, nil, nil, err
+	}
+	group, localMem := occ.Account.PairingIdentity(occ.SignalURL, "desktop")
+	localMem.Name = rp.manager.desktopName()
+
+	rp.mu.Lock()
+	invite := rp.officialInvite
+	owner := rp.owner
+	rp.mu.Unlock()
+
+	var pin, token []byte
+	if invite != nil {
+		pin, token = invite.Pin, invite.Token
+		owner = invite.Owner
+	} else {
+		var pinB64 string
+		if group != nil {
+			if mem, ok := group.Get(rp.peerID); ok {
+				if mem.Role != "desktop" || !group.Allows(rp.peerID) {
+					return nil, nil, nil, pairing.ErrInvalid
+				}
+				owner = mem.Owner
+				pinB64 = mem.Pin
+			}
+		}
+		if pinB64 == "" {
+			bound, ok := occ.Account.PairedPeer(rp.peerID)
+			if !ok {
+				return nil, nil, nil, pairing.ErrInvalid
+			}
+			owner = bound.Owner
+			pinB64 = bound.Pin
+		}
+		pin, err = decodePin32(pinB64)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	sock, owns, err := rp.acquireOfficialSocket(ctx, occ)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	dialCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+	defer stop()
+	p, err := sock.ConnectPairedWithOptions(dialCtx, rp.peerID, owner, transport.ConnectOptions{
+		Pin:     pin,
+		Token:   token,
+		Role:    transport.RoleDesktop,
+		Name:    localMem.Name,
+		Handler: (*peerHandler)(rp),
+	})
+	if err != nil {
+		if owns {
+			sock.Close()
+		}
+		return nil, nil, nil, err
+	}
+
+	// Re-fetch PairingIdentity in case enrollment finished during dial.
+	if group == nil {
+		group, localMem = occ.Account.PairingIdentity(occ.SignalURL, "desktop")
+		localMem.Name = rp.manager.desktopName()
+	}
+	pinB64 := base64.RawURLEncoding.EncodeToString(pin)
+	if group != nil {
+		remoteMem := pairnet.Member{ID: rp.peerID, Pin: pinB64, Owner: owner, Role: "desktop"}
+		if err := group.Admit(localMem, remoteMem, invite != nil); err != nil {
+			p.Close()
+			if owns {
+				sock.Close()
+			}
+			return nil, nil, nil, err
+		}
+	}
+	if err := occ.Account.BindNetworkPeer(group, rp.peerID, account.PeerBinding{Owner: owner, Pin: pinB64}); err != nil {
+		p.Close()
+		if owns {
+			sock.Close()
+		}
+		return nil, nil, nil, err
+	}
+
+	rp.mu.Lock()
+	rp.socket = sock
+	rp.ownsSocket = owns
+	rp.owner = owner
+	rp.signalURL = occ.SignalURL
+	rp.officialInvite = nil
+	if group != nil {
+		if mem, ok := group.Get(rp.peerID); ok && mem.Name != "" {
+			rp.name = mem.Name
+		}
+	}
+	rp.mu.Unlock()
+	return p, nil, group, nil
+}
+
+func (rp *RemotePeer) acquireOfficialSocket(ctx context.Context, occ *OfficialChannel) (*transport.Client, bool, error) {
+	if occ.LiveSocket != nil {
+		if live := occ.LiveSocket(); live != nil {
+			select {
+			case <-live.Done():
+			default:
+				return live, false, nil
+			}
+		}
+	}
+	rp.mu.Lock()
+	existing := rp.socket
+	owns := rp.ownsSocket
+	rp.mu.Unlock()
+	if owns && existing != nil {
+		select {
+		case <-existing.Done():
+			existing.Close()
+		default:
+			return existing, true, nil
+		}
+	}
+	source := occ.Source
+	if source == nil {
+		source = occ.Account
+	}
+	sock, err := transport.DialDesktopControllerFor(ctx, occ.SignalURL, rp.peerID, source, (*peerHandler)(rp))
+	if err != nil {
+		return nil, false, err
+	}
+	return sock, true, nil
+}
+
+func (rp *RemotePeer) recoverLoop() {
+	for {
+		select {
+		case <-rp.ctx.Done():
+			return
+		case <-rp.retry:
+		}
+		for delay := time.Second; ; delay = min(delay*2, 15*time.Second) {
+			timer := time.NewTimer(delay)
+			select {
+			case <-rp.ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			rp.op.Lock()
+			rp.mu.Lock()
+			want := rp.wantReconnect && rp.peer == nil
+			rp.mu.Unlock()
+			var err error
+			if want {
+				err = rp.connectLocked(rp.ctx)
+			}
+			rp.op.Unlock()
+			if !want || err == nil || rp.handleAuthError(err) {
+				break
+			}
+		}
+	}
+}
+
+func (rp *RemotePeer) onNetworkChanged(group *pairnet.Group) {
+	rp.mu.Lock()
+	p := rp.peer
+	if group != nil {
+		rp.group = group
+		if mem, ok := group.Get(rp.peerID); ok {
+			if mem.Name != "" {
+				rp.name = mem.Name
+			}
+			if mem.Address != "" {
+				rp.address = mem.Address
+			}
+		}
+	}
+	rp.mu.Unlock()
+	if group == nil {
+		return
+	}
+	if !group.Allows(rp.peerID) || !group.Allows(group.Self()) {
+		if p != nil {
+			_ = rp.syncPeer(p, group)
+		}
+		rp.mu.Lock()
+		rp.wantReconnect = false
+		rp.mu.Unlock()
+		if p != nil {
+			p.Close()
+		}
+		return
+	}
+	if p != nil {
+		_ = rp.syncPeer(p, group)
+	}
+}
+
+func (rp *RemotePeer) syncPeer(p transport.Peer, g *pairnet.Group) error {
+	snap := g.Snapshot()
+	rp.mu.Lock()
+	if rp.peer == p && maps.Equal(rp.lastSynced, snap) {
+		rp.mu.Unlock()
+		return nil
+	}
+	rp.lastSynced = snap
+	rp.mu.Unlock()
+	return p.Send(protocol.Encode(transport.NetworkFrame{Type: "pairnet.sync", Members: snap}), true)
+}
+
+func (rp *RemotePeer) detachLocked() {
+	rp.peer = nil
+	rp.lastSynced = nil
+	for id, ch := range rp.pending {
+		ch <- rpcReply{err: errors.New("connection lost")}
+		delete(rp.pending, id)
+	}
+	for _, cur := range rp.subscriptions {
+		cur.delivered = cur.applied
+	}
+}
+
+func (rp *RemotePeer) setStateLocked(state, path, errMsg string) {
+	if rp.connState == state && rp.connPath == path && rp.connErr == errMsg {
+		return
+	}
+	rp.connState = state
+	rp.connPath = path
+	rp.connErr = errMsg
+	owner := rp.owner
+	name := rp.name
+	rp.manager.emit(map[string]any{
+		"type":    "remote.connection.state",
+		"peer_id": rp.peerID,
+		"channel": rp.channel,
+		"owner":   owner,
+		"name":    name,
+		"state":   state,
+		"path":    path,
+		"error":   errMsg,
+	})
+}
+
+func (rp *RemotePeer) handleAuthError(err error) bool {
+	var closed *transport.ClosedError
+	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired) ||
+		errors.Is(err, pairing.ErrInvalid) || errors.Is(err, pairnet.ErrRemoved) ||
+		(errors.As(err, &closed) && (closed.Reason == "access_denied" || closed.Reason == "access_revoked"))
+	relayTokenInvalid := errors.Is(err, selfrelay.ErrUnauthorized)
+	loginRequired := isLoginRequiredError(err)
+	if !pairingRequired && !relayTokenInvalid && !loginRequired {
+		return false
+	}
+	rp.mu.Lock()
+	rp.wantReconnect = false
+	rp.setStateLocked("disconnected", "", err.Error())
+	rp.mu.Unlock()
+	eventType, state := "remote.auth.state", "login_required"
+	if pairingRequired {
+		eventType, state = "remote.access.state", "pairing_required"
+	} else if relayTokenInvalid {
+		eventType, state = "remote.access.state", "relay_token_invalid"
+	}
+	rp.manager.emit(map[string]any{
+		"type":    eventType,
+		"peer_id": rp.peerID,
+		"channel": rp.channel,
+		"state":   state,
+		"error":   err.Error(),
+	})
+	return true
+}
+
+func isLoginRequiredError(err error) bool {
+	return errors.Is(err, account.ErrNotEnrolled) ||
+		errors.Is(err, account.ErrExpired) ||
+		errors.Is(err, account.ErrCredential) ||
+		errors.Is(err, account.ErrStateInvalid) ||
+		errors.Is(err, account.ErrAuthorityChanged)
+}
+
+func (rp *RemotePeer) emitSubError(sessionID, code string) {
+	rp.manager.emit(map[string]any{
+		"type":       "remote.subscription.error",
+		"peer_id":    rp.peerID,
+		"channel":    rp.channel,
+		"session_id": sessionID,
+		"code":       code,
+	})
+}
+
+type peerHandler RemotePeer
+
+func (h *peerHandler) Open(transport.Peer) {}
+
+func (h *peerHandler) Closed(p transport.Peer) {
+	rp := (*RemotePeer)(h)
+	rp.mu.Lock()
+	if rp.peer == p {
+		rp.detachLocked()
+		if rp.wantReconnect {
+			rp.setStateLocked("reconnecting", "", "connection lost")
+			signalCh(rp.retry)
+		} else {
+			rp.setStateLocked("disconnected", "", "")
+		}
+	}
+	rp.mu.Unlock()
+}
+
+func (h *peerHandler) Message(p transport.Peer, b []byte) {
+	rp := (*RemotePeer)(h)
+	var m struct {
+		Type     string          `json:"type"`
+		ID       string          `json:"request_id"`
+		Data     json.RawMessage `json:"data"`
+		Code     string          `json:"code"`
+		Session  string          `json:"session_id"`
+		RunID    string          `json:"run_id"`
+		Seq      int64           `json:"seq"`
+		Kind     string          `json:"kind"`
+		Members  pairnet.Roster  `json:"members"`
+		Receiver bool            `json:"receiver"`
+		Epoch    uint64          `json:"epoch"`
+	}
+	if json.Unmarshal(b, &m) != nil {
+		p.Close()
+		return
+	}
+	rp.mu.Lock()
+	if rp.peer != p {
+		rp.mu.Unlock()
+		return
+	}
+	group := rp.group
+	switch m.Type {
+	case "pairnet.state":
+		rp.mu.Unlock()
+		if group == nil {
+			p.Close()
+			return
+		}
+		changed, err := group.Merge(rp.peerID, m.Members)
+		if err != nil || !group.Allows(rp.peerID) || !group.Allows(group.Self()) {
+			rp.handleAuthError(pairnet.ErrRemoved)
+			if changed {
+				go rp.manager.notifyNetworkChanged(rp.channel, rp.peerID)
+			}
+			p.Close()
+			return
+		}
+		if mem, ok := group.Get(rp.peerID); ok {
+			rp.mu.Lock()
+			if mem.Name != "" {
+				rp.name = mem.Name
+			}
+			if mem.Address != "" {
+				rp.address = mem.Address
+			}
+			rp.mu.Unlock()
+		}
+		if changed {
+			go rp.manager.notifyNetworkChanged(rp.channel, rp.peerID)
+		}
+		return
+	case "pairnet.removed":
+		rp.mu.Unlock()
+		if group != nil {
+			changed, _ := group.ReceiveRemoval(rp.peerID, m.Receiver, m.Epoch)
+			if changed {
+				go rp.manager.notifyNetworkChanged(rp.channel, rp.peerID)
+			}
+		}
+		rp.handleAuthError(pairnet.ErrRemoved)
+		p.Close()
+		return
+	case "result", "error":
+		if ch := rp.pending[m.ID]; ch != nil {
+			var err error
+			if m.Type == "error" {
+				err = errors.New(m.Code)
+				switch m.Code {
+				case "snapshot_required":
+					err = errSnapshot
+				case "unavailable":
+					err = errUnavailable
+				}
+			}
+			ch <- rpcReply{m.Data, err}
+			delete(rp.pending, m.ID)
+		}
+		rp.mu.Unlock()
+		return
+	case "event":
+		cur := rp.subscriptions[m.Session]
+		if cur != nil && m.Seq > cur.delivered {
+			if m.Seq != cur.delivered+1 {
+				delete(rp.subscriptions, m.Session)
+				rp.mu.Unlock()
+				rp.emitSubError(m.Session, errSnapshot.Error())
+				return
+			}
+			cur.delivered = m.Seq
+			rp.mu.Unlock()
+			ev := map[string]any{
+				"type":       "remote.event",
+				"peer_id":    rp.peerID,
+				"channel":    rp.channel,
+				"session_id": m.Session,
+				"seq":        m.Seq,
+				"kind":       m.Kind,
+			}
+			if m.RunID != "" {
+				ev["run_id"] = m.RunID
+			}
+			if len(m.Data) > 0 {
+				ev["data"] = m.Data
+			}
+			rp.manager.emit(ev)
+			return
+		}
+		rp.mu.Unlock()
+		return
+	default:
+		rp.mu.Unlock()
+		p.Close()
+	}
+}
+
+// Business RPC methods mirroring mobile/requests.go.
+
+func (rp *RemotePeer) currentPeer() (transport.Peer, error) {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	if rp.peer == nil {
+		return nil, errors.New("remote: desktop disconnected")
+	}
+	return rp.peer, nil
+}
+
+func (rp *RemotePeer) request(ctx context.Context, p transport.Peer, req map[string]any, online bool) (json.RawMessage, error) {
+	id, _ := req["request_id"].(string)
+	if id == "" || len(id) > 128 {
+		return nil, errors.New("request_id must be 1..128 bytes")
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan rpcReply, 1)
+	rp.mu.Lock()
+	if rp.peer != p || len(rp.pending) >= 32 || rp.pending[id] != nil {
+		rp.mu.Unlock()
+		return nil, errors.New("remote: desktop disconnected, busy, or request already pending")
+	}
+	rp.pending[id] = ch
+	rp.mu.Unlock()
+	defer func() {
+		rp.mu.Lock()
+		if rp.pending[id] == ch {
+			delete(rp.pending, id)
+		}
+		rp.mu.Unlock()
+	}()
+	if err := p.Send(body, online); err != nil {
+		return nil, err
+	}
+	timer := time.NewTimer(20 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-rp.ctx.Done():
+		return nil, rp.ctx.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("remote: desktop response timeout")
+	case r := <-ch:
+		return r.data, r.err
+	}
+}
+
+func (rp *RemotePeer) subscribe(ctx context.Context, p transport.Peer, sessionID string, afterSeq int64) (json.RawMessage, error) {
+	if afterSeq < 0 || sessionID == "" {
+		return nil, errors.New("session_id and nonnegative after_seq required")
+	}
+	rp.mu.Lock()
+	if len(rp.subscriptions) >= 64 && rp.subscriptions[sessionID] == nil {
+		rp.mu.Unlock()
+		return nil, errors.New("too many open sessions")
+	}
+	rp.subscriptions[sessionID] = &sessionCursor{applied: afterSeq, delivered: afterSeq}
+	rp.mu.Unlock()
+	data, err := rp.request(ctx, p, map[string]any{
+		"type":       "events.resume",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+		"after_seq":  afterSeq,
+	}, false)
+	if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
+		rp.mu.Lock()
+		delete(rp.subscriptions, sessionID)
+		rp.mu.Unlock()
+	}
+	return data, err
+}
+
+func (rp *RemotePeer) ListWorkspaces(ctx context.Context) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	return rp.request(ctx, p, map[string]any{"type": "workspace.list", "request_id": NewRequestID()}, false)
+}
+
+func (rp *RemotePeer) CreateSession(ctx context.Context, workspaceID, requestID, title string) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	if requestID == "" {
+		requestID = NewRequestID()
+	}
+	return rp.request(ctx, p, map[string]any{
+		"type":         "session.create",
+		"request_id":   requestID,
+		"workspace_id": workspaceID,
+		"title":        title,
+	}, true)
+}
+
+func (rp *RemotePeer) ListSessions(ctx context.Context) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	return rp.request(ctx, p, map[string]any{"type": "session.list", "request_id": NewRequestID()}, false)
+}
+
+func (rp *RemotePeer) OpenSession(ctx context.Context, sessionID string) (json.RawMessage, error) {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	data, err := rp.request(ctx, p, map[string]any{
+		"type":       "session.open",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+	}, false)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot struct {
+		Last *int64 `json:"last_seq"`
+	}
+	if json.Unmarshal(data, &snapshot) != nil || snapshot.Last == nil || *snapshot.Last < 0 {
+		return nil, errors.New("remote: invalid desktop snapshot")
+	}
+	if _, err := rp.subscribe(ctx, p, sessionID, *snapshot.Last); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (rp *RemotePeer) Resume(ctx context.Context, sessionID string, afterSeq int64) error {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	p, err := rp.currentPeer()
+	if err != nil {
+		return err
+	}
+	_, err = rp.subscribe(ctx, p, sessionID, afterSeq)
+	return err
+}
+
+func (rp *RemotePeer) Acknowledge(sessionID string, seq int64) error {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	cur := rp.subscriptions[sessionID]
+	if cur == nil || seq < 0 || seq > cur.delivered {
+		return errors.New("cursor was not delivered")
+	}
+	cur.applied = max(cur.applied, seq)
+	return nil
+}
+
+func (rp *RemotePeer) StartRun(ctx context.Context, sessionID, requestID, text string) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	if requestID == "" {
+		requestID = NewRequestID()
+	}
+	return rp.request(ctx, p, map[string]any{
+		"type":       "run.start",
+		"request_id": requestID,
+		"session_id": sessionID,
+		"text":       text,
+	}, true)
+}
+
+func (rp *RemotePeer) CancelRun(ctx context.Context, sessionID, runID string) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	return rp.request(ctx, p, map[string]any{
+		"type":       "run.cancel",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+		"run_id":     runID,
+	}, true)
+}
+
+func (rp *RemotePeer) RespondUI(ctx context.Context, sessionID, runID, uiID string, payload UIResponse) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	req := map[string]any{
+		"type":       "ui.respond",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+		"run_id":     runID,
+		"ui_id":      uiID,
+	}
+	if payload.Cancelled {
+		req["cancelled"] = true
+	}
+	if payload.Confirmed != nil {
+		req["confirmed"] = *payload.Confirmed
+	}
+	if payload.Value != nil {
+		req["value"] = *payload.Value
+	}
+	if payload.Answers != nil {
+		req["answers"] = payload.Answers
+	}
+	return rp.request(ctx, p, req, true)
+}
+
+func peerPath(p transport.Peer) string {
+	if pr, ok := p.(transport.PathReporter); ok {
+		return pr.Path()
+	}
+	return "unknown"
+}
+
+func signalCh(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}

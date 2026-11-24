@@ -69,21 +69,25 @@ func (r *relayConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (r *relayConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if key, ok := relayAddrPort(addr); ok && key.Addr() == r.srv.publicIP {
-		if dst := r.srv.localRelay(key); dst != nil {
-			owner := r.ownerGrant()
-			if owner == nil || dst.ownerGrant() != owner {
+	if key, ok := relayAddrPort(addr); ok {
+		if key.Addr() == r.srv.publicIP {
+			if dst := r.srv.localRelay(key); dst != nil {
+				owner := r.ownerGrant()
+				if owner == nil || dst.ownerGrant() != owner {
+					return 0, errRelayPeerDenied
+				}
+
+				// Hairpin within one connection: the receiving allocation counts
+				// the datagram when it reads it, so it is credited exactly once.
+				return r.PacketConn.WriteTo(p, addr)
+			}
+			if !r.srv.allowUnsafePeers {
+				// Permissions are per IP, so allowing the server's own address
+				// would expose every other service listening on it. Only relay
+				// sockets of this grant may be reached there.
 				return 0, errRelayPeerDenied
 			}
-
-			// Hairpin within one connection: the receiving allocation counts
-			// the datagram when it reads it, so it is credited exactly once.
-			return r.PacketConn.WriteTo(p, addr)
-		}
-		if !r.srv.allowUnsafePeers {
-			// Permissions are per IP, so allowing the server's own address
-			// would expose every other service listening on it. Only relay
-			// sockets of this grant may be reached there.
+		} else if !r.srv.allowUnsafePeers && r.srv.isLocalHostAddr(key.Addr()) {
 			return 0, errRelayPeerDenied
 		}
 	}
@@ -213,16 +217,36 @@ func (s *Server) authenticate(username, _ string, _ net.Addr) ([]byte, bool) {
 	return g.key, true
 }
 
-func (s *Server) quota(username, _ string, _ net.Addr) bool {
+const pendingAllocTTL = 5 * time.Second
+
+func (s *Server) quota(username, _ string, srcAddr net.Addr) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	g := s.byUsername[username]
-	if g == nil || s.closed || !time.Now().Before(g.until) {
+	if g == nil || s.closed || !now.Before(g.until) {
 		return false
 	}
+	g.prunePendingLocked(now)
 
-	return len(g.allocations) < s.maxAllocationsPerGrant
+	srcKey := ""
+	if srcAddr != nil {
+		srcKey = srcAddr.String()
+	}
+	pending := len(g.pendingAllocs)
+	if srcKey != "" {
+		if _, dup := g.pendingAllocs[srcKey]; dup {
+			pending--
+		}
+	}
+	if len(g.allocations)+pending >= s.maxAllocationsPerGrant {
+		return false
+	}
+	if srcKey != "" {
+		g.pendingAllocs[srcKey] = now.Add(pendingAllocTTL)
+	}
+	return true
 }
 
 func (s *Server) allocationCreated(
@@ -237,7 +261,10 @@ func (s *Server) allocationCreated(
 	s.mu.Lock()
 	rc := s.relays[relayKey]
 	g := s.byUsername[username]
-	if rc == nil || g == nil || s.closed || !time.Now().Before(g.until) {
+	if g != nil && srcAddr != nil {
+		delete(g.pendingAllocs, srcAddr.String())
+	}
+	if rc == nil || g == nil || s.closed || !time.Now().Before(g.until) || len(g.allocations) >= s.maxAllocationsPerGrant {
 		s.mu.Unlock()
 		if rc != nil {
 			_ = rc.Close()

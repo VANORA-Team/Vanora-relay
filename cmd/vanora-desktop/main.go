@@ -28,6 +28,7 @@ import (
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairnet"
 )
 
 // Optional build-time defaults injected via -ldflags when embedding
@@ -141,11 +142,14 @@ func openOfficialSlot(dir, vaultChannel, name, identityURL, caFile, caHexFlag, s
 }
 
 func run(args []string) error {
-	const usage = "usage: vanora-desktop login|serve|whoami|status|logout [-channel cn|global|self -identity URL -ca FILE|-ca-hex HEX -signal WSS_URL -cn-identity URL -cn-ca FILE|-cn-ca-hex HEX -cn-signal WSS_URL -global-identity URL -global-ca FILE|-global-ca-hex HEX -global-signal WSS_URL -self-signal WSS_URL -self-token TOKEN -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
+	const usage = "usage: vanora-desktop login|serve|whoami|status|logout|ctl [-channel cn|global|self -identity URL -ca FILE|-ca-hex HEX -signal WSS_URL -cn-identity URL -cn-ca FILE|-cn-ca-hex HEX -cn-signal WSS_URL -global-identity URL -global-ca FILE|-global-ca-hex HEX -global-signal WSS_URL -self-signal WSS_URL -self-token TOKEN -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
 	cmd := args[0]
+	if cmd == "ctl" {
+		return runCtl(args[1:])
+	}
 	switch cmd {
 	case "login", "serve", "whoami", "status", "logout":
 	default:
@@ -480,6 +484,10 @@ type authority struct {
 	mu      sync.Mutex
 }
 
+func (s *authority) PairingIdentity(scope, role string) (*pairnet.Group, pairnet.Member) {
+	return s.account.PairingIdentity(scope, role)
+}
+
 func (s *authority) Current(ctx context.Context) (*endpoint.Credentials, endpoint.LeaseProof, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -596,10 +604,11 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 			continue
 		}
 		slot := &officialSlot{
-			name:    k,
-			account: sc.account,
-			ca:      sc.ca,
-			url:     sc.signalURL,
+			name:        k,
+			desktopName: name,
+			account:     sc.account,
+			ca:          sc.ca,
+			url:         sc.signalURL,
 		}
 		if options.tokens != nil {
 			slot.token = strings.TrimSpace(options.tokens[k])
@@ -622,6 +631,7 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		selfURL:          strings.TrimSpace(options.selfURL),
 		selfToken:        strings.TrimSpace(options.selfToken),
 	}
+	access.initRemote()
 	if options.relayEnabled && options.activeChannel != "" {
 		access.activeChannel = options.activeChannel
 	}
@@ -684,45 +694,56 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 			"device_id":      access.deviceID(),
 			"name":           strings.TrimSpace(name),
 		}
-		// Watch parent stdin: EOF shuts down the sidecar cleanly so parent exit
-		// never leaves an orphaned process. JSONL control commands are also handled.
-		go func() {
-			scanner := bufio.NewScanner(os.Stdin)
-			scanner.Buffer(make([]byte, 0, 4096), 64<<10)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" {
-					continue
-				}
-				var cmd accessCommand
-				if json.Unmarshal([]byte(line), &cmd) != nil {
-					continue
-				}
-				switch cmd.Type {
-				case "shutdown":
-					cancel()
-					return
-				case "reload":
-					select {
-					case reloadNow <- struct{}{}:
-					default:
-					}
-				case "status":
-					emitter.Emit(map[string]any{
-						"type":           "status",
-						"active_channel": access.currentChannel(),
-						"online":         access.isOnline(),
-						"user_id":        access.userID(),
-						"device_id":      access.deviceID(),
-					})
-				default:
-					access.command(cmd)
-				}
-			}
-			cancel()
-		}()
 		emitter.Emit(ready)
 	}
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 0, 4096), 64<<10)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var cmd accessCommand
+			if json.Unmarshal([]byte(line), &cmd) != nil {
+				continue
+			}
+			if !sidecar &&
+				!strings.HasPrefix(cmd.Type, "access.relay.invite.") &&
+				!strings.HasPrefix(cmd.Type, "access.relay.client") &&
+				!strings.HasPrefix(cmd.Type, "access.network.") &&
+				!strings.HasPrefix(cmd.Type, "access.invite.") &&
+				cmd.Type != "access.client.access.set" &&
+				!strings.HasPrefix(cmd.Type, "remote.") {
+				continue
+			}
+			switch {
+			case cmd.Type == "shutdown":
+				cancel()
+				return
+			case cmd.Type == "reload":
+				select {
+				case reloadNow <- struct{}{}:
+				default:
+				}
+			case cmd.Type == "status":
+				emitter.Emit(map[string]any{
+					"type":           "status",
+					"active_channel": access.currentChannel(),
+					"online":         access.isOnline(),
+					"user_id":        access.userID(),
+					"device_id":      access.deviceID(),
+				})
+			case strings.HasPrefix(cmd.Type, "remote."):
+				go access.remoteCommand(cmd)
+			default:
+				access.command(cmd)
+			}
+		}
+		if sidecar {
+			cancel()
+		}
+	}()
 	access.mu.Lock()
 	_ = access.startActiveWANLocked()
 	access.mu.Unlock()

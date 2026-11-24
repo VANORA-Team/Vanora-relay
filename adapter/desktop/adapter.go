@@ -439,7 +439,7 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 		}
 		if d.visibility != "" {
 			allowed := sr.cfg.canSeeEvent(user, d.visibility)
-			if allowed && d.visibility == visApproval && d.approvalUser != "" && !sr.cfg.owns(user) && user != d.approvalUser {
+			if allowed && d.visibility == visApproval && !sr.cfg.owns(user) && (d.approvalUser == "" || user != d.approvalUser) {
 				allowed = false
 			}
 			if !allowed {
@@ -1110,6 +1110,7 @@ func (a *Adapter) appendEventVisibleLocked(sr *sessionRuntime, runID, kind strin
 		Data:           raw,
 		RequiresOnline: requiresOnline,
 		Visibility:     visibility,
+		ApprovalUser:   approvalUser,
 	}
 	sr.ps.appendEvent(e)
 	sr.ps.trim(a.cfg.retention)

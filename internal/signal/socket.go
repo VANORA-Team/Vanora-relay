@@ -8,12 +8,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairing"
 	"vanora-relay/protocol"
 )
 
@@ -36,6 +40,7 @@ func writeMessage(ctx context.Context, ws *websocket.Conn, m protocol.Message) e
 }
 
 type loginBody struct {
+	Desktop   string `json:"desktop,omitempty"`
 	Role      string `json:"role"`
 	Lease     string `json:"lease,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
@@ -54,9 +59,58 @@ func (h *Hub) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(h.accessToken[:], presented[:]) == 1
 }
 
+func remoteIPAddr(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = strings.TrimSpace(remoteAddr)
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap().String()
+	}
+	return host
+}
+
+func (h *Hub) acquirePreAuth(ip string) (func(), int) {
+	h.preAuthMu.Lock()
+	if ip != "" && h.preAuthByIP[ip] >= maxPreAuthPerIP {
+		h.preAuthMu.Unlock()
+		return nil, http.StatusTooManyRequests
+	}
+	select {
+	case h.preAuthSlots <- struct{}{}:
+	default:
+		h.preAuthMu.Unlock()
+		return nil, http.StatusServiceUnavailable
+	}
+	if ip != "" {
+		h.preAuthByIP[ip]++
+	}
+	h.preAuthMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if ip != "" {
+				h.preAuthMu.Lock()
+				if n := h.preAuthByIP[ip] - 1; n <= 0 {
+					delete(h.preAuthByIP, ip)
+				} else {
+					h.preAuthByIP[ip] = n
+				}
+				h.preAuthMu.Unlock()
+			}
+			<-h.preAuthSlots
+		})
+	}, 0
+}
+
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost || (r.Method == http.MethodGet && r.URL.Query().Has("pairing")) {
+		h.servePairing(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", 405)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if h.requireToken && !h.authorized(r) {
@@ -64,13 +118,13 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid relay token", http.StatusUnauthorized)
 		return
 	}
-	select {
-	case h.slots <- struct{}{}:
-		defer func() { <-h.slots }()
-	default:
-		http.Error(w, "busy", 503)
+	clientIP := remoteIPAddr(r.RemoteAddr)
+	releasePreAuth, status := h.acquirePreAuth(clientIP)
+	if status != 0 {
+		http.Error(w, "busy", status)
 		return
 	}
+	defer releasePreAuth()
 	ws, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -147,11 +201,31 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		cert = m.Certificate
 	}
-	p := &peer{id: id, cert: cert, role: auth.Role, selfHosted: h.selfHosted, lease: until, ctx: ctx, cancel: cancel, out: make(chan protocol.Message, 32)}
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	default:
+		ws.Close(websocket.StatusTryAgainLater, "busy")
+		return
+	}
+	releasePreAuth()
+	p := &peer{id: id, cert: cert, role: auth.Role, desktop: auth.Desktop, selfHosted: h.selfHosted, remoteIP: clientIP, lease: until, ctx: ctx, cancel: cancel, out: make(chan protocol.Message, 32)}
 	h.mu.Lock()
-	_, exists := h.peers[id.DeviceID]
+	_, exists := h.peers[p.slotKey()]
+	if p.desktop != "" {
+		host := h.peers[p.desktop]
+		exists = exists || (p.role != "mobile" && p.role != "desktop") || host == nil || !host.allows(p)
+	}
+	count := 0
+	for _, other := range h.peers {
+		if other.id.DeviceID == id.DeviceID {
+			count++
+			exists = exists || other.role != p.role
+		}
+	}
+	exists = exists || count >= maxPhoneLinks+1
 	if !exists {
-		h.peers[id.DeviceID] = p
+		h.peers[p.slotKey()] = p
 	}
 	h.mu.Unlock()
 	if exists {
@@ -227,4 +301,83 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.send(protocol.Message{Type: "error", Connection: m.Connection, Data: protocol.Encode(err.Error())})
 		}
 	}
+}
+
+func (p *peer) registered() {
+	if p.pairTicket == "" {
+		p.pairTicket = protocol.NewID()
+	}
+	p.send(protocol.Message{Type: "device.registered", Data: protocol.Encode(map[string]string{"pairing_ticket": p.pairTicket})})
+}
+
+func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodGet {
+		h.mu.Lock()
+		locator := r.URL.Query().Get("pairing")
+		host := h.invites[locator]
+		now := time.Now()
+		var box string
+		if host != nil && host.live(now) {
+			if invite := host.invites[locator]; now.Before(invite.Expires) {
+				box = invite.Box
+			}
+		}
+		h.mu.Unlock()
+		if box == "" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(box))
+		return
+	}
+	device := r.Header.Get("Vanora-Desktop")
+	ticket, hasBearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	h.mu.Lock()
+	host := h.peers[device]
+	authorized := hasBearer && host != nil && host.online && host.role == "desktop" && host.pairTicket != "" &&
+		subtle.ConstantTimeCompare([]byte(ticket), []byte(host.pairTicket)) == 1 && host.live(time.Now())
+	h.mu.Unlock()
+	if !authorized {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var record pairing.Record
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&record) != nil || len(record.Locator) != 43 || len(record.Box) > 12<<10 {
+		http.Error(w, "invalid invitation", http.StatusBadRequest)
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	if h.peers[device] != host || !host.live(now) {
+		http.Error(w, "offline", http.StatusConflict)
+		return
+	}
+	if record.Box == "" {
+		if h.invites[record.Locator] == host {
+			delete(h.invites, record.Locator)
+			delete(host.invites, record.Locator)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !record.Expires.After(now) || record.Expires.After(now.Add(pairing.Lifetime+30*time.Second)) {
+		http.Error(w, "invalid expiry", http.StatusBadRequest)
+		return
+	}
+	if _, exists := h.invites[record.Locator]; exists || len(host.invites) >= 32 {
+		http.Error(w, "invitation limit", http.StatusConflict)
+		return
+	}
+	if h.invites == nil {
+		h.invites = make(map[string]*peer)
+	}
+	if host.invites == nil {
+		host.invites = make(map[string]pairing.Record)
+	}
+	h.invites[record.Locator] = host
+	host.invites[record.Locator] = record
+	w.WriteHeader(http.StatusNoContent)
 }

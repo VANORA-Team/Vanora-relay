@@ -59,6 +59,39 @@ func publicPeer(peerIP net.IP) bool {
 	return true
 }
 
+// hostInterfaceAddrs collects all IP addresses currently assigned to the relay
+// host's network interfaces so TURN permissions cannot be used to reach
+// non-advertised secondary host interfaces (such as management or extra public
+// IPs).
+func hostInterfaceAddrs() map[netip.Addr]struct{} {
+	out := make(map[netip.Addr]struct{})
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return out
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if addr, ok := netip.AddrFromSlice(ip); ok {
+			addr = addr.Unmap()
+			if addr.IsValid() && !addr.IsUnspecified() {
+				out[addr] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func (s *Server) isLocalHostAddr(addr netip.Addr) bool {
+	_, ok := s.localAddrs[addr.Unmap()]
+	return ok
+}
+
 // peerAllowed is the pion PermissionHandler. Pion calls it for both
 // CreatePermission and ChannelBind, so a blocked peer can never be reached
 // through either mechanism.
@@ -66,15 +99,23 @@ func (s *Server) peerAllowed(_ net.Addr, peerIP net.IP) bool {
 	if s.allowUnsafePeers {
 		return true
 	}
-	if publicPeer(peerIP) {
-		return true
+	addr, ok := netip.AddrFromSlice(peerIP)
+	if !ok {
+		return false
 	}
+	addr = addr.Unmap()
 
 	// Pion permissions are per IP, not per port. The server's own advertised
 	// address must be allowed so two allocations of one connection can relay
 	// to each other; relayConn.WriteTo then ensures that only that
 	// connection's relay sockets are reachable there.
-	addr, ok := netip.AddrFromSlice(peerIP)
-
-	return ok && addr.Unmap() == s.publicIP
+	if addr == s.publicIP {
+		return true
+	}
+	// Block every other local interface address assigned to the relay host,
+	// even if it falls in a globally routable prefix.
+	if s.isLocalHostAddr(addr) {
+		return false
+	}
+	return publicPeer(peerIP)
 }

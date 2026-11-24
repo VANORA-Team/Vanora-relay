@@ -77,6 +77,7 @@ type storedEvent struct {
 	Data           json.RawMessage `json:"data,omitempty"`
 	RequiresOnline bool            `json:"requires_online,omitempty"`
 	Visibility     string          `json:"visibility,omitempty"`
+	ApprovalUser   string          `json:"approval_user,omitempty"`
 }
 
 type requestRecord struct {
@@ -275,7 +276,7 @@ func (ps *persistedSession) eventBytes() int64 {
 }
 
 func estimateEventBytes(e storedEvent) int64 {
-	return int64(48 + len(e.RunID) + len(e.Kind) + len(e.Data))
+	return int64(48 + len(e.RunID) + len(e.Kind) + len(e.Data) + len(e.ApprovalUser))
 }
 
 func (ps *persistedSession) appendEvent(e storedEvent) {

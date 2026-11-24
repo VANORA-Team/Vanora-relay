@@ -35,6 +35,7 @@ type options struct {
 	relayMaxPort uint16
 
 	maxGrants              int
+	maxGrantsPerVisitor    int
 	maxAllocationsPerGrant int
 	logLevel               logging.LogLevel
 
@@ -91,6 +92,10 @@ func FromEnv() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxGrantsPerVisitor, err := envInt("TURN_MAX_GRANTS_PER_VISITOR", defaultMaxGrantsPerVisitor(maxGrants), 1, maxGrants)
+	if err != nil {
+		return nil, err
+	}
 	maxAllocationsPerGrant, err := envInt("TURN_MAX_ALLOCATIONS_PER_GRANT", 8, 1, 1024)
 	if err != nil {
 		return nil, err
@@ -118,9 +123,21 @@ func FromEnv() (*Server, error) {
 		relayMinPort:           uint16(relayMinPort),
 		relayMaxPort:           uint16(relayMaxPort),
 		maxGrants:              maxGrants,
+		maxGrantsPerVisitor:    maxGrantsPerVisitor,
 		maxAllocationsPerGrant: maxAllocationsPerGrant,
 		logLevel:               logLevel,
 	})
+}
+
+func defaultMaxGrantsPerVisitor(maxGrants int) int {
+	if maxGrants <= 1 {
+		return 1
+	}
+	limit := maxGrants / 2
+	if limit > 32 {
+		limit = 32
+	}
+	return limit
 }
 
 func newServer(opts options) (*Server, error) {
@@ -152,12 +169,17 @@ func newServer(opts options) (*Server, error) {
 		return nil, errors.New("ice: public IPv4 address is required")
 	}
 
+	if opts.maxGrantsPerVisitor <= 0 {
+		opts.maxGrantsPerVisitor = defaultMaxGrantsPerVisitor(opts.maxGrants)
+	}
 	s := &Server{
 		realm:                  opts.realm,
 		publicIP:               publicAddr.Unmap(),
 		maxGrants:              opts.maxGrants,
+		maxGrantsPerVisitor:    opts.maxGrantsPerVisitor,
 		maxAllocationsPerGrant: opts.maxAllocationsPerGrant,
 		allowUnsafePeers:       opts.allowUnsafePeers,
+		localAddrs:             hostInterfaceAddrs(),
 		onRemove:               opts.onRemove,
 		grants:                 make(map[string]*grant),
 		byUsername:             make(map[string]*grant),

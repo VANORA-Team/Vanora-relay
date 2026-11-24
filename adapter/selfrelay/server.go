@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -14,12 +15,16 @@ import (
 
 	"vanora-relay/adapter/transport"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairing"
+	"vanora-relay/internal/pairnet"
 	"vanora-relay/protocol"
 )
 
 type serverState struct {
-	Key     string                `json:"key"`
-	Clients map[string]ClientInfo `json:"clients"`
+	Key     string                           `json:"key"`
+	Clients map[string]ClientInfo            `json:"clients"`
+	Service string                           `json:"service,omitempty"`
+	Other   map[string]map[string]ClientInfo `json:"other_relays,omitempty"`
 }
 
 type runningConn struct {
@@ -29,6 +34,7 @@ type runningConn struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	done       chan struct{}
+	seenConns  map[string]struct{}
 }
 
 // Server owns the desktop's self-hosted Ed25519 key, one-time pairing
@@ -46,10 +52,16 @@ type Server struct {
 	running     *runningConn
 	online      bool
 	lastErr     string
+	pairTicket  string
 	observer    func(online bool, err string)
+	netObserver func()
 	invitations map[string]Invitation
+	retire      map[string]func()
 	links       map[string]*peerLink
 	clientLinks map[string]map[*peerLink]struct{}
+	db          *pairnet.Database
+	group       *pairnet.Group
+	network     *transport.NetworkHandler
 }
 
 // OpenServer opens or initializes persisted self-hosted pairing state in store.
@@ -57,6 +69,11 @@ func OpenServer(store Store, handler transport.Handler) (*Server, error) {
 	if store == nil || handler == nil {
 		return nil, errors.New("selfrelay: secure storage and a connection handler are required")
 	}
+	db, err := pairnet.Open(store)
+	if err != nil {
+		return nil, err
+	}
+	store = db
 	raw, err := store.Load()
 	if err != nil {
 		return nil, err
@@ -66,13 +83,17 @@ func OpenServer(store Store, handler transport.Handler) (*Server, error) {
 		if err := json.Unmarshal([]byte(raw), &state); err != nil {
 			return nil, err
 		}
-		if state.Clients == nil || len(state.Clients) > maxClients {
-			return nil, errors.New("selfrelay: invalid stored clients")
-		}
-		for id, client := range state.Clients {
-			pub, err := parsePublicKeyB64(client.PublicKey)
-			if err != nil || id != client.ID || id != fingerprint(pub) || Access(userID(client)) == "" || !validName(client.Name) {
-				return nil, errors.New("selfrelay: invalid stored client")
+		all := append([]map[string]ClientInfo{state.Clients}, slices.Collect(maps.Values(state.Other))...)
+		for _, clients := range all {
+			if clients == nil || len(clients) > maxClients {
+				return nil, errors.New("selfrelay: invalid stored clients")
+			}
+			for id, client := range clients {
+				pub, err := parsePublicKeyB64(client.PublicKey)
+				validID := err == nil && (id == fingerprint(pub) || (client.Role == "desktop" && id == client.PublicKey))
+				if err != nil || id != client.ID || !validID || Access(userID(client)) == "" || !validName(client.Name) {
+					return nil, errors.New("selfrelay: invalid stored client")
+				}
 			}
 		}
 	} else {
@@ -88,7 +109,8 @@ func OpenServer(store Store, handler transport.Handler) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	s := &Server{
+		db:          db,
 		store:       store,
 		handler:     handler,
 		priv:        priv,
@@ -97,9 +119,284 @@ func OpenServer(store Store, handler transport.Handler) (*Server, error) {
 		deviceID:    devID,
 		state:       state,
 		invitations: make(map[string]Invitation),
+		retire:      make(map[string]func()),
 		links:       make(map[string]*peerLink),
 		clientLinks: make(map[string]map[*peerLink]struct{}),
+	}
+	if state.Service != "" {
+		s.group = db.Group(state.Service, pin)
+	}
+	s.network = &transport.NetworkHandler{Handler: handler, Group: s.Network, Device: func(p transport.Peer) string {
+		user := p.UserID()
+		return user[strings.LastIndex(user, ":")+1:]
+	}, Changed: s.closeRemoved}
+	s.handler = s.network
+	return s, nil
+}
+
+func (s *Server) Network() *pairnet.Group {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.group
+}
+
+// Seed returns the desktop's persisted self-hosted Ed25519 key seed so
+// outbound PC-to-PC connections reuse the exact same endpoint identity.
+func (s *Server) Seed() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.Key
+}
+
+// Profile returns the persisted self-hosted relay profile (last service URL,
+// relay bearer token, and device name) stored inside the encrypted self vault.
+func (s *Server) Profile() pairnet.Profile {
+	return s.db.Profile()
+}
+
+// SetProfile updates the persisted self-hosted relay profile in the encrypted
+// self vault so outbound desktop connections can reconnect after restart.
+func (s *Server) SetProfile(profile pairnet.Profile) error {
+	return s.db.SetProfile(profile)
+}
+
+// GroupFor returns the pairing network group and local desktop member identity
+// scoped to rawSignalURL.
+func (s *Server) GroupFor(rawSignalURL, name string) (*pairnet.Group, pairnet.Member, error) {
+	signalURL, err := NormalizeSignalURL(rawSignalURL)
+	if err != nil {
+		return nil, pairnet.Member{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if name == "" && s.running != nil {
+		name = s.running.name
+	}
+	return s.db.Group(signalURL, s.pin), pairnet.Member{
+		ID:   s.pin,
+		Pin:  s.pin,
+		Role: "desktop",
+		Name: strings.TrimSpace(name),
 	}, nil
+}
+
+// BroadcastNetwork pushes the current pairing network snapshot to all
+// subscribed inbound peers and runs local revocation cleanup.
+func (s *Server) BroadcastNetwork() {
+	s.network.Broadcast()
+}
+
+// SetNetworkObserver registers an optional callback triggered whenever the
+// self-hosted pairing network changes.
+func (s *Server) SetNetworkObserver(fn func()) {
+	s.mu.Lock()
+	s.netObserver = fn
+	s.mu.Unlock()
+}
+
+// SetClientAccess updates the local inbound access level ("read" or "control")
+// for an active member of the current self-hosted pairing network.
+func (s *Server) SetClientAccess(id, access string) error {
+	if access != Read && access != Control {
+		return errors.New("selfrelay: access must be read or control")
+	}
+	s.mu.Lock()
+	if s.group == nil {
+		s.mu.Unlock()
+		return errors.New("selfrelay: self-hosted relay is disabled")
+	}
+	member, known := s.group.Get(id)
+	if !known || id == s.pin || (member.Role != "mobile" && member.Role != "desktop") || !s.group.Allows(id) {
+		s.mu.Unlock()
+		return errors.New("selfrelay: unknown active network member")
+	}
+	local, _ := s.group.Get(s.pin)
+	prev, hadPrev := s.state.Clients[id]
+	pairedAt := time.Now().UTC()
+	name := member.Name
+	if hadPrev {
+		if !prev.PairedAt.IsZero() {
+			pairedAt = prev.PairedAt
+		}
+		if name == "" {
+			name = prev.Name
+		}
+	}
+	if !validName(name) {
+		name = "Peer"
+	}
+	next := s.state
+	next.Clients = maps.Clone(next.Clients)
+	if next.Clients == nil {
+		next.Clients = make(map[string]ClientInfo)
+	}
+	next.Clients[id] = ClientInfo{
+		ID:         id,
+		PublicKey:  member.Pin,
+		Name:       name,
+		Role:       member.Role,
+		Access:     access,
+		PairedAt:   pairedAt,
+		Epoch:      member.Epoch,
+		LocalEpoch: local.Epoch,
+	}
+	if err := saveState(s.store, next); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.state = next
+	var closed []*peerLink
+	for l := range s.clientLinks[id] {
+		closed = append(closed, l)
+		delete(s.links, l.id)
+	}
+	delete(s.clientLinks, id)
+	s.mu.Unlock()
+	for _, l := range closed {
+		l.close(transport.ErrPeerClosed, true)
+	}
+	if service, ok := s.network.Handler.(interface{ RefreshSelfAccess() }); ok {
+		service.RefreshSelfAccess()
+	}
+	return nil
+}
+
+// SetPeerAccessFor persists the local inbound access level for a paired member
+// on a specific self-hosted relay URL (whether or not it is currently active).
+func (s *Server) SetPeerAccessFor(rawSignalURL, id, access string) error {
+	if access != Read && access != Control {
+		return errors.New("selfrelay: access must be read or control")
+	}
+	signalURL, err := NormalizeSignalURL(rawSignalURL)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	group := s.db.Group(signalURL, s.pin)
+	member, known := group.Get(id)
+	if !known || id == s.pin || (member.Role != "mobile" && member.Role != "desktop") || !group.Allows(id) {
+		s.mu.Unlock()
+		return errors.New("selfrelay: unknown active network member")
+	}
+	local, _ := group.Get(s.pin)
+	next := s.state
+	var targetMap map[string]ClientInfo
+	activeService := next.Service == "" || next.Service == signalURL
+	if activeService {
+		if next.Service == "" {
+			next.Service = signalURL
+		}
+		targetMap = maps.Clone(next.Clients)
+		if targetMap == nil {
+			targetMap = make(map[string]ClientInfo)
+		}
+		next.Clients = targetMap
+	} else {
+		next.Other = maps.Clone(next.Other)
+		if next.Other == nil {
+			next.Other = make(map[string]map[string]ClientInfo)
+		}
+		targetMap = maps.Clone(next.Other[signalURL])
+		if targetMap == nil {
+			targetMap = make(map[string]ClientInfo)
+		}
+		next.Other[signalURL] = targetMap
+	}
+	prev, hadPrev := targetMap[id]
+	pairedAt := time.Now().UTC()
+	name := member.Name
+	if hadPrev {
+		if !prev.PairedAt.IsZero() {
+			pairedAt = prev.PairedAt
+		}
+		if name == "" {
+			name = prev.Name
+		}
+	}
+	if !validName(name) {
+		name = "Peer"
+	}
+	targetMap[id] = ClientInfo{
+		ID:         id,
+		PublicKey:  member.Pin,
+		Name:       name,
+		Role:       member.Role,
+		Access:     access,
+		PairedAt:   pairedAt,
+		Epoch:      member.Epoch,
+		LocalEpoch: local.Epoch,
+	}
+	if err := saveState(s.store, next); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.state = next
+	if activeService && s.group == nil {
+		s.group = group
+	}
+	var closed []*peerLink
+	if activeService {
+		for l := range s.clientLinks[id] {
+			closed = append(closed, l)
+			delete(s.links, l.id)
+		}
+		delete(s.clientLinks, id)
+	}
+	s.mu.Unlock()
+	for _, l := range closed {
+		l.close(transport.ErrPeerClosed, true)
+	}
+	if activeService {
+		if service, ok := s.network.Handler.(interface{ RefreshSelfAccess() }); ok {
+			service.RefreshSelfAccess()
+		}
+	}
+	return nil
+}
+
+func (s *Server) RemoveDevice(id string) error {
+	g := s.Network()
+	if g == nil {
+		return errors.New("self-hosted relay is disabled")
+	}
+	if err := g.Remove(id); err != nil {
+		return err
+	}
+	s.network.Broadcast()
+	return nil
+}
+
+func (s *Server) closeRemoved() {
+	s.mu.Lock()
+	if s.group != nil {
+		next := s.state
+		next.Clients = maps.Clone(next.Clients)
+		maps.DeleteFunc(next.Clients, func(id string, client ClientInfo) bool {
+			return s.group.GrantExpired(id, client.LocalEpoch, client.Epoch)
+		})
+		if len(next.Clients) < len(s.state.Clients) && saveState(s.store, next) == nil {
+			s.state = next
+		}
+	}
+	var closed []*peerLink
+	for id, links := range s.clientLinks {
+		if s.group != nil && !s.group.Allows(id) {
+			for l := range links {
+				closed = append(closed, l)
+			}
+		}
+	}
+	netObs := s.netObserver
+	s.mu.Unlock()
+	for _, l := range closed {
+		l.close(ErrUnpaired, true)
+	}
+	if service, ok := s.network.Handler.(interface{ RefreshSelfAccess() }); ok {
+		service.RefreshSelfAccess()
+	}
+	if netObs != nil {
+		netObs()
+	}
 }
 
 func saveState(store Store, state serverState) error {
@@ -113,6 +410,15 @@ func saveState(store Store, state serverState) error {
 func (s *Server) DeviceID() string { return s.deviceID }
 func (s *Server) Pin() string      { return s.pin }
 
+func (s *Server) PairingTicket() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.online {
+		return ""
+	}
+	return s.pairTicket
+}
+
 // SetObserver registers an optional callback invoked when the self-hosted
 // signaling connection transitions between online and offline.
 func (s *Server) SetObserver(fn func(online bool, err string)) {
@@ -124,7 +430,7 @@ func (s *Server) SetObserver(fn func(online bool, err string)) {
 // Connect starts maintaining a desktop presence on the configured self-hosted
 // relay. Call Stop before changing the signaling URL or relay token.
 func (s *Server) Connect(ctx context.Context, rawSignalURL, relayToken, desktopName string) error {
-	signalURL, err := normalizeSignalURL(rawSignalURL)
+	signalURL, err := NormalizeSignalURL(rawSignalURL)
 	if err != nil {
 		return err
 	}
@@ -141,6 +447,26 @@ func (s *Server) Connect(ctx context.Context, rawSignalURL, relayToken, desktopN
 	if s.running != nil {
 		return errors.New("selfrelay: stop the self-hosted relay before changing its configuration")
 	}
+	if s.state.Service != signalURL {
+		next := s.state
+		if next.Service != "" {
+			next.Other = maps.Clone(next.Other)
+			if next.Other == nil {
+				next.Other = make(map[string]map[string]ClientInfo)
+			}
+			next.Other[next.Service] = next.Clients
+			next.Clients = next.Other[signalURL]
+			delete(next.Other, signalURL)
+			if next.Clients == nil {
+				next.Clients = make(map[string]ClientInfo)
+			}
+		}
+		next.Service = signalURL
+		if err := saveState(s.store, next); err != nil {
+			return err
+		}
+		s.state = next
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	entry := &runningConn{
 		signalURL:  signalURL,
@@ -149,8 +475,10 @@ func (s *Server) Connect(ctx context.Context, rawSignalURL, relayToken, desktopN
 		ctx:        runCtx,
 		cancel:     cancel,
 		done:       make(chan struct{}),
+		seenConns:  make(map[string]struct{}),
 	}
 	s.running = entry
+	s.group = s.db.Group(signalURL, s.pin)
 	s.online = false
 	s.lastErr = ""
 	go s.runLoop(entry)
@@ -171,6 +499,7 @@ func (s *Server) Stop() {
 	s.online = false
 	s.lastErr = ""
 	clear(s.invitations)
+	clear(s.retire)
 	links := make([]*peerLink, 0, len(s.links))
 	for _, l := range s.links {
 		links = append(links, l)
@@ -199,8 +528,25 @@ func (s *Server) Allows(user string) bool {
 	id := user[strings.LastIndex(user, ":")+1:]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	client, ok := s.state.Clients[id]
+	client, ok := s.networkClient(id)
 	return s.running != nil && s.running.ctx.Err() == nil && ok && userID(client) == user
+}
+
+func (s *Server) networkClient(id string) (ClientInfo, bool) {
+	if s.group == nil {
+		return ClientInfo{}, false
+	}
+	member, known := s.group.Get(id)
+	if !known || id == s.pin || (member.Role != "mobile" && member.Role != "desktop") || !s.group.Allows(id) {
+		return ClientInfo{}, false
+	}
+	if client, ok := s.state.Clients[id]; ok && client.PublicKey == member.Pin && !s.group.GrantExpired(id, client.LocalEpoch, client.Epoch) {
+		if client.Role == "" {
+			client.Role = member.Role
+		}
+		return client, true
+	}
+	return ClientInfo{ID: id, PublicKey: member.Pin, Name: member.Name, Role: member.Role, Access: Read, Epoch: member.Epoch}, true
 }
 
 // Status returns a snapshot of the self-hosted relay channel, paired clients,
@@ -284,10 +630,43 @@ func (s *Server) RevokeInvitation(id string) bool {
 	for tok, inv := range s.invitations {
 		if inv.ID == id {
 			delete(s.invitations, tok)
+			s.retireLocked(id)
 			return true
 		}
 	}
 	return false
+}
+
+func (s *Server) InvitePairing(ctx context.Context, access string, includeToken bool) (Invitation, pairing.Display, error) {
+	inv, link, err := s.Invite(access, includeToken)
+	if err != nil {
+		return Invitation{}, pairing.Display{}, err
+	}
+	target, err := ParseTarget(link)
+	if err != nil {
+		s.RevokeInvitation(inv.ID)
+		return Invitation{}, pairing.Display{}, err
+	}
+	display, retire, err := pairing.Present(ctx, target.SignalURL, s.deviceID, s.PairingTicket(), link, inv.ExpiresAt)
+	if err != nil {
+		s.RevokeInvitation(inv.ID)
+		return Invitation{}, pairing.Display{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.invitations[target.Pair]; !ok {
+		retire()
+		return Invitation{}, pairing.Display{}, pairing.ErrInvalid
+	}
+	s.retire[inv.ID] = retire
+	return inv, display, nil
+}
+
+func (s *Server) retireLocked(id string) {
+	if retire := s.retire[id]; retire != nil {
+		delete(s.retire, id)
+		retire()
+	}
 }
 
 // RevokeClients removes one paired device (by client ID) or all paired devices
@@ -301,11 +680,26 @@ func (s *Server) RevokeClients(id string) error {
 			clients[clientID] = client
 		}
 	}
-	if id != "" && len(clients) == len(s.state.Clients) {
+	var removed []string
+	if s.group != nil {
+		for key, member := range s.group.Snapshot() {
+			if key != s.pin && (member.Role == "mobile" || member.Role == "desktop") && member.Active() && (id == "" || key == id) {
+				removed = append(removed, key)
+			}
+		}
+	}
+	if id != "" && len(clients) == len(s.state.Clients) && len(removed) == 0 {
 		s.mu.Unlock()
 		return errors.New("selfrelay: unknown client")
 	}
-	next := serverState{Key: s.state.Key, Clients: clients}
+	if len(removed) > 0 {
+		if err := s.group.Remove(removed...); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+	next := s.state
+	next.Clients = clients
 	if err := saveState(s.store, next); err != nil {
 		s.mu.Unlock()
 		return err
@@ -313,10 +707,13 @@ func (s *Server) RevokeClients(id string) error {
 	s.state = next
 	if id == "" {
 		clear(s.invitations)
+		for id := range s.retire {
+			s.retireLocked(id)
+		}
 	}
 	var revoked []*peerLink
 	for clientID, set := range s.clientLinks {
-		if _, allowed := clients[clientID]; !allowed {
+		if id == "" || id == clientID {
 			for l := range set {
 				revoked = append(revoked, l)
 				delete(s.links, l.id)
@@ -329,6 +726,7 @@ func (s *Server) RevokeClients(id string) error {
 	for _, l := range revoked {
 		l.close(ErrUnpaired, true)
 	}
+	s.network.Broadcast()
 	return nil
 }
 
@@ -336,6 +734,7 @@ func (s *Server) pruneInvitationsLocked(now time.Time) {
 	for tok, inv := range s.invitations {
 		if !now.Before(inv.ExpiresAt) {
 			delete(s.invitations, tok)
+			delete(s.retire, inv.ID)
 		}
 	}
 }
@@ -347,6 +746,10 @@ func (s *Server) setOnline(entry *runningConn, online bool, reason string) {
 		return
 	}
 	changed := s.online != online || (reason != "" && reason != s.lastErr)
+	if s.online && !online {
+		clear(s.invitations)
+		clear(s.retire)
+	}
 	s.online = online
 	s.lastErr = reason
 	obs := s.observer
@@ -412,6 +815,13 @@ func (s *Server) runOnce(entry *runningConn) error {
 	if reg.Type != "device.registered" {
 		return parseErrf("unexpected register reply %s", reg.Type)
 	}
+	var registered struct {
+		Ticket string `json:"pairing_ticket"`
+	}
+	_ = json.Unmarshal(reg.Data, &registered)
+	s.mu.Lock()
+	s.pairTicket = registered.Ticket
+	s.mu.Unlock()
 	s.setOnline(entry, true, "")
 
 	sessionCtx, sessionCancel := context.WithCancel(entry.ctx)
@@ -503,6 +913,20 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 		s.rejectRequest(send, m)
 		return
 	}
+	s.mu.Lock()
+	if s.running != entry || entry.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	if _, active := s.links[m.Connection]; active {
+		s.mu.Unlock()
+		return
+	}
+	if _, seen := entry.seenConns[m.Connection]; seen {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 	rawBody, err := base64.RawURLEncoding.Strict().DecodeString(m.Body)
 	if err != nil {
 		s.rejectRequest(send, m)
@@ -513,13 +937,21 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 		s.rejectRequest(send, m)
 		return
 	}
+	role := req.Role
+	if role == "" {
+		role = "mobile"
+	}
+	if role != "mobile" && role != "desktop" {
+		s.rejectRequest(send, m)
+		return
+	}
 	mobilePub, err := parsePublicKeyB64(req.PublicKey)
 	if err != nil {
 		s.rejectRequest(send, m)
 		return
 	}
 	mobileDevID, err := identity.SelfDeviceID(mobilePub)
-	if err != nil || mobileDevID != m.From {
+	if err != nil || mobileDevID != m.From || mobileDevID == s.deviceID {
 		s.rejectRequest(send, m)
 		return
 	}
@@ -528,7 +960,7 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 		return
 	}
 
-	client, ok := s.authorizePeer(entry, m.Connection, mobilePub, req.PublicKey, req.Name, req.PairProof)
+	client, ok := s.authorizePeer(entry, m.Connection, mobilePub, req.PublicKey, req.Name, role, req.PairProof)
 	if !ok {
 		s.rejectRequest(send, m)
 		return
@@ -573,6 +1005,21 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 		s.mu.Unlock()
 		return
 	}
+	if _, active := s.links[l.id]; active {
+		s.mu.Unlock()
+		return
+	}
+	if _, seen := entry.seenConns[l.id]; seen {
+		s.mu.Unlock()
+		return
+	}
+	if len(entry.seenConns) >= 4096 {
+		clear(entry.seenConns)
+		for activeID := range s.links {
+			entry.seenConns[activeID] = struct{}{}
+		}
+	}
+	entry.seenConns[l.id] = struct{}{}
 	s.links[l.id] = l
 	if s.clientLinks[clientID] == nil {
 		s.clientLinks[clientID] = make(map[*peerLink]struct{})
@@ -586,17 +1033,41 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 	}
 }
 
-func (s *Server) authorizePeer(entry *runningConn, connID string, mobilePub ed25519.PublicKey, mobilePubB64, name, pairProofB64 string) (ClientInfo, bool) {
+func (s *Server) authorizePeer(entry *runningConn, connID string, mobilePub ed25519.PublicKey, mobilePubB64, name, role, pairProofB64 string) (ClientInfo, bool) {
 	fp := fingerprint(mobilePub)
+	if role == "desktop" {
+		fp = mobilePubB64
+	}
+	if fp == s.pin {
+		return ClientInfo{}, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.running != entry || entry.ctx.Err() != nil {
 		return ClientInfo{}, false
 	}
-	if client, ok := s.state.Clients[fp]; ok {
-		return client, true
+	if s.group == nil {
+		s.group = s.db.Group(entry.signalURL, s.pin)
 	}
-	if pairProofB64 == "" || len(s.state.Clients) >= maxClients {
+	existing, paired := s.networkClient(fp)
+	if paired && (existing.PublicKey != mobilePubB64 || (existing.Role != "" && existing.Role != role)) {
+		return ClientInfo{}, false
+	}
+	admit := func(fresh bool) error {
+		return s.group.Admit(pairnet.Member{ID: s.pin, Pin: s.pin, Role: "desktop", Name: entry.name},
+			pairnet.Member{ID: fp, Pin: mobilePubB64, Role: role, Name: name}, fresh)
+	}
+	if legacy, ok := s.state.Clients[fp]; ok && !paired && legacy.PublicKey == mobilePubB64 && legacy.Epoch == 0 {
+		_, known := s.group.Get(fp)
+		local, _ := s.group.Get(s.pin)
+		if !known && local.Epoch <= 1 && admit(false) == nil {
+			existing, paired = s.networkClient(fp)
+		}
+	}
+	if paired && pairProofB64 == "" {
+		return existing, true
+	}
+	if pairProofB64 == "" || (!paired && len(s.state.Clients) >= maxClients) {
 		return ClientInfo{}, false
 	}
 	presentedProof, err := base64.RawURLEncoding.Strict().DecodeString(pairProofB64)
@@ -629,18 +1100,36 @@ func (s *Server) authorizePeer(entry *runningConn, connID string, mobilePub ed25
 	if !found {
 		return ClientInfo{}, false
 	}
+	prior, direct := s.state.Clients[fp]
+	if paired && direct && !s.group.GrantExpired(fp, prior.LocalEpoch, prior.Epoch) {
+		return existing, true
+	}
+	if err := admit(true); err != nil {
+		return ClientInfo{}, false
+	}
+	member, _ := s.group.Get(fp)
+	local, _ := s.group.Get(s.pin)
 	client := ClientInfo{
-		ID:        fp,
-		PublicKey: mobilePubB64,
-		Name:      name,
-		Access:    matchedInv.Access,
-		PairedAt:  now.UTC(),
+		Epoch:      member.Epoch,
+		LocalEpoch: local.Epoch,
+		ID:         fp,
+		PublicKey:  mobilePubB64,
+		Name:       name,
+		Role:       role,
+		Access:     matchedInv.Access,
+		PairedAt:   now.UTC(),
 	}
 	s.state.Clients[fp] = client
 	if err := saveState(s.store, s.state); err != nil {
-		delete(s.state.Clients, fp)
+		if direct {
+			s.state.Clients[fp] = prior
+		} else {
+			delete(s.state.Clients, fp)
+		}
+		_ = s.group.Remove(fp)
 		return ClientInfo{}, false
 	}
 	delete(s.invitations, matchedToken)
+	s.retireLocked(matchedInv.ID)
 	return client, true
 }

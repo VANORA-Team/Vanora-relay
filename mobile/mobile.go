@@ -4,6 +4,7 @@ package mobile
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/pairing"
+	"vanora-relay/internal/pairnet"
 )
 
 // Store is supplied by the native app's secure storage. Missing state returns "", nil.
@@ -27,30 +30,38 @@ type Store interface {
 
 // Client owns one phone identity, one signaling socket and at most one selected desktop.
 type Client struct {
-	identity      *account.Account
-	source        transport.IdentitySource
-	url           string
-	lanKey        string
-	lanTarget     *lan.Target
-	lanName       string
-	selfKey       string
-	selfTarget    *selfrelay.Target
-	selfName      string
-	ctx           context.Context
-	stop          context.CancelFunc
-	op            sync.Mutex // dial, selection, subscription setup and link recovery
-	mu            sync.Mutex
-	socket        *transport.Client
-	peer          transport.Peer
-	device, owner string
-	connState     string
-	connPath      string
-	connErr       string
-	pending       map[string]chan reply
-	subscriptions map[string]*cursor
-	events        []event
-	ready         chan struct{}
-	retry         chan struct{}
+	mesh           *phoneNetwork
+	book           *pairnet.Database
+	group          *pairnet.Group
+	child          bool
+	scopeTarget    string
+	deviceName     string
+	synced         chan struct{}
+	identity       *account.Account
+	source         transport.IdentitySource
+	url            string
+	lanKey         string
+	lanTarget      *lan.Target
+	lanName        string
+	selfKey        string
+	selfTarget     *selfrelay.Target
+	selfName       string
+	officialInvite *pairing.Official
+	ctx            context.Context
+	stop           context.CancelFunc
+	op             sync.Mutex // dial, selection, subscription setup and link recovery
+	mu             sync.Mutex
+	socket         *transport.Client
+	peer           transport.Peer
+	device, owner  string
+	connState      string
+	connPath       string
+	connErr        string
+	pending        map[string]chan reply
+	subscriptions  map[string]*cursor
+	events         []event
+	ready          chan struct{}
+	retry          chan struct{}
 }
 
 type reply struct {
@@ -80,29 +91,42 @@ func NewClient(identityURL, signalURL, publicKeyHex string, store Store) (*Clien
 	}
 	c := newClient(signalURL, a)
 	c.identity = a
+	c.startNetwork()
 	return c, nil
 }
 
 // NewLANClient creates an account-free client. Use a secure store dedicated to LAN pairing.
 func NewLANClient(store Store) (*Client, error) {
-	key, err := lan.LoadClientKey(store)
+	db, err := pairnet.Open(store)
+	if err != nil {
+		return nil, err
+	}
+	key, err := lan.LoadClientKey(db)
 	if err != nil {
 		return nil, err
 	}
 	c := newClient("", nil)
 	c.lanKey = key
+	c.book = db
+	c.startNetwork()
 	return c, nil
 }
 
 // NewSelfRelayClient creates an account-free client for a user-hosted relay
 // (RELAY_CHANNEL=self). Use a secure store dedicated to self-hosted pairing.
 func NewSelfRelayClient(store Store) (*Client, error) {
-	key, err := selfrelay.LoadClientKey(store)
+	db, err := pairnet.Open(store)
+	if err != nil {
+		return nil, err
+	}
+	key, err := selfrelay.LoadClientKey(db)
 	if err != nil {
 		return nil, err
 	}
 	c := newClient("", nil)
 	c.selfKey = key
+	c.book = db
+	c.startNetwork()
 	return c, nil
 }
 
@@ -166,11 +190,22 @@ func (c *Client) DeviceID() string {
 // Reset disconnects from any desktop and clears the locally enrolled account,
 // replacing the endpoint key so the user can sign into a different account.
 func (c *Client) Reset() error {
-	c.Disconnect()
+	if c.child {
+		return errors.New("reset the account on the main client")
+	}
+	c.op.Lock()
+	defer c.op.Unlock()
+	c.disconnect()
 	if c.identity == nil {
 		return errors.New("no account configured")
 	}
-	return c.identity.Reset()
+	err := c.identity.Reset()
+	if err == nil {
+		c.mu.Lock()
+		c.group = nil
+		c.mu.Unlock()
+	}
+	return err
 }
 
 // ConnectionState returns a JSON snapshot of the client's current connection
@@ -250,7 +285,7 @@ func (c *Client) dial() (*transport.Client, error) {
 			return c.socket, nil
 		}
 	}
-	s, err := transport.Dial(c.ctx, c.url, "mobile", c.source, (*handler)(c))
+	s, err := transport.DialMobileFor(c.ctx, c.url, c.scopeTarget, c.source, (*handler)(c))
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +333,76 @@ func (c *Client) Connect(deviceID, ownerID string) error {
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
-	return c.selectDesktop(deviceID, ownerID)
+	if c.identity != nil {
+		bound, ok := c.desktopBinding(deviceID)
+		if !ok || bound.Owner != ownerID {
+			c.handleAuthError(pairing.ErrInvalid)
+			return pairing.ErrInvalid
+		}
+	}
+	c.officialInvite = nil
+	return c.selectDesktop(deviceID, ownerID, false)
+}
+
+// Pair accepts a scanned QR link or a typed pairing code. Official clients use
+// their configured site. For a self-hosted code, supply the node's signal URL.
+func (c *Client) Pair(input, signalURL, relayToken, clientName string) error {
+	if c.child {
+		return errors.New("pair devices on the main client")
+	}
+	if c.lanKey != "" {
+		link := strings.TrimSpace(input)
+		if !strings.Contains(link, "://") {
+			var err error
+			link, err = lan.ResolveCode(c.ctx, link, signalURL, c.lanKey)
+			if err != nil {
+				return err
+			}
+		}
+		target, err := lan.ParseTarget(link)
+		if err != nil || target.Token == "" {
+			return pairing.ErrInvalid
+		}
+		return c.ConnectLAN(link, clientName)
+	}
+	if c.selfKey == "" && c.identity == nil {
+		return errors.New("pairing requires an official or self-hosted relay client")
+	}
+	link := strings.TrimSpace(input)
+	service := c.url
+	if c.selfKey != "" && signalURL != "" {
+		var err error
+		service, err = selfrelay.NormalizeSignalURL(signalURL)
+		if err != nil {
+			return err
+		}
+	}
+	if !strings.Contains(link, "://") {
+		if service == "" {
+			return errors.New("self-hosted pairing code requires the relay URL")
+		}
+		var err error
+		link, err = pairing.Resolve(c.ctx, service, link)
+		if err != nil {
+			return err
+		}
+	}
+	if c.selfKey != "" {
+		target, err := selfrelay.ParseTarget(link)
+		if err != nil || target.Pair == "" || (service != "" && service != target.SignalURL) {
+			return pairing.ErrInvalid
+		}
+		return c.ConnectSelfRelayWithToken(link, relayToken, clientName)
+	}
+	target, err := pairing.ParseOfficial(link, c.url)
+	if err != nil {
+		return err
+	}
+	c.op.Lock()
+	defer c.op.Unlock()
+	c.deviceName = clientName
+	c.officialInvite = &target
+	return c.selectDesktop(target.Device, target.Owner, true)
 }
 
 // ConnectLAN pairs with a private desktop link or reconnects using LANAddress.
@@ -309,6 +413,9 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 	target, err := lan.ParseTarget(link)
 	if err != nil {
 		return err
+	}
+	if c.child && c.scopeTarget != target.Pin {
+		return errors.New("desktop handle is bound to a different device")
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
@@ -323,7 +430,7 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 	}
 	c.lanTarget = &target
 	c.lanName = clientName
-	if err := c.selectDesktop(target.Pin, "lan"); err != nil {
+	if err := c.selectDesktop(target.Pin, "lan", target.Token != ""); err != nil {
 		return err
 	}
 	c.lanTarget.Token = ""
@@ -357,6 +464,9 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 	if err != nil {
 		return err
 	}
+	if c.child && c.scopeTarget != target.Pin {
+		return errors.New("desktop handle is bound to a different device")
+	}
 	if strings.TrimSpace(relayToken) != "" {
 		if err := selfrelay.ValidateRelayToken(strings.TrimSpace(relayToken)); err != nil {
 			return err
@@ -368,6 +478,15 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
+	if c.child && c.book.Profile().Service != target.SignalURL {
+		return errors.New("desktop handle is bound to a different relay")
+	}
+	if !c.child && c.book.Profile().Service != target.SignalURL {
+		c.disconnect()
+		c.mu.Lock()
+		c.group = nil
+		c.mu.Unlock()
+	}
 	if c.selfTarget != nil && (c.selfTarget.SignalURL != target.SignalURL || c.selfTarget.Token != target.Token) && c.selfTarget.Pin == target.Pin {
 		c.mu.Lock()
 		old := c.peer
@@ -379,7 +498,7 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 	}
 	c.selfTarget = &target
 	c.selfName = clientName
-	if err := c.selectDesktop(target.Pin, "self"); err != nil {
+	if err := c.selectDesktop(target.Pin, "self", target.Pair != ""); err != nil {
 		return err
 	}
 	c.selfTarget.Pair = ""
@@ -397,10 +516,19 @@ func (c *Client) SelfRelayTarget() string {
 	return c.selfTarget.Link()
 }
 
-func (c *Client) selectDesktop(deviceID, ownerID string) error {
+func (c *Client) selectDesktop(deviceID, ownerID string, freshInvite bool) error {
+	if c.child && deviceID != c.scopeTarget {
+		return errors.New("desktop handle is bound to a different device")
+	}
+	if c.mesh != nil && !c.child {
+		c.closeChild(deviceID)
+	}
 	c.mu.Lock()
 	same := deviceID == c.device && ownerID == c.owner
 	old := c.peer
+	if same && freshInvite && old != nil {
+		c.detachLocked()
+	}
 	if !same {
 		c.detachLocked()
 		c.device = deviceID
@@ -409,7 +537,7 @@ func (c *Client) selectDesktop(deviceID, ownerID string) error {
 		c.events = nil
 	}
 	c.mu.Unlock()
-	if same && old != nil && old.Allows(false) {
+	if same && !freshInvite && old != nil && old.Allows(false) {
 		return nil
 	}
 	if old != nil {
@@ -434,12 +562,36 @@ func (c *Client) connectLocked() error {
 	if d == "" {
 		return errors.New("no desktop selected")
 	}
+	group, local, remote, invited := c.networkBinding(d)
+	if group != nil && !invited {
+		member, known := group.Get(d)
+		self, hasSelf := group.Get(local.ID)
+		if (known && !member.Active()) || (hasSelf && !self.Active()) {
+			return pairing.ErrInvalid
+		}
+	}
 	p, start, err := c.dialPeer(d, o)
 	if err != nil {
 		c.mu.Lock()
 		c.setStateLocked("reconnecting", "", err.Error())
 		c.mu.Unlock()
 		return err
+	}
+	if group != nil {
+		if err := group.Admit(local, remote, invited); err != nil {
+			p.Close()
+			return err
+		}
+		if c.book != nil && !c.child {
+			profile := pairnet.Profile{Name: local.Name}
+			if c.selfTarget != nil {
+				profile.Service, profile.Token = c.selfTarget.SignalURL, c.selfTarget.Token
+			}
+			if err := c.book.SetProfile(profile); err != nil {
+				p.Close()
+				return err
+			}
+		}
 	}
 	c.mu.Lock()
 	if !p.Allows(true) {
@@ -449,6 +601,9 @@ func (c *Client) connectLocked() error {
 		return errors.New("desktop authorization expired")
 	}
 	c.peer = p
+	c.group = group
+	c.synced = make(chan struct{})
+	synced := c.synced
 	c.setStateLocked("connected", peerPath(p), "")
 	resume := make(map[string]int64, len(c.subscriptions))
 	for id, cur := range c.subscriptions {
@@ -457,6 +612,23 @@ func (c *Client) connectLocked() error {
 	c.mu.Unlock()
 	if start != nil {
 		start()
+	}
+	if group != nil {
+		if err := c.syncPeer(p, group); err != nil {
+			p.Close()
+			return err
+		}
+		if invited {
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-synced:
+			case <-c.ctx.Done():
+				return c.ctx.Err()
+			case <-timer.C:
+				return errors.New("pairing network synchronization timed out")
+			}
+		}
 	}
 	for id, seq := range resume {
 		if _, err := c.subscribe(p, id, seq); err != nil {
@@ -495,7 +667,29 @@ func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) 
 	}
 	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
 	defer stop()
-	p, err := s.Connect(ctx, device, owner)
+	var pin, token []byte
+	if target := c.officialInvite; target != nil {
+		pin, token = target.Pin, target.Token
+	} else if c.identity != nil {
+		bound, ok := c.desktopBinding(device)
+		if !ok || bound.Owner != owner {
+			return nil, nil, pairing.ErrInvalid
+		}
+		pin, err = base64.RawURLEncoding.Strict().DecodeString(bound.Pin)
+		if err != nil || len(pin) != 32 {
+			return nil, nil, pairing.ErrInvalid
+		}
+	}
+	p, err := s.ConnectPaired(ctx, device, owner, pin, token)
+	if err == nil && c.officialInvite != nil {
+		bound := account.PeerBinding{Owner: owner, Pin: base64.RawURLEncoding.EncodeToString(pin)}
+		group, _ := c.identity.PairingIdentity(c.url, "mobile")
+		if err := c.identity.BindNetworkPeer(group, device, bound); err != nil {
+			p.Close()
+			return nil, nil, err
+		}
+		c.officialInvite = nil
+	}
 	return p, nil, err
 }
 
@@ -533,10 +727,14 @@ func (c *Client) recoverConnection() {
 // Disconnect forgets the selected desktop and disables automatic reconnect. The identity is retained.
 func (c *Client) Disconnect() { c.op.Lock(); defer c.op.Unlock(); c.disconnect() }
 func (c *Client) disconnect() {
+	if c.mesh != nil && !c.child {
+		c.closeChildren()
+	}
 	c.lanTarget = nil
 	c.lanName = ""
 	c.selfTarget = nil
 	c.selfName = ""
+	c.officialInvite = nil
 	c.mu.Lock()
 	p := c.peer
 	c.device = ""
@@ -591,7 +789,9 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 }
 
 func (c *Client) handleAuthError(err error) bool {
-	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired)
+	var closed *transport.ClosedError
+	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired) || errors.Is(err, pairing.ErrInvalid) ||
+		(errors.As(err, &closed) && closed.Reason == "access_denied")
 	relayTokenInvalid := errors.Is(err, selfrelay.ErrUnauthorized)
 	if !pairingRequired && !relayTokenInvalid && !isLoginRequiredError(err) {
 		return false
@@ -678,6 +878,43 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 	c.mu.Lock()
 	if c.peer != p {
 		c.mu.Unlock()
+		return
+	}
+	if m.Type == "pairnet.removed" && c.group != nil {
+		group, id := c.group, c.device
+		c.mu.Unlock()
+		var removal transport.Removal
+		if json.Unmarshal(b, &removal) == nil {
+			if changed, _ := group.ReceiveRemoval(id, removal.Receiver, removal.Epoch); changed {
+				signal(c.mesh.wake)
+			}
+		}
+		p.Close()
+		return
+	}
+	if m.Type == "pairnet.state" && c.group != nil {
+		group, id := c.group, c.device
+		c.mu.Unlock()
+		var frame transport.NetworkFrame
+		if len(b) > 2<<20 || json.Unmarshal(b, &frame) != nil {
+			p.Close()
+			return
+		}
+		changed, err := group.Merge(id, frame.Members)
+		if err != nil {
+			p.Close()
+			return
+		}
+		c.mu.Lock()
+		if c.peer == p && c.synced != nil {
+			close(c.synced)
+			c.synced = nil
+			changed = true
+		}
+		c.mu.Unlock()
+		if changed {
+			signal(c.mesh.wake)
+		}
 		return
 	}
 	bad := false
@@ -770,7 +1007,7 @@ func (c *Client) Acknowledge(sessionID string, seq int64) error {
 func (c *Client) currentPeer() (transport.Peer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.peer == nil {
+	if c.peer == nil || (c.group != nil && !c.group.Allows(c.device)) {
 		return nil, errors.New("desktop disconnected")
 	}
 	return c.peer, nil

@@ -4,10 +4,17 @@
 package endpoint
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"vanora-relay/internal/identity"
 	"vanora-relay/protocol"
@@ -30,8 +37,9 @@ func OpenCredentials(cert string, key ed25519.PrivateKey, ca ed25519.PublicKey, 
 	}
 	return &Credentials{cert, key, ca, p}, nil
 }
-func (c *Credentials) DeviceID() string { return c.principal.DeviceID }
-func (c *Credentials) UserID() string   { return c.principal.RemoteUserID() }
+func (c *Credentials) DeviceID() string             { return c.principal.DeviceID }
+func (c *Credentials) UserID() string               { return c.principal.RemoteUserID() }
+func (c *Credentials) PublicKey() ed25519.PublicKey { return c.key.Public().(ed25519.PublicKey) }
 
 // Certificate returns the signed certificate string this endpoint presents.
 func (c *Credentials) Certificate() string { return c.cert }
@@ -39,11 +47,19 @@ func (c *Credentials) Certificate() string { return c.cert }
 // CA returns the authority public key these credentials were opened against.
 func (c *Credentials) CA() ed25519.PublicKey { return c.ca }
 func (c *Credentials) Login(challenge protocol.Message, role, lease string) (protocol.Message, error) {
+	return c.LoginFor(challenge, role, lease, "")
+}
+
+func (c *Credentials) LoginFor(challenge protocol.Message, role, lease, desktop string) (protocol.Message, error) {
 	if challenge.Type != "auth.challenge" || !protocol.ValidID(challenge.Connection) || (role != "desktop" && role != "mobile") {
 		return protocol.Message{}, errors.New("invalid login challenge or role")
 	}
 	m := protocol.Message{Type: "auth.login", Connection: challenge.Connection, From: c.DeviceID(), To: "signal", Certificate: c.cert}
-	err := m.Sign(c.key, protocol.Encode(map[string]string{"role": role, "lease": lease}))
+	fields := map[string]string{"role": role, "lease": lease}
+	if desktop != "" {
+		fields["desktop"] = desktop
+	}
+	err := m.Sign(c.key, protocol.Encode(fields))
 	return m, err
 }
 
@@ -55,10 +71,12 @@ type Session struct {
 	sent, received                   uint64
 	round                            uint32
 	answered                         bool
+	pin                              ed25519.PublicKey
 }
 
-func (s *Session) ID() string           { return s.connection }
-func (s *Session) RemoteUserID() string { return s.remote.RemoteUserID() }
+func (s *Session) ID() string                          { return s.connection }
+func (s *Session) RemoteUserID() string                { return s.remote.RemoteUserID() }
+func (s *Session) RemotePrincipal() identity.Principal { return s.remote }
 
 func (s *Session) sign(kind string, body []byte) (protocol.Message, error) {
 	m := protocol.Message{Type: kind, Connection: s.connection, From: s.local.DeviceID(), To: s.target, Round: s.round, Seq: s.sent + 1}
@@ -69,15 +87,104 @@ func (s *Session) sign(kind string, body []byte) (protocol.Message, error) {
 	return m, err
 }
 
+// ConnectRequestMeta carries optional caller role and display name inside an
+// endpoint-signed connect.request body.
+type ConnectRequestMeta struct {
+	Role string `json:"role,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+type connectRequestEnvelope struct {
+	Role  string `json:"role,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Proof string `json:"proof,omitempty"`
+}
+
 // Request pins the selected machine and its owner. Obtain both identifiers from
 // a trusted binding or invitation, independently of the signaling directory.
 func (c *Credentials) Request(device, owner string) (*Session, protocol.Message, error) {
+	return c.RequestPaired(device, owner, nil, nil)
+}
+
+func (c *Credentials) RequestPaired(device, owner string, pin ed25519.PublicKey, token []byte) (*Session, protocol.Message, error) {
+	return c.RequestPairedWithMeta(device, owner, pin, token, ConnectRequestMeta{})
+}
+
+func (c *Credentials) RequestPairedWithMeta(device, owner string, pin ed25519.PublicKey, token []byte, meta ConnectRequestMeta) (*Session, protocol.Message, error) {
 	if device == "" || owner == "" {
 		return nil, protocol.Message{}, errors.New("expected device and owner required")
 	}
-	s := &Session{local: c, target: device, owner: owner, connection: protocol.NewID()}
-	m, err := s.sign("connect.request", nil)
+	if device == c.DeviceID() {
+		return nil, protocol.Message{}, errors.New("cannot connect to self")
+	}
+	s := &Session{local: c, target: device, owner: owner, pin: pin, connection: protocol.NewID()}
+	var proof []byte
+	if len(token) != 0 {
+		var err error
+		proof, err = identity.SelfPairProof(token, s.connection, c.principal.PublicKey, pin)
+		if err != nil {
+			return nil, protocol.Message{}, err
+		}
+	}
+	body := proof
+	if meta.Role != "" || meta.Name != "" {
+		role := meta.Role
+		if role == "" {
+			role = "mobile"
+		}
+		if role != "mobile" && role != "desktop" {
+			return nil, protocol.Message{}, errors.New("invalid connect request role")
+		}
+		name := strings.TrimSpace(meta.Name)
+		if name != "" && !validPeerName(name) {
+			return nil, protocol.Message{}, errors.New("invalid connect request name")
+		}
+		env := connectRequestEnvelope{Role: role, Name: name}
+		if len(proof) != 0 {
+			env.Proof = base64.RawURLEncoding.EncodeToString(proof)
+		}
+		body = protocol.Encode(env)
+	}
+	m, err := s.sign("connect.request", body)
 	return s, m, err
+}
+
+func parseConnectRequestBody(body []byte) (role, name string, proof []byte, err error) {
+	if len(body) == 0 {
+		return "mobile", "", nil, nil
+	}
+	if body[0] == '{' {
+		var env connectRequestEnvelope
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if decErr := dec.Decode(&env); decErr == nil {
+			var extra any
+			if errors.Is(dec.Decode(&extra), io.EOF) && (env.Role == "mobile" || env.Role == "desktop") {
+				if env.Name != "" && !validPeerName(env.Name) {
+					return "", "", nil, errors.New("invalid connect request name")
+				}
+				if env.Proof != "" {
+					p, decProofErr := base64.RawURLEncoding.Strict().DecodeString(env.Proof)
+					if decProofErr != nil || len(p) != sha256.Size {
+						return "", "", nil, errors.New("invalid pairing proof")
+					}
+					proof = p
+				}
+				return env.Role, env.Name, proof, nil
+			}
+		}
+	}
+	if len(body) == sha256.Size {
+		return "mobile", "", body, nil
+	}
+	return "", "", nil, errors.New("invalid connect request body")
+}
+
+func validPeerName(name string) bool {
+	return len(name) > 0 && len(name) <= 128 && utf8.ValidString(name) &&
+		strings.TrimSpace(name) == name && !strings.ContainsFunc(name, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+	})
 }
 
 func (c *Credentials) checkPeer(m protocol.Message, kind string, now time.Time) (identity.Principal, []byte, error) {
@@ -94,14 +201,45 @@ func (c *Credentials) checkPeer(m protocol.Message, kind string, now time.Time) 
 
 // Accept requires the desktop's local ACL decision before releasing its nonce.
 func (c *Credentials) Accept(m protocol.Message, allows func(string) bool, now time.Time) (*Session, protocol.Message, error) {
+	return c.AcceptPaired(m, allows, nil, now)
+}
+
+type PeerIdentity = identity.Principal
+
+type PairAuthorizer func(connection string, mobile PeerIdentity, proof []byte) bool
+
+type PairRoleAuthorizer func(connection string, peer PeerIdentity, role, name string, proof []byte) bool
+
+func (c *Credentials) AcceptPaired(m protocol.Message, allows func(string) bool, paired PairAuthorizer, now time.Time) (*Session, protocol.Message, error) {
+	var fn PairRoleAuthorizer
+	if paired != nil {
+		fn = func(connection string, peer PeerIdentity, _, _ string, proof []byte) bool {
+			return paired(connection, peer, proof)
+		}
+	}
+	return c.AcceptPairedWithRole(m, allows, fn, now)
+}
+
+func (c *Credentials) AcceptPairedWithRole(m protocol.Message, allows func(string) bool, paired PairRoleAuthorizer, now time.Time) (*Session, protocol.Message, error) {
 	p, body, err := c.checkPeer(m, "connect.request", now)
 	if err != nil {
 		return nil, protocol.Message{}, err
 	}
-	if len(body) != 0 || allows == nil || !allows(p.RemoteUserID()) {
+	if p.DeviceID == c.DeviceID() {
+		return nil, protocol.Message{}, errors.New("cannot connect to self")
+	}
+	role, name, proof, err := parseConnectRequestBody(body)
+	if err != nil {
+		return nil, protocol.Message{}, errors.New("access denied")
+	}
+	if allows == nil || !allows(p.RemoteUserID()) || (len(proof) != 0 && paired == nil) {
 		return nil, protocol.Message{}, errors.New("access denied")
 	}
 	s := &Session{local: c, remote: p, target: p.DeviceID, owner: p.RemoteUserID(), connection: m.Connection, nonce: protocol.NewID(), desktop: true, received: m.Seq}
+	if paired != nil && !paired(m.Connection, p, role, name, proof) {
+		denied, _ := s.Close()
+		return nil, denied, errors.New("pairing required")
+	}
 	reply, err := s.sign("connect.accept", []byte(s.nonce))
 	return s, reply, err
 }
@@ -114,7 +252,7 @@ func (s *Session) Accepted(m protocol.Message, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if p.DeviceID != s.target || p.RemoteUserID() != s.owner || !protocol.ValidID(string(body)) {
+	if p.DeviceID != s.target || p.RemoteUserID() != s.owner || (s.pin != nil && !s.pin.Equal(p.PublicKey)) || !protocol.ValidID(string(body)) {
 		return errors.New("unexpected remote endpoint")
 	}
 	s.remote, s.nonce, s.received = p, string(body), m.Seq

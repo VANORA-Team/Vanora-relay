@@ -52,12 +52,15 @@ type Store interface {
 // ClientInfo describes one paired mobile device authorized to connect through
 // the desktop's self-hosted relay channel.
 type ClientInfo struct {
-	ID        string    `json:"id"`
-	PublicKey string    `json:"public_key"`
-	Name      string    `json:"name"`
-	Access    string    `json:"access"`
-	PairedAt  time.Time `json:"paired_at"`
-	Connected bool      `json:"connected"`
+	ID         string    `json:"id"`
+	PublicKey  string    `json:"public_key"`
+	Name       string    `json:"name"`
+	Role       string    `json:"role,omitempty"`
+	Access     string    `json:"access"`
+	PairedAt   time.Time `json:"paired_at"`
+	Connected  bool      `json:"connected"`
+	Epoch      uint64    `json:"membership_epoch,omitempty"`
+	LocalEpoch uint64    `json:"local_epoch,omitempty"`
 }
 
 // Invitation is an active one-time pairing invitation for the self-hosted relay.
@@ -147,6 +150,14 @@ func fingerprint(pub ed25519.PublicKey) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+func ClientIdentity(seed string) (string, string) {
+	_, pub, pin, _, err := parseKeySeed(seed)
+	if err != nil {
+		return "", ""
+	}
+	return fingerprint(pub), pin
+}
+
 func validToken32(value string) bool {
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(value)
 	return err == nil && len(raw) == sha256.Size
@@ -163,11 +174,11 @@ func ValidateRelayToken(token string) error {
 // ValidateSignalURL enforces wss:// for remote hosts and allows ws:// only on
 // loopback hosts.
 func ValidateSignalURL(raw string) error {
-	_, err := normalizeSignalURL(raw)
+	_, err := NormalizeSignalURL(raw)
 	return err
 }
 
-func normalizeSignalURL(raw string) (string, error) {
+func NormalizeSignalURL(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", errors.New("selfrelay: invalid signaling URL")
@@ -205,7 +216,7 @@ func ParseTarget(link string) (Target, error) {
 	}
 	base := *parsed
 	base.Fragment = ""
-	signalURL, err := normalizeSignalURL(base.String())
+	signalURL, err := NormalizeSignalURL(base.String())
 	if err != nil {
 		return Target{}, errors.New("selfrelay: invalid pairing link URL")
 	}

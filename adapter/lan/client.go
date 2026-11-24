@@ -14,11 +14,14 @@ import (
 
 	"github.com/coder/websocket"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/pairing"
 )
 
 const (
-	tokenHeader = "X-Vanora-Pairing"
-	nameHeader  = "X-Vanora-Client-Name"
+	tokenHeader   = "X-Vanora-Pairing"
+	nameHeader    = "X-Vanora-Client-Name"
+	roleHeader    = "X-Vanora-Client-Role"
+	addressHeader = "X-Vanora-Client-Address"
 )
 
 var ErrUnpaired = errors.New("LAN: device authorization required")
@@ -56,17 +59,38 @@ func (t Target) Link() string {
 }
 
 func Dial(ctx context.Context, target Target, seed, name string, handler transport.Handler) (transport.Peer, func(), error) {
+	return DialWithOptions(ctx, target, seed, name, "mobile", "", handler)
+}
+
+func DialWithOptions(ctx context.Context, target Target, seed, name, role, localAddr string, handler transport.Handler) (transport.Peer, func(), error) {
+	if role == "" {
+		role = "mobile"
+	}
+	if role != "mobile" && role != "desktop" {
+		return nil, nil, errors.New("LAN: invalid client role")
+	}
 	address, err := parseLocalAddress(target.Address)
 	if err != nil || address.Port() == 0 || !validToken(target.Pin) ||
 		(target.Token != "" && !validToken(target.Token)) {
 		return nil, nil, errors.New("LAN: invalid desktop target")
 	}
-	certificate, _, err := makeCertificate(seed)
+	certificate, localPin, err := makeCertificate(seed)
 	if err != nil {
 		return nil, nil, err
 	}
+	if localPin == target.Pin {
+		return nil, nil, errors.New("LAN: cannot connect to self")
+	}
 	if !validName(name) {
 		return nil, nil, errors.New("LAN: invalid device name")
+	}
+	var advertiseAddr string
+	if strings.TrimSpace(localAddr) != "" {
+		parsedLocal, err := parseLocalAddress(strings.TrimSpace(localAddr))
+		if err != nil || parsedLocal.Port() == 0 {
+			return nil, nil, errors.New("LAN: invalid local listener address")
+		}
+		advertiseAddr = parsedLocal.String()
 	}
 	httpTransport := &http.Transport{TLSClientConfig: &tls.Config{
 		MinVersion:         tls.VersionTLS13,
@@ -88,6 +112,12 @@ func Dial(ctx context.Context, target Target, seed, name string, handler transpo
 	}
 	header := http.Header{}
 	header.Set(nameHeader, base64.RawURLEncoding.EncodeToString([]byte(name)))
+	if role == "desktop" {
+		header.Set(roleHeader, role)
+	}
+	if advertiseAddr != "" {
+		header.Set(addressHeader, advertiseAddr)
+	}
 	if target.Token != "" {
 		header.Set(tokenHeader, target.Token)
 	}
@@ -110,4 +140,34 @@ func validName(name string) bool {
 		strings.TrimSpace(name) == name && !strings.ContainsFunc(name, func(r rune) bool {
 		return unicode.IsControl(r) || unicode.In(r, unicode.Cf)
 	})
+}
+
+func ResolveCode(ctx context.Context, input, address, seed string) (string, error) {
+	code, embedded, hasAddress := strings.Cut(input, "@")
+	if hasAddress {
+		if address != "" && address != embedded {
+			return "", pairing.ErrInvalid
+		}
+		address = embedded
+	}
+	host, err := parseLocalAddress(address)
+	if err != nil || host.Port() == 0 {
+		return "", errors.New("LAN pairing code requires the desktop's private IP and port")
+	}
+	cert, _, err := makeCertificate(seed)
+	if err != nil {
+		return "", err
+	}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true}}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	link, err := pairing.ResolveAt(ctx, client, &url.URL{Scheme: "https", Host: host.String(), Path: path}, code)
+	if err != nil {
+		return "", err
+	}
+	target, err := ParseTarget(link)
+	if err != nil || target.Address != host.String() || target.Token == "" {
+		return "", pairing.ErrInvalid
+	}
+	return link, nil
 }

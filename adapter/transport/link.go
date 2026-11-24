@@ -25,10 +25,12 @@ type iceServer struct {
 // link is one authenticated WebRTC connection. Its run goroutine owns the
 // negotiation state machine; DataChannel callbacks only feed events into it.
 type link struct {
-	c       *Client
-	id      string
-	desktop bool
-	session *endpoint.Session
+	c            *Client
+	id           string
+	desktop      bool
+	session      *endpoint.Session
+	remoteDevice string
+	handler      Handler
 
 	// stateMu serializes Session and Access. Both are documented as owned by a
 	// serial event loop because Access.Update replaces Session identity fields.
@@ -870,7 +872,10 @@ func toICEServers(servers []iceServer) []webrtc.ICEServer {
 
 func (p *peer) run() {
 	l := p.link
-	h := l.c.handler
+	h := l.handler
+	if h == nil {
+		h = l.c.handler
+	}
 	if !l.isClosed() {
 		l.cbMu.Lock()
 		if !l.isClosed() {
@@ -934,6 +939,13 @@ func (p *peer) Send(data []byte, requiresOnline bool) error {
 	if !allowed {
 		return ErrUnauthorized
 	}
+	return p.send(data)
+}
+
+func (p *peer) SendRemoval(removal Removal) error { return p.send(protocol.Encode(removal)) }
+
+func (p *peer) send(data []byte) error {
+	l := p.link
 	l.dcMu.Lock()
 	dc, open := l.dc, l.dcOpen
 	l.dcMu.Unlock()

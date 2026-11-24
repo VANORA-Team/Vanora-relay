@@ -454,9 +454,19 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 		if e.Seq <= after {
 			continue
 		}
+		approvalUser := e.ApprovalUser
+		if e.Visibility == visApproval && approvalUser == "" && e.RunID != "" {
+			if rec, ok := sr.ps.Runs[e.RunID]; ok {
+				approvalUser = rec.UserID
+			}
+		}
+		visible := sr.cfg.canSeeEvent(user, e.Visibility)
+		if visible && e.Visibility == visApproval && !sr.cfg.owns(user) && (approvalUser == "" || user != approvalUser) {
+			visible = false
+		}
 		var wire []byte
 		var err error
-		if sr.cfg.canSeeEvent(user, e.Visibility) {
+		if visible {
 			wire, err = json.Marshal(wireEvent{
 				Type:      "event",
 				SessionID: req.SessionID,
@@ -481,6 +491,7 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 			requiresOnline: e.RequiresOnline,
 			sessionID:      req.SessionID,
 			visibility:     e.Visibility,
+			approvalUser:   approvalUser,
 			seq:            e.Seq,
 		})
 	}
@@ -601,6 +612,11 @@ func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
 	}
 	if r == nil {
 		if rec, exists := sr.ps.Runs[req.RunID]; exists {
+			if rec.UserID != user && !sr.cfg.owns(user) {
+				a.mu.Unlock()
+				a.sendError(ps, req.RequestID, codeUnavailable)
+				return
+			}
 			a.mu.Unlock()
 			a.sendResult(ps, req.RequestID, runStatusResult{RunID: req.RunID, Status: rec.Status}, req.SessionID, false)
 			return

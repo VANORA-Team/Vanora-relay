@@ -37,6 +37,7 @@ type connectRequestBody struct {
 	PublicKey string `json:"public_key"`
 	Name      string `json:"name"`
 	PairProof string `json:"pair_proof,omitempty"`
+	Role      string `json:"role,omitempty"`
 }
 
 type connectAcceptBody struct {
@@ -763,6 +764,13 @@ func (p *peer) Send(data []byte, _ bool) error {
 	if !l.allows() {
 		return ErrUnpaired
 	}
+	return p.send(data)
+}
+
+func (p *peer) SendRemoval(removal transport.Removal) error { return p.send(protocol.Encode(removal)) }
+
+func (p *peer) send(data []byte) error {
+	l := p.link
 	l.dcMu.Lock()
 	dc, open := l.dc, l.dcOpen
 	l.dcMu.Unlock()
@@ -830,7 +838,11 @@ func toICEServers(servers []iceServer) []webrtc.ICEServer {
 }
 
 func dialSignal(ctx context.Context, rawURL, relayToken, role string, priv ed25519.PrivateKey, pub ed25519.PublicKey, devID string) (*websocket.Conn, error) {
-	signalURL, err := normalizeSignalURL(rawURL)
+	return dialSignalFor(ctx, rawURL, relayToken, role, priv, pub, devID, "")
+}
+
+func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed25519.PrivateKey, pub ed25519.PublicKey, devID, desktop string) (*websocket.Conn, error) {
+	signalURL, err := NormalizeSignalURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -873,6 +885,7 @@ func dialSignal(ctx context.Context, rawURL, relayToken, role string, priv ed255
 	}
 	if err := login.Sign(priv, protocol.Encode(map[string]string{
 		"role":       role,
+		"desktop":    desktop,
 		"public_key": base64.RawURLEncoding.EncodeToString(pub),
 	})); err != nil {
 		ws.CloseNow()

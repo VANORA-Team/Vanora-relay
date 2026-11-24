@@ -7,6 +7,7 @@ import (
 
 	"github.com/coder/websocket"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/protocol"
 )
 
 type peer struct {
@@ -44,6 +45,12 @@ func (p *peer) Send(data []byte, online bool) error {
 func (p *peer) Close() {
 	p.cancel()
 	_ = p.socket.CloseNow()
+}
+
+func (p *peer) SendRemoval(removal transport.Removal) error {
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+	return p.socket.Write(ctx, websocket.MessageBinary, protocol.Encode(removal))
 }
 
 func (p *peer) run(handler transport.Handler, readLimit int64) {

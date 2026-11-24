@@ -16,8 +16,11 @@ import (
 	"vanora-relay/adapter/account"
 	"vanora-relay/adapter/desktop"
 	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/remote"
 	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/pairing"
+	"vanora-relay/internal/pairnet"
 )
 
 type accessOptions struct {
@@ -32,27 +35,46 @@ type accessOptions struct {
 }
 
 type accessCommand struct {
-	Type         string `json:"type"`
-	RequestID    string `json:"request_id"`
-	Channel      string `json:"channel"`
-	Token        string `json:"token"`
-	SignalURL    string `json:"signal_url"`
-	SignalToken  string `json:"signal_token"`
-	Enabled      *bool  `json:"enabled"`
-	IncludeToken *bool  `json:"include_token"`
-	Address      string `json:"address"`
-	Access       string `json:"access"`
-	ID           string `json:"id"`
+	Type         string     `json:"type"`
+	RequestID    string     `json:"request_id"`
+	Channel      string     `json:"channel"`
+	Token        string     `json:"token"`
+	SignalURL    string     `json:"signal_url"`
+	SignalToken  string     `json:"signal_token"`
+	Enabled      *bool      `json:"enabled"`
+	IncludeToken *bool      `json:"include_token"`
+	Address      string     `json:"address"`
+	Access       string     `json:"access"`
+	ID           string     `json:"id"`
+	PeerID       string     `json:"peer_id"`
+	Input        string     `json:"input"`
+	GrantAccess  string     `json:"grant_access"`
+	WorkspaceID  string     `json:"workspace_id"`
+	SessionID    string     `json:"session_id"`
+	Title        string     `json:"title"`
+	Text         string     `json:"text"`
+	RunID        string     `json:"run_id"`
+	UIID         string     `json:"ui_id"`
+	AfterSeq     *int64     `json:"after_seq"`
+	Seq          *int64     `json:"seq"`
+	Confirmed    *bool      `json:"confirmed"`
+	Value        *string    `json:"value"`
+	Answers      [][]string `json:"answers"`
+	Cancelled    bool       `json:"cancelled"`
 }
 
 type officialSlot struct {
-	name     string
-	account  *account.Account
-	ca       ed25519.PublicKey
-	url      string
-	token    string
-	online   atomic.Bool
-	verified atomic.Bool
+	name        string
+	desktopName string
+	account     *account.Account
+	ca          ed25519.PublicKey
+	url         string
+	token       string
+	online      atomic.Bool
+	verified    atomic.Bool
+	socket      atomic.Pointer[transport.Client]
+	pairMu      sync.Mutex
+	invites     map[string]officialInvite
 }
 
 type accessManager struct {
@@ -77,6 +99,7 @@ type accessManager struct {
 	activeSlot    *officialSlot
 	stopRelay     context.CancelFunc
 	relayDone     chan struct{}
+	remote        *remote.Manager
 }
 
 func (m *accessManager) primaryOfficialSlotLocked() *officialSlot {
@@ -163,12 +186,14 @@ func (m *accessManager) statusLocked() map[string]any {
 			continue
 		}
 		channels[ch] = map[string]any{
-			"configured": slot.account != nil && slot.url != "",
-			"enrolled":   slot.account != nil && slot.account.UserID() != "",
-			"authorized": slot.verified.Load(),
-			"online":     slot.online.Load(),
-			"user_id":    slot.account.UserID(),
-			"device_id":  slot.account.DeviceID(),
+			"configured":  slot.account != nil && slot.url != "",
+			"enrolled":    slot.account != nil && slot.account.UserID() != "",
+			"authorized":  slot.verified.Load(),
+			"online":      slot.online.Load(),
+			"user_id":     slot.account.UserID(),
+			"device_id":   slot.account.DeviceID(),
+			"clients":     slot.account.Pairings(),
+			"invitations": slot.invitations(),
 		}
 	}
 
@@ -214,8 +239,13 @@ func (m *accessManager) loadLANLocked() error {
 	if err != nil {
 		return err
 	}
+	local.SetNetworkObserver(func() {
+		m.onNetworkChanged("lan")
+	})
 	m.local = local
-	m.service.SetLANAuthority(local.Allows)
+	if m.service != nil {
+		m.service.SetLANAuthority(local.Allows)
+	}
 	return nil
 }
 
@@ -267,8 +297,13 @@ func (m *accessManager) loadSelfLocked() error {
 			}
 		}
 	})
+	srv.SetNetworkObserver(func() {
+		m.onNetworkChanged("self")
+	})
 	m.selfServer = srv
-	m.service.SetSelfAuthority(srv.Allows)
+	if m.service != nil {
+		m.service.SetSelfAuthority(srv.Allows)
+	}
 	return nil
 }
 
@@ -347,7 +382,9 @@ func (m *accessManager) command(cmd accessCommand) {
 			}
 		case m.local != nil:
 			m.local.Stop()
-			m.service.RefreshLANAccess()
+			if m.service != nil {
+				m.service.RefreshLANAccess()
+			}
 		}
 	case "access.relay.set":
 		if cmd.Enabled == nil {
@@ -365,9 +402,97 @@ func (m *accessManager) command(cmd accessCommand) {
 			level = lan.Read
 		}
 		var invite lan.Invitation
-		var link string
-		invite, link, err = m.local.Invite(level)
-		result["type"], result["invitation"], result["link"] = "access.invite.created", invite, link
+		var display pairing.Display
+		invite, display, err = m.local.InvitePairing(level)
+		result["type"], result["invitation"], result["link"] = "access.invite.created", invite, display.Link
+		result["qr_code"], result["pairing_code"] = display.QR, display.Code
+	case "access.network.list", "access.network.remove":
+		channel := cmd.Channel
+		if channel == "" {
+			channel = m.activeChannel
+		}
+		var group *pairnet.Group
+		var remove func(string) error
+		switch {
+		case channel == "lan":
+			err = m.loadExistingLANLocked()
+			if m.local != nil {
+				group, remove = m.local.Network(), m.local.RemoveDevice
+			}
+		case channel == "self":
+			err = m.loadExistingSelfLocked()
+			if m.selfServer != nil {
+				group, remove = m.selfServer.Network(), m.selfServer.RemoveDevice
+			}
+		case m.slots[channel] != nil:
+			slot := m.slots[channel]
+			group, _ = slot.account.PairingIdentity(slot.url, "desktop")
+			remove = func(id string) error {
+				if err := group.Remove(id); err != nil {
+					return err
+				}
+				if socket := slot.socket.Load(); socket != nil {
+					socket.NetworkChanged()
+				}
+				return nil
+			}
+		}
+		if err != nil {
+			break
+		}
+		if group == nil {
+			err = errors.New("pairing network unavailable")
+			break
+		}
+		if cmd.Type == "access.network.remove" {
+			if err = remove(cmd.ID); err != nil {
+				break
+			}
+			go m.onNetworkChanged(channel)
+		}
+		members := []pairnet.Member{}
+		if group.Allows(group.Self()) {
+			members = group.Snapshot().Members()
+		}
+		result["channel"], result["members"], result["self_id"] = channel, members, group.Self()
+		result["type"] = "access.network"
+	case "access.client.access.set":
+		channel := strings.ToLower(strings.TrimSpace(cmd.Channel))
+		if channel == "" {
+			channel = m.activeChannel
+		}
+		switch channel {
+		case "lan":
+			if err = m.loadExistingLANLocked(); err != nil {
+				break
+			}
+			if m.local == nil {
+				err = errors.New("LAN sharing has not been opened")
+				break
+			}
+			err = m.local.SetClientAccess(cmd.ID, cmd.Access)
+			if err == nil && m.service != nil {
+				m.service.RefreshLANAccess()
+			}
+		case "self":
+			if err = m.loadExistingSelfLocked(); err != nil {
+				break
+			}
+			if m.selfServer == nil {
+				err = errors.New("self-hosted relay has not been opened")
+				break
+			}
+			if strings.TrimSpace(cmd.SignalURL) != "" {
+				err = m.selfServer.SetPeerAccessFor(cmd.SignalURL, cmd.ID, cmd.Access)
+			} else {
+				err = m.selfServer.SetClientAccess(cmd.ID, cmd.Access)
+			}
+			if err == nil && m.service != nil {
+				m.service.RefreshSelfAccess()
+			}
+		default:
+			err = errors.New("access.client.access.set requires channel lan or self")
+		}
 	case "access.invite.revoke":
 		if m.local == nil || !m.local.RevokeInvitation(cmd.ID) {
 			err = errors.New("unknown pairing link")
@@ -387,37 +512,47 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = m.local.RevokeClients(cmd.ID)
 		}
 		if err == nil {
-			m.service.RefreshLANAccess()
+			if m.service != nil {
+				m.service.RefreshLANAccess()
+			}
+			go m.onNetworkChanged("lan")
 		}
-	case "access.self.invite.create":
-		if m.selfServer == nil || !m.selfServer.Status().Enabled {
-			err = errors.New("self-hosted relay is disabled")
-			break
+	case "access.self.invite.create", "access.relay.invite.create":
+		err = m.createRelayInvite(cmd, result)
+	case "access.relay.invite.revoke":
+		if cmd.Channel != "" && cmd.Channel != m.activeChannel {
+			err = errors.New("inactive relay channel")
+		} else if slot := m.activeSlot; slot != nil {
+			err = slot.revokeInvite(cmd.ID)
+		} else if m.activeChannel != "self" || m.selfServer == nil || !m.selfServer.RevokeInvitation(cmd.ID) {
+			err = errors.New("unknown pairing invitation")
 		}
-		level := cmd.Access
-		if level == "" {
-			level = selfrelay.Read
-		}
-		includeToken := true
-		if cmd.IncludeToken != nil {
-			includeToken = *cmd.IncludeToken
-		}
-		var invite selfrelay.Invitation
-		var link string
-		invite, link, err = m.selfServer.Invite(level, includeToken)
-		result["type"], result["invitation"], result["link"] = "access.self.invite.created", invite, link
 	case "access.self.invite.revoke":
 		if m.selfServer == nil || !m.selfServer.RevokeInvitation(cmd.ID) {
 			err = errors.New("unknown self-relay pairing link")
 		}
-	case "access.self.client.revoke", "access.self.clients.revoke":
+	case "access.self.client.revoke", "access.self.clients.revoke", "access.relay.client.revoke", "access.relay.clients.revoke":
+		all := strings.HasSuffix(cmd.Type, ".clients.revoke")
+		if strings.HasPrefix(cmd.Type, "access.relay.") {
+			if m.activeChannel == "" || (cmd.Channel != "" && m.activeChannel != cmd.Channel) {
+				err = errors.New("inactive relay channel")
+				break
+			}
+			if slot := m.activeSlot; slot != nil {
+				err = slot.revokeClients(cmd.ID, all)
+				if err == nil {
+					go m.onNetworkChanged(slot.name)
+				}
+				break
+			}
+		}
 		if err = m.loadExistingSelfLocked(); err != nil {
 			break
 		}
 		switch {
 		case m.selfServer == nil:
 			err = errors.New("self-hosted relay has not been opened")
-		case cmd.Type == "access.self.clients.revoke":
+		case all:
 			err = m.selfServer.RevokeClients("")
 		case cmd.ID == "":
 			err = errors.New("client ID required")
@@ -425,7 +560,10 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = m.selfServer.RevokeClients(cmd.ID)
 		}
 		if err == nil {
-			m.service.RefreshSelfAccess()
+			if m.service != nil {
+				m.service.RefreshSelfAccess()
+			}
+			go m.onNetworkChanged("self")
 		}
 	case "auth.token":
 		m.updateTokenLocked(cmd.Channel, cmd.Token)
@@ -454,7 +592,11 @@ func (m *accessManager) command(cmd accessCommand) {
 	if err != nil {
 		result = map[string]any{"type": "access.error", "request_id": cmd.RequestID, "error": err.Error()}
 	}
-	m.emitter.Emit(result)
+	output := m.emitter
+	if output == nil {
+		output = &jsonEmitter{out: os.Stdout}
+	}
+	output.Emit(result)
 	if err == nil && cmd.Type != "access.status" {
 		m.emitter.Emit(m.statusLocked())
 	}
@@ -527,12 +669,19 @@ func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, sign
 
 func (m *accessManager) close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	rm := m.remote
+	m.remote = nil
 	if m.local != nil {
 		m.local.Stop()
-		m.service.RefreshLANAccess()
+		if m.service != nil {
+			m.service.RefreshLANAccess()
+		}
 	}
 	m.stopAllWANLocked()
+	m.mu.Unlock()
+	if rm != nil {
+		rm.Close()
+	}
 }
 
 func (m *accessManager) updateTokenLocked(rawChannel, token string) {
@@ -605,7 +754,9 @@ func (m *accessManager) startSelfLocked() error {
 func (m *accessManager) stopSelfLocked() {
 	if m.selfServer != nil {
 		m.selfServer.Stop()
-		m.service.RefreshSelfAccess()
+		if m.service != nil {
+			m.service.RefreshSelfAccess()
+		}
 	}
 }
 
@@ -664,8 +815,12 @@ func (m *accessManager) stopOfficialLocked() {
 func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot) {
 	source := &authority{account: slot.account, adapter: m.service, ca: slot.ca}
 	for delay := time.Second; ctx.Err() == nil; {
-		socket, err := transport.Dial(ctx, slot.url, "desktop", source, m.service)
+		socket, err := transport.DialPairedDesktopWithRole(ctx, slot.url, source, m.service, slot.authorize)
 		if err == nil {
+			socket.SetNetworkChangedHook(func() {
+				m.onNetworkChanged(slot.name)
+			})
+			slot.socket.Store(socket)
 			err = m.publish(ctx, slot, socket)
 			if err == nil {
 				slot.verified.Store(true)
@@ -685,7 +840,9 @@ func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot
 					}
 				}
 			}
+			slot.socket.Store(nil)
 			socket.Close()
+			slot.clearInvites()
 		}
 		if ctx.Err() != nil {
 			return

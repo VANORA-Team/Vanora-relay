@@ -96,6 +96,7 @@ func run() error {
 	go hub.Run(ctx)
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/signal", hub)
+	mux.Handle("POST /v1/signal", hub)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintln(w, "ok")

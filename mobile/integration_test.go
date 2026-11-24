@@ -442,7 +442,9 @@ func exerciseAdapters(t *testing.T, cli string) {
 	must(t, err)
 	defer service.Close()
 	service.AuthorityUntil(time.Now().Add(time.Minute))
-	desktopConn, err := transport.Dial(ctx, signalURL, "desktop", host, service)
+	desktopConn, err := transport.DialPairedDesktop(ctx, signalURL, host, service, func(_ string, peer endpoint.PeerIdentity, _ []byte) bool {
+		return peer.DeviceID == phone.creds.DeviceID() && peer.PublicKey.Equal(phone.creds.PublicKey())
+	})
 	must(t, err)
 	defer desktopConn.Close()
 	must(t, desktopConn.Publish(ctx, "Office", []string{phone.creds.UserID()}))
@@ -582,7 +584,9 @@ func TestMobileEmbeddedCapabilities(t *testing.T) {
 	service.SetOfficialOwner(host.creds.UserID())
 	service.AuthorityUntil(time.Now().Add(time.Minute))
 
-	desktopConn, err := transport.Dial(ctx, signalURL, "desktop", host, service)
+	desktopConn, err := transport.DialPairedDesktop(ctx, signalURL, host, service, func(_ string, peer endpoint.PeerIdentity, _ []byte) bool {
+		return peer.DeviceID == phone.creds.DeviceID() && peer.PublicKey.Equal(phone.creds.PublicKey())
+	})
 	must(t, err)
 	defer desktopConn.Close()
 	must(t, desktopConn.Publish(ctx, "Workstation", nil))
@@ -761,8 +765,9 @@ func TestSelfRelaySharingWithoutAccount(t *testing.T) {
 		t.Fatal("timed out waiting for desktop self-relay online")
 	}
 
-	_, controlLink, err := server.Invite(selfrelay.Control, true)
+	_, controlInvite, err := server.InvitePairing(ctx, selfrelay.Control, true)
 	must(t, err)
+	controlLink := controlInvite.Link
 
 	// Wrong relay token rejected.
 	controllerStore := &lanTestStore{}
@@ -774,7 +779,7 @@ func TestSelfRelaySharingWithoutAccount(t *testing.T) {
 	}
 
 	// Valid pairing succeeds without any official login.
-	must(t, controller.ConnectSelfRelay(controlLink, "Controller"))
+	must(t, controller.Pair(controlInvite.Code, signalURL, "", "Controller"))
 	if controller.UserID() != "" {
 		t.Fatalf("self-relay client unexpectedly reported official user_id %q", controller.UserID())
 	}
@@ -803,9 +808,9 @@ func TestSelfRelaySharingWithoutAccount(t *testing.T) {
 	}
 
 	// Pair read-only device (without embedding token, supplied out-of-band).
-	_, readLinkNoToken, err := server.Invite(selfrelay.Read, false)
+	_, readInvite, err := server.InvitePairing(ctx, selfrelay.Read, false)
 	must(t, err)
-	must(t, reader.ConnectSelfRelayWithToken(readLinkNoToken, relayToken, "Reader"))
+	must(t, reader.Pair(readInvite.Link, "", relayToken, "Reader"))
 	readerSaved := reader.SelfRelayTarget()
 	if _, err := reader.CreateSession("self-only", NewRequestID(), "Denied"); !errors.Is(err, errUnavailable) {
 		t.Fatalf("read-only self-relay client created session: %v", err)

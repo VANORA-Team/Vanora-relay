@@ -22,7 +22,19 @@ import (
 // invoke the returned start function after recording the Peer so handler.Open
 // and handler.Message run in order.
 func Dial(ctx context.Context, target Target, seed, clientName string, handler transport.Handler) (transport.Peer, func(), error) {
-	if _, err := normalizeSignalURL(target.SignalURL); err != nil {
+	return DialWithRole(ctx, target, seed, clientName, "mobile", handler)
+}
+
+// DialWithRole connects a mobile or desktop peer to a target desktop through a
+// self-hosted relay using the caller's Ed25519 key seed.
+func DialWithRole(ctx context.Context, target Target, seed, clientName, role string, handler transport.Handler) (transport.Peer, func(), error) {
+	if role == "" {
+		role = "mobile"
+	}
+	if role != "mobile" && role != "desktop" {
+		return nil, nil, errors.New("selfrelay: invalid client role")
+	}
+	if _, err := NormalizeSignalURL(target.SignalURL); err != nil {
 		return nil, nil, err
 	}
 	if err := ValidateRelayToken(target.Token); err != nil {
@@ -43,8 +55,11 @@ func Dial(ctx context.Context, target Target, seed, clientName string, handler t
 	if err != nil {
 		return nil, nil, err
 	}
+	if desktopDevID == mobileDevID {
+		return nil, nil, errors.New("selfrelay: cannot connect to self")
+	}
 
-	ws, err := dialSignal(ctx, target.SignalURL, target.Token, "mobile", mobilePriv, mobilePub, mobileDevID)
+	ws, err := dialSignalFor(ctx, target.SignalURL, target.Token, role, mobilePriv, mobilePub, mobileDevID, desktopDevID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -61,6 +76,9 @@ func Dial(ctx context.Context, target Target, seed, clientName string, handler t
 	body := connectRequestBody{
 		PublicKey: mobilePubB64,
 		Name:      clientName,
+	}
+	if role == "desktop" {
+		body.Role = role
 	}
 	if target.Pair != "" {
 		rawPair, err := base64.RawURLEncoding.Strict().DecodeString(target.Pair)

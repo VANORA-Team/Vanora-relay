@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +32,7 @@ import (
 
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairnet"
 )
 
 const (
@@ -117,6 +119,7 @@ type Account struct {
 	ca        ed25519.PublicKey
 	authority string
 	store     Store
+	network   *pairnet.Database
 	client    *http.Client
 	now       func() time.Time
 
@@ -126,6 +129,7 @@ type Account struct {
 	userID        string
 	deviceID      string
 	refreshHandle string
+	paired        map[string]PeerBinding
 
 	// In-memory host auth token used for direct-token renewal; never persisted.
 	liveToken     string
@@ -156,7 +160,101 @@ type persisted struct {
 	// RenewalDenied records a definitive authority rejection of the endpoint's
 	// standing credentials. It stays until a successful re-enrollment or fresh
 	// host token renewal.
-	RenewalDenied string `json:"renewal_denied,omitempty"`
+	RenewalDenied string                 `json:"renewal_denied,omitempty"`
+	Paired        map[string]PeerBinding `json:"paired,omitempty"`
+}
+
+type PeerBinding struct {
+	Owner string `json:"owner"`
+	Pin   string `json:"pin"`
+}
+
+func (binding PeerBinding) valid(device string) bool {
+	key, err := base64.RawURLEncoding.Strict().DecodeString(binding.Pin)
+	return err == nil && len(key) == ed25519.PublicKeySize && device != "" && len(device) <= 128 &&
+		binding.Owner != "" && len(binding.Owner) <= 128
+}
+
+func (a *Account) PairingIdentity(scope, role string) (*pairnet.Group, pairnet.Member) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deviceID == "" || len(a.key) != ed25519.PrivateKeySize {
+		return nil, pairnet.Member{}
+	}
+	member := pairnet.Member{ID: a.deviceID, Pin: base64.RawURLEncoding.EncodeToString(a.key.Public().(ed25519.PublicKey)), Owner: a.userID, Role: role}
+	return a.network.Group(scope, member.ID), member
+}
+
+func (a *Account) Pairings() map[string]PeerBinding {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return maps.Clone(a.paired)
+}
+
+func (a *Account) PairedPeer(device string) (PeerBinding, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	peer, ok := a.paired[device]
+	return peer, ok
+}
+
+func (a *Account) BindPeer(device string, peer PeerBinding) error {
+	return a.BindNetworkPeer(nil, device, peer)
+}
+
+func (a *Account) BindNetworkPeer(group *pairnet.Group, device string, peer PeerBinding) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deviceID == "" || !peer.valid(device) {
+		return errors.New("account: enrolled device and peer identity required")
+	}
+	if existing, ok := a.paired[device]; ok {
+		if existing != peer {
+			return errors.New("account: paired device identity changed")
+		}
+		return nil
+	}
+	paired := maps.Clone(a.paired)
+	if group != nil {
+		maps.DeleteFunc(paired, func(id string, _ PeerBinding) bool {
+			member, known := group.Get(id)
+			return known && !member.Active()
+		})
+	}
+	if len(paired) >= 128 {
+		return errors.New("account: paired device limit reached")
+	}
+	if paired == nil {
+		paired = make(map[string]PeerBinding)
+	}
+	previous := a.paired
+	paired[device] = peer
+	a.paired = paired
+	if err := a.saveLocked(); err != nil {
+		a.paired = previous
+		return err
+	}
+	return nil
+}
+
+func (a *Account) UnbindPeer(device string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	previous := a.paired
+	if device == "" {
+		a.paired = nil
+	} else {
+		if _, ok := previous[device]; !ok {
+			return errors.New("account: unknown paired device")
+		}
+		a.paired = maps.Clone(previous)
+		delete(a.paired, device)
+	}
+	if err := a.saveLocked(); err != nil {
+		a.paired = previous
+		return err
+	}
+	return nil
 }
 
 // New opens the account stored in store for the authority at baseURL. baseURL
@@ -186,7 +284,13 @@ func newAccount(baseURL, caHex string, store Store, now func() time.Time) (*Acco
 	if err != nil {
 		return nil, fmt.Errorf("account: parse pinned authority key: %w", err)
 	}
+	db, err := pairnet.Open(store)
+	if err != nil {
+		return nil, fmt.Errorf("account: load state: %w", err)
+	}
+	store = db
 	a := &Account{
+		network:   db,
 		base:      base,
 		ca:        ca,
 		authority: authorityFingerprint(ca),
@@ -273,6 +377,7 @@ func (a *Account) Reset() error {
 	a.certExpires = time.Time{}
 	a.userID = ""
 	a.deviceID = ""
+	a.paired = nil
 	a.refreshHandle = ""
 	a.liveToken = ""
 	a.lease = ""
@@ -763,6 +868,7 @@ func (a *Account) saveLocked() error {
 		DeviceID:      a.deviceID,
 		RefreshHandle: a.refreshHandle,
 		RenewalDenied: renewalDenialCode(a.renewalDenied),
+		Paired:        a.paired,
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -784,7 +890,7 @@ func (a *Account) saveKeyOnlyLocked(key ed25519.PrivateKey) error {
 	if err != nil {
 		return fmt.Errorf("account: encode state: %w", err)
 	}
-	if err := a.store.Save(string(data)); err != nil {
+	if err := a.network.Reset(string(data)); err != nil {
 		return fmt.Errorf("account: save state: %w", err)
 	}
 	return nil
@@ -814,7 +920,7 @@ func (a *Account) restore(raw string) error {
 	a.key = ed25519.NewKeyFromSeed(seed)
 
 	if state.Certificate == "" {
-		if state.UserID != "" || state.DeviceID != "" || state.RefreshHandle != "" || state.RenewalDenied != "" {
+		if state.UserID != "" || state.DeviceID != "" || state.RefreshHandle != "" || state.RenewalDenied != "" || len(state.Paired) != 0 {
 			return fmt.Errorf("%w: credentials without a certificate", ErrStateInvalid)
 		}
 		return nil
@@ -828,10 +934,19 @@ func (a *Account) restore(raw string) error {
 	if state.RenewalDenied == "refresh_rejected" && state.RefreshHandle == "" {
 		return fmt.Errorf("%w: renewal denial without a refresh handle", ErrStateInvalid)
 	}
+	if len(state.Paired) > 128 {
+		return fmt.Errorf("%w: paired device limit", ErrStateInvalid)
+	}
+	for device, binding := range state.Paired {
+		if !binding.valid(device) {
+			return fmt.Errorf("%w: invalid paired device", ErrStateInvalid)
+		}
+	}
 	a.certificate = state.Certificate
 	a.userID = state.UserID
 	a.deviceID = state.DeviceID
 	a.refreshHandle = state.RefreshHandle
+	a.paired = state.Paired
 	if state.RenewalDenied != "" {
 		a.renewalDenied = renewalDenialError(state.RenewalDenied)
 	}

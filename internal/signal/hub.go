@@ -16,10 +16,23 @@ import (
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/ice"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairing"
 	"vanora-relay/protocol"
 )
 
-const selfTurnWindow = 10 * time.Minute
+const (
+	selfTurnWindow = 10 * time.Minute
+
+	maxAuthenticatedSlots = 1024
+	maxPreAuthSlots       = 256
+	maxPreAuthPerIP       = 16
+
+	maxPhoneLinks          = 8
+	maxHostAcceptedLinks   = 32
+	maxHostPendingLinks    = 32
+	maxPendingPerPhoneHost = 2
+	maxPendingPerIPHost    = 16
+)
 
 // EntitlementVerifier checks whether the account that signed in with issuer
 // and subject may use TURN relay. A zero time with a nil error means the
@@ -40,16 +53,22 @@ type Hub struct {
 	ice           iceService
 	accessToken   [sha256.Size]byte
 	requireToken  bool
+	preAuthSlots  chan struct{}
+	preAuthMu     sync.Mutex
+	preAuthByIP   map[string]int
 	slots         chan struct{}
 	mu            sync.Mutex
 	peers         map[string]*peer
 	links         map[string]*link
+	invites       map[string]*peer
 }
 
 type peer struct {
 	id         identity.Principal
 	cert, role string
+	desktop    string
 	selfHosted bool
+	remoteIP   string
 	card       protocol.Message
 	lease      time.Time
 	online     bool
@@ -57,6 +76,8 @@ type peer struct {
 	out        chan protocol.Message
 	ctx        context.Context
 	cancel     context.CancelFunc
+	pairTicket string
+	invites    map[string]pairing.Record
 }
 
 type link struct {
@@ -73,12 +94,14 @@ type link struct {
 // key and checks TURN entitlement via entitlement.
 func New(key ed25519.PublicKey, entitlement EntitlementVerifier, network iceService) *Hub {
 	return &Hub{
-		key:         key,
-		entitlement: entitlement,
-		ice:         network,
-		slots:       make(chan struct{}, 1024),
-		peers:       make(map[string]*peer),
-		links:       make(map[string]*link),
+		key:          key,
+		entitlement:  entitlement,
+		ice:          network,
+		preAuthSlots: make(chan struct{}, maxPreAuthSlots),
+		preAuthByIP:  make(map[string]int),
+		slots:        make(chan struct{}, maxAuthenticatedSlots),
+		peers:        make(map[string]*peer),
+		links:        make(map[string]*link),
 	}
 }
 
@@ -88,11 +111,13 @@ func New(key ed25519.PublicKey, entitlement EntitlementVerifier, network iceServ
 // pairing on the desktop.
 func NewSelfHosted(accessToken string, network iceService) *Hub {
 	h := &Hub{
-		selfHosted: true,
-		ice:        network,
-		slots:      make(chan struct{}, 1024),
-		peers:      make(map[string]*peer),
-		links:      make(map[string]*link),
+		selfHosted:   true,
+		ice:          network,
+		preAuthSlots: make(chan struct{}, maxPreAuthSlots),
+		preAuthByIP:  make(map[string]int),
+		slots:        make(chan struct{}, maxAuthenticatedSlots),
+		peers:        make(map[string]*peer),
+		links:        make(map[string]*link),
 	}
 	if accessToken != "" {
 		h.RequireAccessToken(accessToken)
@@ -124,11 +149,11 @@ func (p *peer) send(m protocol.Message) {
 }
 
 func (host *peer) allows(visitor *peer) bool {
-	if !host.online || host.role != "desktop" {
+	if !host.online || host.role != "desktop" || host.id.DeviceID == visitor.id.DeviceID {
 		return false
 	}
 	if host.selfHosted {
-		return visitor.selfHosted && visitor.role == "mobile"
+		return visitor.selfHosted && (visitor.role == "mobile" || visitor.role == "desktop")
 	}
 	if visitor.selfHosted {
 		return false
@@ -154,13 +179,23 @@ func (h *Hub) drop(l *link, reason string) {
 	l.phone.send(msg)
 }
 
+func (p *peer) slotKey() string {
+	if p.desktop != "" {
+		return p.id.DeviceID + "\x00" + p.desktop
+	}
+	return p.id.DeviceID
+}
+
 func (h *Hub) remove(p *peer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.peers[p.id.DeviceID] != p {
+	if h.peers[p.slotKey()] != p {
 		return
 	}
-	delete(h.peers, p.id.DeviceID)
+	delete(h.peers, p.slotKey())
+	for key := range p.invites {
+		delete(h.invites, key)
+	}
 	for _, l := range h.links {
 		if l.host == p || l.phone == p {
 			h.drop(l, "endpoint_offline")
@@ -171,6 +206,12 @@ func (h *Hub) remove(p *peer) {
 func (h *Hub) expire(now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for key, host := range h.invites {
+		if !now.Before(host.invites[key].Expires) {
+			delete(host.invites, key)
+			delete(h.invites, key)
+		}
+	}
 	for _, p := range h.peers {
 		if !p.live(now) {
 			p.cancel()
@@ -246,7 +287,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			Card   protocol.Message `json:"card"`
 			Guests []string         `json:"guests"`
 		}
-		if p.role != "desktop" || json.Unmarshal(m.Data, &d) != nil {
+		if p.role != "desktop" || p.desktop != "" || json.Unmarshal(m.Data, &d) != nil {
 			return errors.New("invalid_device")
 		}
 		if h.selfHosted {
@@ -258,7 +299,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 				return errors.New("invalid_device")
 			}
 			p.card, p.online = d.Card, true
-			p.send(protocol.Message{Type: "device.registered"})
+			p.registered()
 			return nil
 		}
 		if d.Card.Certificate != p.cert || len(d.Guests) > 256 {
@@ -280,7 +321,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 				h.drop(l, "access_revoked")
 			}
 		}
-		p.send(protocol.Message{Type: "device.registered"})
+		p.registered()
 		return nil
 	case "devices.list":
 		if h.selfHosted {
@@ -306,22 +347,36 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 	}
 	if m.Type == "connect.request" {
 		host := h.peers[m.To]
-		if p.role != "mobile" || host == nil || !host.live(time.Now()) || !host.allows(p) {
+		if (p.role != "mobile" && p.role != "desktop") || (p.desktop != "" && p.desktop != m.To) || host == nil || !host.live(time.Now()) || !host.allows(p) {
 			return errors.New("device_unavailable")
 		}
 		if _, exists := h.links[m.Connection]; exists || m.Round != 0 {
 			return errors.New("invalid_connection")
 		}
-		phoneCount, hostCount := 0, 0
+		phoneCount, hostAccepted, hostPending, phoneHostPending, ipHostPending := 0, 0, 0, 0, 0
 		for _, l := range h.links {
-			if l.phone == p {
+			if l.phone.id.DeviceID == p.id.DeviceID {
 				phoneCount++
 			}
 			if l.host == host {
-				hostCount++
+				if l.accepted {
+					hostAccepted++
+				} else {
+					hostPending++
+					if l.phone.id.DeviceID == p.id.DeviceID {
+						phoneHostPending++
+					}
+					if p.remoteIP != "" && l.phone.remoteIP == p.remoteIP {
+						ipHostPending++
+					}
+				}
 			}
 		}
-		if phoneCount >= 8 || hostCount >= 32 {
+		if phoneCount >= maxPhoneLinks ||
+			hostAccepted >= maxHostAcceptedLinks ||
+			hostPending >= maxHostPendingLinks ||
+			phoneHostPending >= maxPendingPerPhoneHost ||
+			ipHostPending >= maxPendingPerIPHost {
 			return errors.New("connection_limit")
 		}
 		h.links[m.Connection] = &link{id: m.Connection, phone: p, host: host, phoneSeq: m.Seq, created: time.Now()}
@@ -447,6 +502,16 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 		return errors.New("ice_unavailable")
 	}
 	if accepting {
+		hostAccepted := 0
+		for _, existing := range h.links {
+			if existing.host == l.host && existing.accepted {
+				hostAccepted++
+			}
+		}
+		if hostAccepted >= maxHostAcceptedLinks {
+			h.drop(l, "connection_limit")
+			return errors.New("connection_limit")
+		}
 		l.accepted, l.hostSeq = true, m.Seq
 		if !h.selfHosted {
 			m.Certificate = p.cert

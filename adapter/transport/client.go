@@ -19,6 +19,7 @@ import (
 
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/identity"
+	"vanora-relay/internal/pairnet"
 	"vanora-relay/protocol"
 )
 
@@ -114,9 +115,14 @@ func (e *ClosedError) Error() string {
 // Closed; the host reconnects by calling Dial again with the same
 // IdentitySource.
 type Client struct {
-	role    string
-	source  IdentitySource
-	handler Handler
+	role       string
+	desktop    string
+	source     IdentitySource
+	handler    Handler
+	pairedRole endpoint.PairRoleAuthorizer
+	network    *NetworkHandler
+	netHookMu  sync.Mutex
+	netHook    func()
 
 	ws *websocket.Conn
 
@@ -142,6 +148,7 @@ type Client struct {
 	userID     string
 	authority  bool
 	guests     map[string]bool
+	pairTicket string
 	links      map[string]*link
 
 	authCbMu sync.Mutex
@@ -165,10 +172,45 @@ type leaseUpdate struct {
 	Certificate string `json:"certificate,omitempty"`
 }
 
-// Dial opens and authenticates one official-channel signaling connection. role
-// must be RoleDesktop or RoleMobile. The returned Client is usable until Done
-// is closed or Close is called.
+// Dial opens an official mobile signaling connection. Desktops supply their
+// device pairing policy to DialPairedDesktop before publishing.
 func Dial(ctx context.Context, url, role string, source IdentitySource, h Handler) (*Client, error) {
+	if role == RoleDesktop {
+		return nil, fmt.Errorf("%w: use DialPairedDesktop with a pairing authorizer", ErrInvalidArgument)
+	}
+	return dial(ctx, url, role, source, h, nil, "")
+}
+
+func DialMobileFor(ctx context.Context, url, desktop string, source IdentitySource, h Handler) (*Client, error) {
+	return dial(ctx, url, RoleMobile, source, h, nil, desktop)
+}
+
+// DialDesktopControllerFor opens a target-scoped outbound signaling connection
+// using the desktop's own official identity without publishing host presence.
+func DialDesktopControllerFor(ctx context.Context, url, desktop string, source IdentitySource, h Handler) (*Client, error) {
+	if strings.TrimSpace(desktop) == "" {
+		return nil, fmt.Errorf("%w: target desktop required", ErrInvalidArgument)
+	}
+	return dial(ctx, url, RoleDesktop, source, h, nil, desktop)
+}
+
+func DialPairedDesktop(ctx context.Context, url string, source IdentitySource, h Handler, paired endpoint.PairAuthorizer) (*Client, error) {
+	if paired == nil {
+		return nil, ErrInvalidArgument
+	}
+	return DialPairedDesktopWithRole(ctx, url, source, h, func(connection string, peer endpoint.PeerIdentity, _, _ string, proof []byte) bool {
+		return paired(connection, peer, proof)
+	})
+}
+
+func DialPairedDesktopWithRole(ctx context.Context, url string, source IdentitySource, h Handler, paired endpoint.PairRoleAuthorizer) (*Client, error) {
+	if paired == nil {
+		return nil, ErrInvalidArgument
+	}
+	return dial(ctx, url, RoleDesktop, source, h, paired, "")
+}
+
+func dial(ctx context.Context, url, role string, source IdentitySource, h Handler, paired endpoint.PairRoleAuthorizer, desktop string) (*Client, error) {
 	if role != RoleDesktop && role != RoleMobile {
 		return nil, fmt.Errorf("%w: role %q", ErrInvalidArgument, role)
 	}
@@ -199,8 +241,10 @@ func Dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 
 	c := &Client{
 		role:        role,
+		desktop:     desktop,
 		source:      source,
 		handler:     h,
+		pairedRole:  paired,
 		ws:          ws,
 		done:        make(chan struct{}),
 		guests:      make(map[string]bool),
@@ -227,7 +271,7 @@ func Dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 	if err != nil {
 		return fail(err)
 	}
-	login, err := creds.Login(challenge, role, proof.Lease)
+	login, err := creds.LoginFor(challenge, role, proof.Lease, desktop)
 	if err != nil {
 		return fail(fmt.Errorf("transport: sign login: %w", err))
 	}
@@ -249,6 +293,35 @@ func Dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 		return fail(fmt.Errorf("%w: relay accepted a different endpoint identity", ErrMalformedResponse))
 	}
 
+	if provider, ok := source.(interface {
+		PairingIdentity(string, string) (*pairnet.Group, pairnet.Member)
+	}); ok && role == RoleDesktop && desktop == "" {
+		group, _ := provider.PairingIdentity(url, role)
+		if group != nil {
+			c.network = &NetworkHandler{Handler: h, Group: func() *pairnet.Group { return group }, Device: func(p Peer) string { return p.(*peer).link.remoteDevice }}
+			c.network.Changed = func() {
+				c.mu.Lock()
+				var closed []*link
+				for _, l := range c.links {
+					if l.desktop && !group.Allows(l.remoteDevice) {
+						l.permitted.Store(false)
+						closed = append(closed, l)
+					}
+				}
+				c.mu.Unlock()
+				for _, l := range closed {
+					l.close(ErrUnauthorized, true)
+				}
+				c.netHookMu.Lock()
+				hook := c.netHook
+				c.netHookMu.Unlock()
+				if hook != nil {
+					hook()
+				}
+			}
+			c.handler = c.network
+		}
+	}
 	go c.readLoop()
 	go c.refreshLoop()
 	return c, nil
@@ -327,6 +400,9 @@ func (c *Client) Publish(ctx context.Context, name string, guests []string) erro
 
 	// Fail closed for revoked guests before the directory is updated.
 	for _, l := range links {
+		if !l.desktop {
+			continue
+		}
 		if !peerAllowed(owner, allowed, l.remoteUserID()) {
 			l.permitted.Store(false)
 			l.close(ErrUnauthorized, true)
@@ -346,7 +422,34 @@ func (c *Client) Publish(ctx context.Context, name string, guests []string) erro
 	if m.Type != "device.registered" {
 		return waiterFailure(m)
 	}
+	var registered struct {
+		Ticket string `json:"pairing_ticket"`
+	}
+	_ = json.Unmarshal(m.Data, &registered)
+	c.mu.Lock()
+	c.pairTicket = registered.Ticket
+	c.mu.Unlock()
 	return nil
+}
+
+func (c *Client) NetworkChanged() {
+	if c.network != nil {
+		c.network.Broadcast()
+	}
+}
+
+// SetNetworkChangedHook registers an optional callback triggered whenever the
+// host's pairing network changes (from inbound sync or local revocation).
+func (c *Client) SetNetworkChangedHook(fn func()) {
+	c.netHookMu.Lock()
+	c.netHook = fn
+	c.netHookMu.Unlock()
+}
+
+func (c *Client) PairingTicket() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pairTicket
 }
 
 // Devices lists signed, verified desktops that currently allow this endpoint.
@@ -393,12 +496,29 @@ func (c *Client) Devices(ctx context.Context) ([]endpoint.Device, error) {
 	return devices, nil
 }
 
+// ConnectOptions configures an outbound official connection.
+type ConnectOptions struct {
+	Pin     ed25519.PublicKey
+	Token   []byte
+	Role    string
+	Name    string
+	Handler Handler
+}
+
 // Connect opens one peer to the selected desktop and waits until the desktop
 // accepted the request and both endpoints verified each other's lease proof
 // on the encrypted channel. deviceID and ownerID must come from a trusted
 // binding or invitation, not only from the discovery directory.
 func (c *Client) Connect(ctx context.Context, deviceID, ownerID string) (Peer, error) {
-	if c.role != RoleMobile {
+	return c.ConnectPaired(ctx, deviceID, ownerID, nil, nil)
+}
+
+func (c *Client) ConnectPaired(ctx context.Context, deviceID, ownerID string, pin ed25519.PublicKey, token []byte) (Peer, error) {
+	return c.ConnectPairedWithOptions(ctx, deviceID, ownerID, ConnectOptions{Pin: pin, Token: token})
+}
+
+func (c *Client) ConnectPairedWithOptions(ctx context.Context, deviceID, ownerID string, opts ConnectOptions) (Peer, error) {
+	if c.role != RoleMobile && c.role != RoleDesktop {
 		return nil, ErrNotMobile
 	}
 	if deviceID == "" || ownerID == "" || containsControl(deviceID) || containsControl(ownerID) {
@@ -412,11 +532,23 @@ func (c *Client) Connect(ctx context.Context, deviceID, ownerID string) (Peer, e
 	if err != nil {
 		return nil, err
 	}
-	session, request, err := creds.Request(deviceID, ownerID)
+	if deviceID == creds.DeviceID() {
+		return nil, fmt.Errorf("%w: cannot connect to self", ErrInvalidArgument)
+	}
+	reqRole := opts.Role
+	if reqRole == "" && c.role == RoleDesktop {
+		reqRole = RoleDesktop
+	}
+	session, request, err := creds.RequestPairedWithMeta(deviceID, ownerID, opts.Pin, opts.Token, endpoint.ConnectRequestMeta{
+		Role: reqRole,
+		Name: opts.Name,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("transport: build connect request: %w", err)
 	}
 	l := newLink(c, session.ID(), session, false, false)
+	l.remoteDevice = deviceID
+	l.handler = opts.Handler
 	l.localProof = proof
 	c.addLink(l)
 	go l.run()
@@ -452,7 +584,7 @@ func (c *Client) Connect(ctx context.Context, deviceID, ownerID string) (Peer, e
 
 // acceptRequest handles one inbound connect.request on a desktop.
 func (c *Client) acceptRequest(m protocol.Message) {
-	if c.role != RoleDesktop || c.closed.Load() {
+	if c.role != RoleDesktop || c.desktop != "" || c.closed.Load() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, refreshTimeout)
@@ -461,11 +593,15 @@ func (c *Client) acceptRequest(m protocol.Message) {
 	if err != nil {
 		return
 	}
-	session, reply, err := creds.Accept(m, c.allowsUser, time.Now())
+	session, reply, err := creds.AcceptPairedWithRole(m, c.allowsUser, c.pairedRole, time.Now())
 	if err != nil {
+		if reply.Type == "connect.close" {
+			_ = c.sendSignal(reply)
+		}
 		return
 	}
 	l := newLink(c, session.ID(), session, true, true)
+	l.remoteDevice = m.From
 	l.localProof = proof
 	l.setRemoteUser(session.RemoteUserID())
 	if err := l.initAccess(); err != nil {
@@ -473,6 +609,10 @@ func (c *Client) acceptRequest(m protocol.Message) {
 		return
 	}
 	c.addLink(l)
+	if c.pairedRole != nil && !c.pairedRole(m.Connection, session.RemotePrincipal(), "", "", nil) {
+		l.close(ErrUnauthorized, true)
+		return
+	}
 	if !c.allowsUser(session.RemoteUserID()) {
 		l.permitted.Store(false)
 		l.close(ErrUnauthorized, true)
@@ -484,9 +624,24 @@ func (c *Client) acceptRequest(m protocol.Message) {
 	}
 }
 
+func (c *Client) RevokeDevice(device string) {
+	c.mu.Lock()
+	var revoked []*link
+	for _, l := range c.links {
+		if l.desktop && (device == "" || device == l.remoteDevice) {
+			l.permitted.Store(false)
+			revoked = append(revoked, l)
+		}
+	}
+	c.mu.Unlock()
+	for _, l := range revoked {
+		l.close(ErrUnauthorized, true)
+	}
+}
+
 func (c *Client) addLink(l *link) {
 	c.mu.Lock()
-	if c.role != RoleDesktop || l.remoteUserID() == "" || l.remoteUserID() == c.userID || c.guests[l.remoteUserID()] {
+	if !l.desktop || l.remoteUserID() == "" || l.remoteUserID() == c.userID || c.guests[l.remoteUserID()] {
 		l.permitted.Store(true)
 	} else {
 		l.permitted.Store(false)
@@ -703,9 +858,6 @@ func (c *Client) renew(ctx context.Context, now time.Time) error {
 // reply. Links younger than the relay's acceptance window are skipped so the
 // request is never rejected as refresh_unavailable.
 func (c *Client) refreshICE(now time.Time) {
-	if c.role != "mobile" {
-		return
-	}
 	c.mu.Lock()
 	links := make([]*link, 0, len(c.links))
 	for _, l := range c.links {
@@ -759,7 +911,7 @@ func (c *Client) dispatch(m protocol.Message) {
 		}
 		c.notifyWaiters(m)
 	case "connect.request":
-		if c.role == RoleDesktop {
+		if c.role == RoleDesktop && c.desktop == "" {
 			go c.acceptRequest(m)
 		}
 	case "connect.accept", "connect.closed", "rtc.offer", "rtc.answer", "rtc.candidate":
