@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -61,6 +62,25 @@ func (c *Credentials) LoginFor(challenge protocol.Message, role, lease, desktop 
 	}
 	err := m.Sign(c.key, protocol.Encode(fields))
 	return m, err
+}
+
+// SignActivityPoll produces a base64url-encoded signed activity.poll proof for
+// polling redacted session states of targetDevice from the relay over HTTPS.
+func (c *Credentials) SignActivityPoll(targetDevice string, now time.Time) (string, error) {
+	targetDevice = strings.TrimSpace(targetDevice)
+	if targetDevice == "" || targetDevice == c.DeviceID() {
+		return "", errors.New("invalid target device")
+	}
+	m := protocol.Message{
+		Type:        "activity.poll",
+		From:        c.DeviceID(),
+		To:          targetDevice,
+		Certificate: c.cert,
+	}
+	if err := m.Sign(c.key, []byte(strconv.FormatInt(now.UnixMilli(), 10))); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(protocol.Encode(m)), nil
 }
 
 type Session struct {

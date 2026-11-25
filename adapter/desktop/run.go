@@ -58,6 +58,7 @@ type run struct {
 	sessionID      string
 	session        *sessionRuntime
 	userID         string
+	localApproved  bool
 	requestID      string
 	text           string
 	tools          bool
@@ -723,6 +724,13 @@ func (a *Adapter) handleExtensionUI(r *run, rec rpcRecord) {
 		"method":     info.Method,
 		"title":      info.Title,
 	})
+	a.emitActivity(ActivityEvent{
+		SessionID: sessionID,
+		RunID:     runID,
+		Phase:     "awaiting_approval",
+		UIID:      info.UIID,
+		Method:    info.Method,
+	})
 }
 
 func (a *Adapter) timeoutPendingUI(r *run, uiID string) {
@@ -734,6 +742,7 @@ func (a *Adapter) timeoutPendingUI(r *run, uiID string) {
 	}
 	pui.resolved = true
 	delete(r.pendingUI, uiID)
+	hasMoreUI := len(r.pendingUI) > 0
 	a.appendEventVisibleLocked(r.session, r.id, kindUIResolved, uiResolvedData{UIID: uiID, Status: "timed_out"}, true, visApproval, r.userID)
 	sessionID := r.session.cfg.id
 	runID := r.id
@@ -743,6 +752,13 @@ func (a *Adapter) timeoutPendingUI(r *run, uiID string) {
 		"id":        uiID,
 		"cancelled": true,
 	})
+	if !hasMoreUI {
+		a.emitActivity(ActivityEvent{
+			SessionID: sessionID,
+			RunID:     runID,
+			Phase:     statusRunning,
+		})
+	}
 	a.emitObserve(map[string]any{
 		"type":       "ui.resolved",
 		"session_id": sessionID,
@@ -868,9 +884,16 @@ func (a *Adapter) finishRun(r *run) {
 		if err := a.saveLocked(); err != nil {
 			a.logger.Error("persist run terminal", "session", r.session.cfg.id, "run", r.id, "error", err)
 		}
+		sessionID := r.session.cfg.id
+		runID := r.id
 		close(r.done)
 		a.mu.Unlock()
 		flushUICancels(uiCancels)
+		a.emitActivity(ActivityEvent{
+			SessionID: sessionID,
+			RunID:     runID,
+			Phase:     status,
+		})
 	})
 }
 

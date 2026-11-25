@@ -135,7 +135,9 @@ go build -ldflags "\
 | `auth.token` | `channel: "cn" \| "global"`, `token` | 注入或更新对应站点宿主令牌；若该站为活跃渠道则立即注册或续期（绝不跨站复用） |
 | `auth.logout` | `channel: "cn" \| "global"`, `request_id?` | 仅登出并重置该站点凭据，不影响另一站、自建通道或局域网；返回 `auth.logout.ok` |
 | `access.relay.set` | `enabled`, `channel?: "cn" \| "global" \| "self"`, `signal_url?`, `signal_token?` | 启停或热切换广域网中转；`cn`/`global` 校验对应站令牌，`self` 校验 `signal_url` 与 `signal_token` |
-| `access.lan.set` | `enabled`, `address?` | 启停局域网监听（启用时传私有 IP:端口，如 `192.168.1.42:3773`） |
+| `access.lan.set` | `enabled`, `address?` | 启停局域网/Tailnet 监听（支持 RFC1918/RFC4193 私网及 `100.64.0.0/10` Tailnet 地址） |
+| `access.activity.set` | `enabled` | 运行时动态启停向当前中转节点发布零信任脱敏运行态势 |
+| `session.guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`) | 本机宿主直接批准或忽略只读访客提交的 `guest.request` 提问 |
 | `reload` / `status` / `shutdown` | — | 热重载 `desktop.json`、查询简要状态、优雅退出 |
 
 ### 配对邀请与配对网管理
@@ -182,11 +184,13 @@ go build -ldflags "\
 | :--- | :--- | :--- |
 | `remote.peers.list` | `channel?` | 返回 `remote.peers`（含 `peer_id`、`channel`、`name`、`address`、`online`、`state`、`path`） |
 | `remote.pair` | `input`, `channel?`, `signal_url?`, `signal_token?`, `grant_access?` | 接受二维码链接或 16 位手输码完成配对、同步配对网并建连；返回 `remote.paired` |
-| `remote.connect` / `disconnect` / `reconnect` | `peer_id`, `channel?` | 连接已知配对网电脑 / 断开并暂停重连 / 主动重连并自动续订游标 |
+| `remote.connect` / `disconnect` / `reconnect` / `wakeup` | `peer_id`, `channel?`, `long_resume?` | 连接已知电脑 / 断开 / 强制重连 / **先探活再重连**（并行检测静默半开死连接） |
+| `remote.route.add` / `remove` | `peer_id`, `address`, `channel?: "lan"` | 为已配对电脑注册或移除备用局域网 / Tailnet（`100.64.0.0/10`）路由，后台自动向高优路由回切 |
 | `remote.workspace.list` | `peer_id`, `channel?` | 查询远程电脑白名单工作区；返回 `remote.result` |
-| `remote.session.create` / `list` / `open` | `peer_id`, `workspace_id` 或 `session_id`, `title?`, `channel?` | 远程创建会话 / 列出会话 / 拉取快照并自动订阅实时流 |
+| `remote.session.create` / `list` / `open` | `peer_id`, `workspace_id` 或 `session_id`, `title?`, `namespace?`, `link_origin?`, `mode_limit?` | 远程创建会话（支持幂等命名空间、`link_origin` 围栏与 `mode_limit` 单调收窄）/ 列出会话 / 拉取快照 |
 | `remote.events.resume` / `ack` | `peer_id`, `session_id`, `after_seq` 或 `seq`, `channel?` | 补发断点事件 / 确认已消费序号以支持断线自动恢复 |
-| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` 或 `run_id`, `channel?` | 发起幂等对话/工具运行 / 取消指定运行 |
+| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` 或 `run_id`, `namespace?`, `link_origin?`, `mode_limit?` | 发起幂等对话/工具运行 / 取消指定运行（受控子进程内自动阻止 `A -> B -> C` 二次跳跃转发） |
+| `remote.guest.request` / `respond` | `peer_id`, `session_id`, `text` 或 `guest_request_id`+`action` | 只读提交待主人确认的提问 / 会话主人远程批准或忽略提问 |
 | `remote.ui.respond` | `peer_id`, `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | 响应远程审批或提问弹窗 |
 
 异步推送事件包括：`remote.connection.state`、`remote.event`（流式文本/思考/工具/审批/运行终态）、`remote.network.updated`、`remote.access.state`、`remote.auth.state`、`remote.subscription.error` 与 `remote.error`。
@@ -299,6 +303,7 @@ go build -ldflags "\
 | `allow_slash_commands` | `false` | 是否允许远程提交 `/` 开头的斜杠命令（默认禁用以防调用未授权模板/工具） |
 | `max_text_bytes` | `64 KiB`（上限 `1 MiB`） | 单条远程提示词最大字节数 |
 | `max_snapshot_bytes` | `16 MiB`（上限 `48 MiB`） | `session.open` 快照体积上限，超出返回 `snapshot_too_large` |
+| `publish_activity` | `false` | 是否向当前在线中转节点自动发布零信任脱敏会话态势（供手机 `PollActivity` 与可选 `RELAY_PUSH_WEBHOOK_URL` 消费） |
 | `retention` | `4096` 条 / `4 MiB` / `4096` 请求 | 单会话事件回放窗口与 `request_id` 幂等去重保留上限 |
 
 #### 工作区与会话权限
@@ -312,6 +317,8 @@ go build -ldflags "\
 | `tools` | 本机实际启用的工具白名单；空数组 `[]` 表示纯文本对话（自动传 `--no-tools`） |
 | `show_thinking` / `show_tools` | 是否向主人与 `control` 配对端展示思考过程和工具详情（默认关闭；未授权查看者仅收到无信息泄露的 `sync` 占位序号） |
 | `approval_policy` | `"none"`（默认，本地自动取消交互弹窗）或 `"remote"`（加载审批守卫拦截写入/破坏性/开放世界工具并推送远端确认，同时支持 `ask` 提问；审批超时可通过环境变量 `VANORA_RELAY_APPROVAL_TIMEOUT_MS` 调整，默认与上限 `300000` ms） |
+| `fence_peer_sessions` | 开启后，非主人对端仅可在自身新建的受围栏会话（`link_origin`）中执行/取消任务，禁止改动宿主既有会话或其他对端会话，且自动向子进程注入 `VANORA_LINK_ORIGIN` 阻断跨机传递跳跃 |
+| `allow_guest_requests` | 开启后，只读访客可通过 `guest.request` 提交待主人确认的提示词请求（不赋予直接 `run.start` 权限） |
 | `users` | 官方渠道显式访客列表（同时支持 `sessions` 与 `workspaces`）。`read` 控制读取，`tools` 控制提交提示词，思考/工具/审批可见性须分别显式开启 |
 
 > [!WARNING]

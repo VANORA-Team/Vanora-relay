@@ -20,6 +20,8 @@ const (
 	kindToolEnd       = "tool.end"
 	kindUIRequest     = "ui.request"
 	kindUIResolved    = "ui.resolved"
+	kindGuestRequest  = "guest.request"
+	kindGuestResolved = "guest.resolved"
 	kindSync          = "sync"
 	kindRunCompleted  = "run.completed"
 	kindRunCancelled  = "run.cancelled"
@@ -29,6 +31,7 @@ const (
 	visThinking = "thinking"
 	visTools    = "tools"
 	visApproval = "approval"
+	visGuest    = "guest"
 
 	statusRunning    = "running"
 	statusCancelling = "cancelling"
@@ -45,13 +48,17 @@ type persistedState struct {
 }
 
 type createdSessionRecord struct {
-	ID          string `json:"id"`
-	WorkspaceID string `json:"workspace_id"`
-	Title       string `json:"title"`
-	WorkingDir  string `json:"working_dir"`
-	SessionFile string `json:"session_file"`
-	Owner       string `json:"owner"`
-	Created     int64  `json:"created"`
+	ID            string   `json:"id"`
+	WorkspaceID   string   `json:"workspace_id"`
+	Title         string   `json:"title"`
+	WorkingDir    string   `json:"working_dir"`
+	SessionFile   string   `json:"session_file"`
+	Owner         string   `json:"owner"`
+	LinkOrigin    string   `json:"link_origin,omitempty"`
+	ReadOnly      bool     `json:"read_only,omitempty"`
+	HasToolsLimit bool     `json:"has_tools_limit,omitempty"`
+	ToolsLimit    []string `json:"tools_limit,omitempty"`
+	Created       int64    `json:"created"`
 }
 
 type createRequestRecord struct {
@@ -63,11 +70,13 @@ type createRequestRecord struct {
 type persistedSession struct {
 	// LastSeq is the newest event sequence ever assigned for this session. It
 	// is persisted even when older events fall out of retention.
-	LastSeq  int64                    `json:"last_seq"`
-	FirstSeq int64                    `json:"first_seq,omitempty"`
-	Events   []storedEvent            `json:"events,omitempty"`
-	Requests map[string]requestRecord `json:"requests,omitempty"`
-	Runs     map[string]runRecord     `json:"runs,omitempty"`
+	LastSeq       int64                         `json:"last_seq"`
+	FirstSeq      int64                         `json:"first_seq,omitempty"`
+	Events        []storedEvent                 `json:"events,omitempty"`
+	Requests      map[string]requestRecord      `json:"requests,omitempty"`
+	Runs          map[string]runRecord          `json:"runs,omitempty"`
+	GuestRequests map[string]guestRequestRecord `json:"guest_requests,omitempty"`
+	PendingGuest  []guestRequestData            `json:"pending_guest,omitempty"`
 }
 
 type storedEvent struct {
@@ -146,6 +155,28 @@ type uiResolvedData struct {
 	Status string `json:"status"`
 }
 
+type guestRequestRecord struct {
+	GuestRequestID string `json:"guest_request_id"`
+	TextSHA        string `json:"text_sha"`
+	Status         string `json:"status"`
+	RunID          string `json:"run_id,omitempty"`
+	Created        int64  `json:"created"`
+}
+
+type guestRequestData struct {
+	GuestRequestID string `json:"guest_request_id"`
+	SessionID      string `json:"session_id"`
+	UserID         string `json:"user_id"`
+	Text           string `json:"text"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+type guestResolvedData struct {
+	GuestRequestID string `json:"guest_request_id"`
+	Status         string `json:"status"`
+	RunID          string `json:"run_id,omitempty"`
+}
+
 type runCancelledData struct {
 	Reason string `json:"reason"`
 }
@@ -165,8 +196,9 @@ func newPersistedState() *persistedState {
 
 func newPersistedSession() *persistedSession {
 	return &persistedSession{
-		Requests: make(map[string]requestRecord),
-		Runs:     make(map[string]runRecord),
+		Requests:      make(map[string]requestRecord),
+		Runs:          make(map[string]runRecord),
+		GuestRequests: make(map[string]guestRequestRecord),
 	}
 }
 
@@ -225,6 +257,9 @@ func (ps *persistedSession) validateAndNormalize() error {
 	}
 	if ps.Runs == nil {
 		ps.Runs = make(map[string]runRecord)
+	}
+	if ps.GuestRequests == nil {
+		ps.GuestRequests = make(map[string]guestRequestRecord)
 	}
 	for id, rec := range ps.Runs {
 		switch rec.Status {
@@ -300,6 +335,7 @@ func (ps *persistedSession) trim(ret RetentionConfig) {
 	ps.recalculateFirstSeq()
 	trimMap(ps.Requests, ret.MaxRequests, func(r requestRecord) int64 { return r.Created })
 	trimMap(ps.Runs, ret.MaxRequests, func(r runRecord) int64 { return r.Created })
+	trimMap(ps.GuestRequests, ret.MaxRequests, func(r guestRequestRecord) int64 { return r.Created })
 }
 
 func trimMap[V any](m map[string]V, max int, created func(V) int64) {

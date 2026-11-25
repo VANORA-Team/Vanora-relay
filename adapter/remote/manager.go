@@ -5,7 +5,9 @@ package remote
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 	"vanora-relay/adapter/transport"
 	"vanora-relay/internal/pairing"
 	"vanora-relay/internal/pairnet"
+	"vanora-relay/internal/routes"
 	"vanora-relay/protocol"
 )
 
@@ -75,17 +78,20 @@ type PairOptions struct {
 
 // PeerInfo summarizes a known paired or connected remote desktop.
 type PeerInfo struct {
-	PeerID    string `json:"peer_id"`
-	Channel   string `json:"channel"`
-	Role      string `json:"role"`
-	Name      string `json:"name,omitempty"`
-	Owner     string `json:"owner,omitempty"`
-	Address   string `json:"address,omitempty"`
-	SignalURL string `json:"signal_url,omitempty"`
-	Online    *bool  `json:"online,omitempty"`
-	State     string `json:"state"`
-	Path      string `json:"path,omitempty"`
-	Error     string `json:"error,omitempty"`
+	PeerID        string         `json:"peer_id"`
+	Channel       string         `json:"channel"`
+	Role          string         `json:"role"`
+	Name          string         `json:"name,omitempty"`
+	Owner         string         `json:"owner,omitempty"`
+	Address       string         `json:"address,omitempty"`
+	SignalURL     string         `json:"signal_url,omitempty"`
+	Online        *bool          `json:"online,omitempty"`
+	State         string         `json:"state"`
+	Path          string         `json:"path,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Generation    uint64         `json:"generation,omitempty"`
+	TransportHint string         `json:"transport_hint,omitempty"`
+	Routes        []routes.Entry `json:"routes,omitempty"`
 }
 
 // UIResponse carries an answer to a remote desktop's approval or ask prompt.
@@ -94,6 +100,42 @@ type UIResponse struct {
 	Value     *string    `json:"value,omitempty"`
 	Answers   [][]string `json:"answers,omitempty"`
 	Cancelled bool       `json:"cancelled,omitempty"`
+}
+
+// ModeLimit monotonically narrows permissions for a delegated session or run
+// on a remote desktop; the target desktop intersects it downward with its own
+// local desktop.json ACL so a caller can never widen capabilities.
+type ModeLimit struct {
+	ReadOnly bool     `json:"read_only,omitempty"`
+	NoTools  bool     `json:"no_tools,omitempty"`
+	Tools    []string `json:"tools,omitempty"`
+}
+
+// RequestOptions attaches optional multi-agent delegation fences, idempotency
+// namespacing, and monotonic permission narrowing to session.create / run.start.
+type RequestOptions struct {
+	Namespace  string     `json:"namespace,omitempty"`
+	LinkOrigin string     `json:"link_origin,omitempty"`
+	ModeLimit  *ModeLimit `json:"mode_limit,omitempty"`
+}
+
+// ScopedRequestID deterministically namespaces a caller requestID under
+// namespace so concurrent agents or forwarding hops sharing one desktop
+// controller never collide on idempotency keys, while staying <= 128 bytes.
+func ScopedRequestID(namespace, requestID string) string {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		requestID = NewRequestID()
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return requestID
+	}
+	h := sha256.New()
+	h.Write([]byte(namespace))
+	h.Write([]byte{0})
+	h.Write([]byte(requestID))
+	return "fwd:" + hex.EncodeToString(h.Sum(nil))[:48]
 }
 
 type peerKey struct {
@@ -418,6 +460,58 @@ func (m *Manager) Reconnect(ctx context.Context, channel, peerID string) (PeerIn
 	}
 	if err := rp.Reconnect(ctx); err != nil {
 		return rp.Info(), err
+	}
+	return rp.Info(), nil
+}
+
+// Wakeup probes an established peer connection (with parallel silent-socket
+// detection) instead of blindly tearing down a healthy link, reconnecting only
+// when disconnected, silent, or timed out.
+func (m *Manager) Wakeup(ctx context.Context, channel, peerID string, longResume bool) (PeerInfo, error) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return PeerInfo{}, errors.New("remote: peer_id is required")
+	}
+	ch, err := m.resolveChannelForPeer(channel, peerID)
+	if err != nil {
+		return PeerInfo{}, err
+	}
+	rp := m.getOrCreatePeer(ch, peerID)
+	if err := rp.Wakeup(ctx, longResume); err != nil {
+		return rp.Info(), err
+	}
+	return rp.Info(), nil
+}
+
+// AddRoute registers an alternate private LAN or tailnet (100.64.0.0/10)
+// IP:port route for a paired LAN peer and triggers better-route evaluation.
+func (m *Manager) AddRoute(channel, peerID, address string) (PeerInfo, error) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return PeerInfo{}, errors.New("remote: peer_id is required")
+	}
+	ch := strings.ToLower(strings.TrimSpace(channel))
+	if ch == "" {
+		ch = ChannelLAN
+	}
+	if ch != ChannelLAN {
+		return PeerInfo{}, errors.New("remote: alternate IP routes are only supported on channel lan")
+	}
+	rp := m.getOrCreatePeer(ChannelLAN, peerID)
+	if err := rp.AddRoute(address); err != nil {
+		return PeerInfo{}, err
+	}
+	return rp.Info(), nil
+}
+
+// RemoveRoute removes an alternate IP:port route from a paired LAN peer.
+func (m *Manager) RemoveRoute(channel, peerID, address string) (PeerInfo, error) {
+	rp, err := m.lookupPeer(channel, peerID)
+	if err != nil {
+		return PeerInfo{}, err
+	}
+	if err := rp.RemoveRoute(address); err != nil {
+		return PeerInfo{}, err
 	}
 	return rp.Info(), nil
 }
@@ -794,11 +888,15 @@ func (m *Manager) ListWorkspaces(ctx context.Context, channel, peerID string) (j
 }
 
 func (m *Manager) CreateSession(ctx context.Context, channel, peerID, workspaceID, requestID, title string) (json.RawMessage, error) {
+	return m.CreateSessionWithOptions(ctx, channel, peerID, workspaceID, requestID, title, RequestOptions{})
+}
+
+func (m *Manager) CreateSessionWithOptions(ctx context.Context, channel, peerID, workspaceID, requestID, title string, opts RequestOptions) (json.RawMessage, error) {
 	rp, err := m.lookupPeer(channel, peerID)
 	if err != nil {
 		return nil, err
 	}
-	return rp.CreateSession(ctx, workspaceID, requestID, title)
+	return rp.CreateSessionWithOptions(ctx, workspaceID, requestID, title, opts)
 }
 
 func (m *Manager) ListSessions(ctx context.Context, channel, peerID string) (json.RawMessage, error) {
@@ -834,19 +932,27 @@ func (m *Manager) Acknowledge(channel, peerID, sessionID string, seq int64) erro
 }
 
 func (m *Manager) StartRun(ctx context.Context, channel, peerID, sessionID, requestID, text string) (json.RawMessage, error) {
+	return m.StartRunWithOptions(ctx, channel, peerID, sessionID, requestID, text, RequestOptions{})
+}
+
+func (m *Manager) StartRunWithOptions(ctx context.Context, channel, peerID, sessionID, requestID, text string, opts RequestOptions) (json.RawMessage, error) {
 	rp, err := m.lookupPeer(channel, peerID)
 	if err != nil {
 		return nil, err
 	}
-	return rp.StartRun(ctx, sessionID, requestID, text)
+	return rp.StartRunWithOptions(ctx, sessionID, requestID, text, opts)
 }
 
 func (m *Manager) CancelRun(ctx context.Context, channel, peerID, sessionID, runID string) (json.RawMessage, error) {
+	return m.CancelRunWithOrigin(ctx, channel, peerID, sessionID, runID, "")
+}
+
+func (m *Manager) CancelRunWithOrigin(ctx context.Context, channel, peerID, sessionID, runID, linkOrigin string) (json.RawMessage, error) {
 	rp, err := m.lookupPeer(channel, peerID)
 	if err != nil {
 		return nil, err
 	}
-	return rp.CancelRun(ctx, sessionID, runID)
+	return rp.CancelRunWithOrigin(ctx, sessionID, runID, linkOrigin)
 }
 
 func (m *Manager) RespondUI(ctx context.Context, channel, peerID, sessionID, runID, uiID string, payload UIResponse) (json.RawMessage, error) {
@@ -855,6 +961,22 @@ func (m *Manager) RespondUI(ctx context.Context, channel, peerID, sessionID, run
 		return nil, err
 	}
 	return rp.RespondUI(ctx, sessionID, runID, uiID, payload)
+}
+
+func (m *Manager) SubmitGuestRequest(ctx context.Context, channel, peerID, sessionID, requestID, text string) (json.RawMessage, error) {
+	rp, err := m.lookupPeer(channel, peerID)
+	if err != nil {
+		return nil, err
+	}
+	return rp.SubmitGuestRequest(ctx, sessionID, requestID, text)
+}
+
+func (m *Manager) RespondGuestRequest(ctx context.Context, channel, peerID, sessionID, guestRequestID, action string) (json.RawMessage, error) {
+	rp, err := m.lookupPeer(channel, peerID)
+	if err != nil {
+		return nil, err
+	}
+	return rp.RespondGuestRequest(ctx, sessionID, guestRequestID, action)
 }
 
 func decodePin32(b64 string) ([]byte, error) {

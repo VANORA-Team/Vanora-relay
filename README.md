@@ -29,10 +29,10 @@
   支持免账号的 **局域网直连（LAN）** 与 **自建中转（Self）**，也支持严格分站隔离的 **CN / GLOBAL 官方中转**。本机可同时登录多个模型供应商，按需交叉组合不同中转通道。
 - **一次扫码组网，手机与电脑双向互控**
   扫描二维码或输入 16 位加密手输码即可加入设备配对网（PairNet）。同一网络内支持 **手机 ↔ 电脑** 与 **电脑 ↔ 电脑** 双向互认与并发控制，同时每台电脑独立执行本机 ACL 权限。
-- **直连优先，按需 TURN 中继**
-  优先通过 STUN 建立 P2P 直连；在复杂 NAT 环境下自动无缝切换至 TURN 转发，并在直连恢复后优先迁移。支持移动切网重连、事件序号游标补发（`events.resume`）与 `request_id` 幂等去重。
-- **细粒度本地授权与远程审批**
-  通过本机 `desktop.json` 白名单严格控制暴露的工作区、会话与本地工具集；开启 `approval_policy: "remote"` 后，写入或破坏性工具操作会经加密通道推送到手机/控制端实时确认，支持随时撤权并立即取消运行中的访客任务。
+- **直连优先，按需 TURN 中继与多路径自动回切**
+  优先通过 STUN 建立 P2P 直连；在复杂 NAT 环境下自动切换至 TURN 转发。原生支持 **局域网 + Tailnet（`100.64.0.0/10`）多地址优选与后台平滑回切**、**无损唤醒探测（`Wakeup` 探活保连 + 并行静默死连接秒级替换）**、事件游标补发（`events.resume`）与命名空间化 `request_id` 幂等去重。
+- **细粒度本地授权、多端委派围栏与访客提问门禁**
+  通过本机 `desktop.json` 白名单严格控制暴露的工作区、会话与工具集；支持 **`link_origin` 跨机委派会话围栏**、**`mode_limit` 单调权限收窄**、**非传递跳跃防护**、**`approval_policy: "remote"` 实时工具审批**、**`allow_guest_requests` 只读访客提问门禁**，以及 **零信任脱敏运行态势通知（`PollActivity` / Push Webhook）**。
 - **嵌入式 Sidecar 与原生移动 SDK**
   提供 `vanora-desktop` 独立 CLI / 热切换 Sidecar 二进制，以及基于 `gomobile` 构建的 Android AAR 与 iOS XCFramework，开箱即接入原生系统密钥库（Keychain / Keystore / Credential Manager）。
 

@@ -61,6 +61,7 @@ type Hub struct {
 	peers         map[string]*peer
 	links         map[string]*link
 	invites       map[string]*peer
+	activity      *activityTracker
 }
 
 type peer struct {
@@ -74,6 +75,8 @@ type peer struct {
 	online     bool
 	grants     map[string]bool
 	out        chan protocol.Message
+	probeWake  chan struct{}
+	lastProbe  time.Time
 	ctx        context.Context
 	cancel     context.CancelFunc
 	pairTicket string
@@ -173,7 +176,9 @@ func (p *peer) live(now time.Time) bool {
 
 func (h *Hub) drop(l *link, reason string) {
 	delete(h.links, l.id)
-	h.ice.Revoke(l.id)
+	if h.ice != nil {
+		h.ice.Revoke(l.id)
+	}
 	msg := protocol.Message{Type: "connect.closed", Connection: l.id, Data: protocol.Encode(reason)}
 	l.host.send(msg)
 	l.phone.send(msg)
@@ -225,6 +230,7 @@ func (h *Hub) expire(now time.Time) {
 }
 
 func (h *Hub) Run(ctx context.Context) {
+	h.ensureActivityTracker().startWorker(ctx)
 	timer := time.NewTicker(time.Second)
 	defer timer.Stop()
 	for {
@@ -489,17 +495,23 @@ func (h *Hub) configure(p *peer, m protocol.Message) error {
 		}
 	}
 	if !until.After(time.Now()) {
-		h.ice.Revoke(l.id)
+		if h.ice != nil {
+			h.ice.Revoke(l.id)
+		}
 		until = time.Time{}
 	}
 	visitor := l.phone.id.RemoteUserID()
 	if h.selfHosted {
 		visitor = l.phone.id.DeviceID
 	}
-	servers, err := h.ice.Config(l.id, visitor, until)
-	if err != nil {
-		h.drop(l, "ice_unavailable")
-		return errors.New("ice_unavailable")
+	servers := []ice.ICEServer{}
+	if h.ice != nil {
+		var err error
+		servers, err = h.ice.Config(l.id, visitor, until)
+		if err != nil {
+			h.drop(l, "ice_unavailable")
+			return errors.New("ice_unavailable")
+		}
 	}
 	if accepting {
 		hostAccepted := 0

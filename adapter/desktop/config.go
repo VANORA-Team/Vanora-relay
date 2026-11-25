@@ -65,6 +65,11 @@ type Config struct {
 	// cap. A larger conversation is refused with snapshot_too_large instead of
 	// exhausting memory or silently truncating history.
 	MaxSnapshotBytes int `json:"max_snapshot_bytes,omitempty"`
+
+	// PublishActivity enables publishing redacted, content-free session state
+	// transitions (running, awaiting_approval, completed, failed, cancelled) to
+	// the active relay for background mobile status polling and push webhooks.
+	PublishActivity bool `json:"publish_activity,omitempty"`
 }
 
 // RetentionConfig bounds persisted replay data per session.
@@ -124,6 +129,14 @@ type SessionConfig struct {
 	// when tools are enabled).
 	ApprovalPolicy string `json:"approval_policy,omitempty"`
 
+	// FencePeerSessions prevents non-owner peers from starting or cancelling
+	// runs on pre-existing host sessions or sessions created by other peers.
+	FencePeerSessions bool `json:"fence_peer_sessions,omitempty"`
+
+	// AllowGuestRequests lets read-only viewers submit owner-gated prompt
+	// requests via guest.request without granting direct run.start execution.
+	AllowGuestRequests bool `json:"allow_guest_requests,omitempty"`
+
 	// Users are additional explicit grants. Any user absent from this list
 	// (and not the owner) has no access at all.
 	Users []Grant `json:"users,omitempty"`
@@ -132,19 +145,21 @@ type SessionConfig struct {
 // WorkspaceConfig is an explicitly allowed project directory where the owner
 // can remotely create new Vanora sessions.
 type WorkspaceConfig struct {
-	ID             string   `json:"id"`
-	Title          string   `json:"title,omitempty"`
-	WorkingDir     string   `json:"working_dir"`
-	SessionDir     string   `json:"session_dir,omitempty"`
-	Owner          string   `json:"owner"`
-	LANAccess      bool     `json:"lan_access,omitempty"`
-	SelfAccess     bool     `json:"self_access,omitempty"`
-	Tools          []string `json:"tools,omitempty"`
-	Arguments      []string `json:"arguments,omitempty"`
-	ShowThinking   bool     `json:"show_thinking,omitempty"`
-	ShowTools      bool     `json:"show_tools,omitempty"`
-	ApprovalPolicy string   `json:"approval_policy,omitempty"`
-	Users          []Grant  `json:"users,omitempty"`
+	ID                 string   `json:"id"`
+	Title              string   `json:"title,omitempty"`
+	WorkingDir         string   `json:"working_dir"`
+	SessionDir         string   `json:"session_dir,omitempty"`
+	Owner              string   `json:"owner"`
+	LANAccess          bool     `json:"lan_access,omitempty"`
+	SelfAccess         bool     `json:"self_access,omitempty"`
+	Tools              []string `json:"tools,omitempty"`
+	Arguments          []string `json:"arguments,omitempty"`
+	ShowThinking       bool     `json:"show_thinking,omitempty"`
+	ShowTools          bool     `json:"show_tools,omitempty"`
+	ApprovalPolicy     string   `json:"approval_policy,omitempty"`
+	FencePeerSessions  bool     `json:"fence_peer_sessions,omitempty"`
+	AllowGuestRequests bool     `json:"allow_guest_requests,omitempty"`
+	Users              []Grant  `json:"users,omitempty"`
 }
 
 // Grant is one remote user's permission for one session.
@@ -180,43 +195,50 @@ type normalizedConfig struct {
 	workspacesByID    map[string]*normalizedWorkspace
 	retention         RetentionConfig
 	allowSlash        bool
+	publishActivity   bool
 	maxText           int
 	maxSnapshot       int
 }
 
 type normalizedWorkspace struct {
-	id             string
-	title          string
-	workDir        string
-	sessionDir     string
-	owner          string
-	officialOwner  string
-	lanAccess      bool
-	selfAccess     bool
-	tools          []string
-	arguments      []string
-	showThinking   bool
-	showTools      bool
-	approvalPolicy string
-	grants         map[string]Grant
+	id                 string
+	title              string
+	workDir            string
+	sessionDir         string
+	owner              string
+	officialOwner      string
+	lanAccess          bool
+	selfAccess         bool
+	tools              []string
+	arguments          []string
+	showThinking       bool
+	showTools          bool
+	approvalPolicy     string
+	fencePeerSessions  bool
+	allowGuestRequests bool
+	grants             map[string]Grant
 }
 
 type normalizedSession struct {
-	id             string
-	workspaceID    string
-	title          string
-	workDir        string
-	sessionFile    string
-	owner          string
-	officialOwner  string
-	lanAccess      bool
-	selfAccess     bool
-	tools          []string
-	arguments      []string
-	showThinking   bool
-	showTools      bool
-	approvalPolicy string
-	grants         map[string]Grant
+	id                 string
+	workspaceID        string
+	title              string
+	workDir            string
+	sessionFile        string
+	owner              string
+	officialOwner      string
+	lanAccess          bool
+	selfAccess         bool
+	tools              []string
+	arguments          []string
+	showThinking       bool
+	showTools          bool
+	approvalPolicy     string
+	fencePeerSessions  bool
+	allowGuestRequests bool
+	linkOrigin         string
+	readOnly           bool
+	grants             map[string]Grant
 }
 
 func (s *normalizedSession) grant(userID string) (Grant, bool) {
@@ -272,6 +294,10 @@ func owns(owner, officialOwner, userID string) bool {
 	return owner == userID
 }
 
+func (w *normalizedWorkspace) owns(userID string) bool {
+	return owns(w.owner, w.officialOwner, userID)
+}
+
 func (w *normalizedWorkspace) canCreate(userID string) bool {
 	if access := lan.Access(userID); access != "" {
 		return w.lanAccess && access == lan.Control
@@ -279,7 +305,14 @@ func (w *normalizedWorkspace) canCreate(userID string) bool {
 	if access := selfrelay.Access(userID); access != "" {
 		return w.selfAccess && access == selfrelay.Control
 	}
-	return owns(w.owner, w.officialOwner, userID)
+	if owns(w.owner, w.officialOwner, userID) {
+		return true
+	}
+	if w.fencePeerSessions {
+		g, ok := w.grants[userID]
+		return ok && g.Read && g.Tools
+	}
+	return false
 }
 
 func (s *normalizedSession) canRead(userID string) bool {
@@ -290,6 +323,9 @@ func (s *normalizedSession) canRead(userID string) bool {
 // canRun is true when the user may submit a model prompt. The local Tools
 // list may be empty; that produces a text-only (--no-tools) run, not a denial.
 func (s *normalizedSession) canRun(userID string) bool {
+	if s.readOnly {
+		return false
+	}
 	g, ok := s.grant(userID)
 	return ok && g.Read && g.Tools
 }
@@ -342,7 +378,7 @@ func (s *normalizedSession) anyTools() bool {
 
 func (s *normalizedSession) canSeeEvent(userID, visibility string) bool {
 	switch visibility {
-	case visAll:
+	case visAll, visGuest:
 		return s.canRead(userID)
 	case visThinking:
 		return s.canSeeThinking(userID)
@@ -406,11 +442,12 @@ func normalizeConfig(cfg *Config) (*normalizedConfig, error) {
 			MaxBytes:    cfg.Retention.MaxBytes,
 			MaxRequests: cfg.Retention.MaxRequests,
 		},
-		allowSlash:     cfg.AllowSlashCommands,
-		maxText:        cfg.MaxTextBytes,
-		maxSnapshot:    cfg.MaxSnapshotBytes,
-		byID:           make(map[string]*normalizedSession),
-		workspacesByID: make(map[string]*normalizedWorkspace),
+		allowSlash:      cfg.AllowSlashCommands,
+		publishActivity: cfg.PublishActivity,
+		maxText:         cfg.MaxTextBytes,
+		maxSnapshot:     cfg.MaxSnapshotBytes,
+		byID:            make(map[string]*normalizedSession),
+		workspacesByID:  make(map[string]*normalizedWorkspace),
 	}
 	if out.retention.MaxEvents < 0 || out.retention.MaxBytes < 0 || out.retention.MaxRequests < 0 {
 		return nil, errors.New("desktop: retention values must not be negative")
@@ -568,19 +605,21 @@ func normalizeSession(in *SessionConfig) (*normalizedSession, error) {
 		return nil, fmt.Errorf("desktop: session %q: %w", id, err)
 	}
 	return &normalizedSession{
-		id:             id,
-		title:          title,
-		workDir:        workDir,
-		sessionFile:    sessionFile,
-		owner:          owner,
-		lanAccess:      in.LANAccess,
-		selfAccess:     in.SelfAccess,
-		tools:          tools,
-		arguments:      args,
-		showThinking:   in.ShowThinking,
-		showTools:      in.ShowTools,
-		approvalPolicy: approvalPolicy,
-		grants:         grants,
+		id:                 id,
+		title:              title,
+		workDir:            workDir,
+		sessionFile:        sessionFile,
+		owner:              owner,
+		lanAccess:          in.LANAccess,
+		selfAccess:         in.SelfAccess,
+		tools:              tools,
+		arguments:          args,
+		showThinking:       in.ShowThinking,
+		showTools:          in.ShowTools,
+		approvalPolicy:     approvalPolicy,
+		fencePeerSessions:  in.FencePeerSessions,
+		allowGuestRequests: in.AllowGuestRequests,
+		grants:             grants,
 	}, nil
 }
 
@@ -628,19 +667,21 @@ func normalizeWorkspace(in *WorkspaceConfig) (*normalizedWorkspace, error) {
 		return nil, fmt.Errorf("desktop: workspace %q: %w", id, err)
 	}
 	return &normalizedWorkspace{
-		id:             id,
-		title:          title,
-		workDir:        workDir,
-		sessionDir:     sessionDir,
-		owner:          owner,
-		lanAccess:      in.LANAccess,
-		selfAccess:     in.SelfAccess,
-		tools:          tools,
-		arguments:      args,
-		showThinking:   in.ShowThinking,
-		showTools:      in.ShowTools,
-		approvalPolicy: approvalPolicy,
-		grants:         grants,
+		id:                 id,
+		title:              title,
+		workDir:            workDir,
+		sessionDir:         sessionDir,
+		owner:              owner,
+		lanAccess:          in.LANAccess,
+		selfAccess:         in.SelfAccess,
+		tools:              tools,
+		arguments:          args,
+		showThinking:       in.ShowThinking,
+		showTools:          in.ShowTools,
+		approvalPolicy:     approvalPolicy,
+		fencePeerSessions:  in.FencePeerSessions,
+		allowGuestRequests: in.AllowGuestRequests,
+		grants:             grants,
 	}, nil
 }
 

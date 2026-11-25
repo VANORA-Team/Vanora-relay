@@ -91,6 +91,12 @@ func run() error {
 			hub.RequireIssuer(allowedIssuer)
 		}
 	}
+	if pushURL := strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_URL")); pushURL != "" {
+		pushToken := strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_TOKEN"))
+		if err := hub.ConfigurePushWebhook(pushURL, pushToken, false); err != nil {
+			return err
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go hub.Run(ctx)

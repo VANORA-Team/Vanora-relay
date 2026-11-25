@@ -105,6 +105,20 @@ func (h *Hub) acquirePreAuth(ip string) (func(), int) {
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Query().Get("probe") == "1" {
+		w.Header().Set("Cache-Control", "no-store")
+		if h.requireToken && !h.authorized(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="vanora-relay"`)
+			http.Error(w, "invalid relay token", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.URL.Query().Has("activity") {
+		h.serveActivity(w, r)
+		return
+	}
 	if r.Method == http.MethodPost || (r.Method == http.MethodGet && r.URL.Query().Has("pairing")) {
 		h.servePairing(w, r)
 		return
@@ -209,9 +223,22 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	releasePreAuth()
-	p := &peer{id: id, cert: cert, role: auth.Role, desktop: auth.Desktop, selfHosted: h.selfHosted, remoteIP: clientIP, lease: until, ctx: ctx, cancel: cancel, out: make(chan protocol.Message, 32)}
+	p := &peer{
+		id:         id,
+		cert:       cert,
+		role:       auth.Role,
+		desktop:    auth.Desktop,
+		selfHosted: h.selfHosted,
+		remoteIP:   clientIP,
+		lease:      until,
+		ctx:        ctx,
+		cancel:     cancel,
+		out:        make(chan protocol.Message, 32),
+		probeWake:  make(chan struct{}, 1),
+	}
 	h.mu.Lock()
-	_, exists := h.peers[p.slotKey()]
+	existing := h.peers[p.slotKey()]
+	exists := existing != nil
 	if p.desktop != "" {
 		host := h.peers[p.desktop]
 		exists = exists || (p.role != "mobile" && p.role != "desktop") || host == nil || !host.allows(p)
@@ -226,6 +253,19 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	exists = exists || count >= maxPhoneLinks+1
 	if !exists {
 		h.peers[p.slotKey()] = p
+	} else if existing != nil && existing.role == p.role && existing.id.PublicKey.Equal(id.PublicKey) {
+		// Preserve "first connection wins" so a racing connection cannot kick a
+		// healthy peer, while immediately probing the incumbent socket so a
+		// half-open blackholed connection is evicted within ~1.2s instead of
+		// waiting out the full 15s+5s heartbeat cycle (VR-SEC-08).
+		now := time.Now()
+		if now.Sub(existing.lastProbe) >= 500*time.Millisecond {
+			existing.lastProbe = now
+			select {
+			case existing.probeWake <- struct{}{}:
+			default:
+			}
+		}
 	}
 	h.mu.Unlock()
 	if exists {
@@ -265,16 +305,26 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
+		ping := func(timeout time.Duration) bool {
+			pingCtx, done := context.WithTimeout(ctx, timeout)
+			err := ws.Ping(pingCtx)
+			done()
+			if err != nil {
+				cancel()
+				return false
+			}
+			return true
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-p.probeWake:
+				if !ping(1200 * time.Millisecond) {
+					return
+				}
 			case <-ticker.C:
-				pingCtx, done := context.WithTimeout(ctx, 5*time.Second)
-				err := ws.Ping(pingCtx)
-				done()
-				if err != nil {
-					cancel()
+				if !ping(5 * time.Second) {
 					return
 				}
 			}

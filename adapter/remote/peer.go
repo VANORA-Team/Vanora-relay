@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vanora-relay/adapter/account"
@@ -17,6 +19,7 @@ import (
 	"vanora-relay/adapter/transport"
 	"vanora-relay/internal/pairing"
 	"vanora-relay/internal/pairnet"
+	"vanora-relay/internal/routes"
 	"vanora-relay/protocol"
 )
 
@@ -67,8 +70,15 @@ type RemotePeer struct {
 	pending        map[string]chan rpcReply
 	subscriptions  map[string]*sessionCursor
 	lastSynced     pairnet.Roster
+	altRoutes      []string
+	routeTracker   *routes.Tracker
 
-	retry chan struct{}
+	generation    atomic.Uint64
+	inboundFrames atomic.Uint64
+
+	retry      chan struct{}
+	retryNow   chan struct{}
+	betterWake chan struct{}
 }
 
 func newRemotePeer(m *Manager, channel, peerID string) *RemotePeer {
@@ -82,9 +92,13 @@ func newRemotePeer(m *Manager, channel, peerID string) *RemotePeer {
 		connState:     "disconnected",
 		pending:       make(map[string]chan rpcReply),
 		subscriptions: make(map[string]*sessionCursor),
+		routeTracker:  routes.NewTracker(),
 		retry:         make(chan struct{}, 1),
+		retryNow:      make(chan struct{}, 1),
+		betterWake:    make(chan struct{}, 1),
 	}
 	go rp.recoverLoop()
+	go rp.maintainRoutes()
 	return rp
 }
 
@@ -92,16 +106,19 @@ func newRemotePeer(m *Manager, channel, peerID string) *RemotePeer {
 func (rp *RemotePeer) Info() PeerInfo {
 	rp.mu.Lock()
 	info := PeerInfo{
-		PeerID:    rp.peerID,
-		Channel:   rp.channel,
-		Role:      "desktop",
-		Name:      rp.name,
-		Owner:     rp.owner,
-		Address:   rp.address,
-		SignalURL: rp.signalURL,
-		State:     rp.connState,
-		Path:      rp.connPath,
-		Error:     rp.connErr,
+		PeerID:        rp.peerID,
+		Channel:       rp.channel,
+		Role:          "desktop",
+		Name:          rp.name,
+		Owner:         rp.owner,
+		Address:       rp.address,
+		SignalURL:     rp.signalURL,
+		State:         rp.connState,
+		Path:          rp.connPath,
+		Error:         rp.connErr,
+		Generation:    rp.generation.Load(),
+		TransportHint: rp.routeTracker.TransportHint(time.Now()),
+		Routes:        rp.routesLocked(),
 	}
 	p := rp.peer
 	rp.mu.Unlock()
@@ -291,8 +308,11 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 		return errors.New("desktop authorization expired")
 	}
 	rp.peer = p
+	rp.generation.Add(1)
 	rp.group = group
-	rp.setStateLocked("connected", peerPath(p), "")
+	activePath := peerPath(p)
+	rp.routeTracker.RecordActivePath(activePath, time.Now())
+	rp.setStateLocked("connected", activePath, "")
 	resume := make(map[string]int64, len(rp.subscriptions))
 	for id, cur := range rp.subscriptions {
 		resume[id] = cur.applied
@@ -310,7 +330,7 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 	}
 	for id, seq := range resume {
 		if _, err := rp.subscribe(ctx, p, id, seq); err != nil {
-			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
+			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) || p.Allows(false) {
 				rp.mu.Lock()
 				delete(rp.subscriptions, id)
 				rp.mu.Unlock()
@@ -351,32 +371,87 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 	if rp.lanTarget != nil {
 		target = *rp.lanTarget
 	}
+	alt := slices.Clone(rp.altRoutes)
 	rp.mu.Unlock()
 
-	if target.Pin == "" {
-		mem, ok := group.Get(rp.peerID)
-		if !ok || mem.Role != "desktop" || !group.Allows(rp.peerID) || mem.Address == "" {
+	var learnedAddr string
+	if mem, ok := group.Get(rp.peerID); ok {
+		if target.Token == "" && !group.Allows(rp.peerID) {
 			return nil, nil, nil, lan.ErrUnpaired
 		}
-		target = lan.Target{Address: mem.Address, Pin: mem.Pin}
-	} else if target.Token == "" {
-		if mem, ok := group.Get(rp.peerID); ok {
-			if !group.Allows(rp.peerID) {
-				return nil, nil, nil, lan.ErrUnpaired
-			}
-			if mem.Address != "" {
-				target.Address = mem.Address
-			}
+		if mem.Address != "" {
+			learnedAddr = mem.Address
 		}
+		if target.Pin == "" && mem.Role == "desktop" && group.Allows(rp.peerID) {
+			target = lan.Target{Address: mem.Address, Pin: mem.Pin}
+		}
+	}
+	if target.Pin == "" {
+		return nil, nil, nil, lan.ErrUnpaired
 	}
 
 	localName := rp.manager.desktopName()
 	localAddr := lanCh.Server.Address()
-	p, start, err := lan.DialWithOptions(rp.ctx, target, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
-	if err != nil {
-		return nil, nil, nil, err
-	}
 	invited := target.Token != ""
+
+	var p transport.Peer
+	var start func()
+	if invited {
+		p, start, err = lan.DialWithOptions(rp.ctx, target, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	} else {
+		entries := routes.MergeOrdered(target.Address, alt, learnedAddr)
+		if len(entries) == 0 {
+			return nil, nil, nil, lan.ErrUnpaired
+		}
+		now := time.Now()
+		var filtered []routes.Entry
+		for _, e := range entries {
+			if !rp.routeTracker.InCooldown(e.Address, now) {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			filtered = entries
+		}
+		var lastErr error
+		for _, cand := range filtered {
+			candTarget := lan.Target{Address: cand.Address, Pin: target.Pin}
+			dctx, cancel := context.WithTimeout(ctx, routes.DialTimeout(cand.Kind))
+			// Bind the persistent peer reader to rp.ctx while bounding the initial dial via dctx:
+			// probe first on dctx when multiple candidates exist so unreachable LAN IPs skip fast.
+			if len(filtered) > 1 {
+				if pErr := lan.ProbeTarget(dctx, candTarget, lanCh.Server.Seed(), routes.DialTimeout(cand.Kind)); pErr != nil {
+					cancel()
+					if errors.Is(pErr, lan.ErrUnpaired) {
+						return nil, nil, nil, pErr
+					}
+					lastErr = pErr
+					continue
+				}
+			}
+			p, start, err = lan.DialWithOptions(rp.ctx, candTarget, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
+			cancel()
+			if err == nil {
+				if target.Address != "" && target.Address != cand.Address && !slices.Contains(alt, target.Address) {
+					alt = append(alt, target.Address)
+				}
+				target.Address = cand.Address
+				rp.routeTracker.RecordProbeSuccess(cand.Address)
+				break
+			}
+			if errors.Is(err, lan.ErrUnpaired) {
+				return nil, nil, nil, err
+			}
+			lastErr = err
+		}
+		if p == nil {
+			return nil, nil, nil, lastErr
+		}
+	}
+
 	localMem := pairnet.Member{ID: lanCh.Server.Pin(), Pin: lanCh.Server.Pin(), Role: "desktop", Name: localName, Address: localAddr}
 	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop", Address: target.Address}
 	if err := group.Admit(localMem, remoteMem, invited); err != nil {
@@ -388,6 +463,7 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 	rp.owner = "lan"
 	rp.address = target.Address
 	rp.lanTarget = &target
+	rp.altRoutes = alt
 	if mem, ok := group.Get(rp.peerID); ok && mem.Name != "" {
 		rp.name = mem.Name
 	}
@@ -618,6 +694,7 @@ func (rp *RemotePeer) recoverLoop() {
 		case <-rp.ctx.Done():
 			return
 		case <-rp.retry:
+		case <-rp.retryNow:
 		}
 		for delay := time.Second; ; delay = min(delay*2, 15*time.Second) {
 			timer := time.NewTimer(delay)
@@ -625,6 +702,9 @@ func (rp *RemotePeer) recoverLoop() {
 			case <-rp.ctx.Done():
 				timer.Stop()
 				return
+			case <-rp.retryNow:
+				timer.Stop()
+				delay = time.Second
 			case <-timer.C:
 			}
 			rp.op.Lock()
@@ -814,6 +894,7 @@ func (h *peerHandler) Message(p transport.Peer, b []byte) {
 		rp.mu.Unlock()
 		return
 	}
+	rp.inboundFrames.Add(1)
 	group := rp.group
 	switch m.Type {
 	case "pairnet.state":
@@ -842,6 +923,7 @@ func (h *peerHandler) Message(p transport.Peer, b []byte) {
 			rp.mu.Unlock()
 		}
 		if changed {
+			signalCh(rp.betterWake)
 			go rp.manager.notifyNetworkChanged(rp.channel, rp.peerID)
 		}
 		return
@@ -921,6 +1003,10 @@ func (rp *RemotePeer) currentPeer() (transport.Peer, error) {
 }
 
 func (rp *RemotePeer) request(ctx context.Context, p transport.Peer, req map[string]any, online bool) (json.RawMessage, error) {
+	return rp.requestWithTimeout(ctx, p, req, online, 20*time.Second)
+}
+
+func (rp *RemotePeer) requestWithTimeout(ctx context.Context, p transport.Peer, req map[string]any, online bool, timeout time.Duration) (json.RawMessage, error) {
 	id, _ := req["request_id"].(string)
 	if id == "" || len(id) > 128 {
 		return nil, errors.New("request_id must be 1..128 bytes")
@@ -947,7 +1033,10 @@ func (rp *RemotePeer) request(ctx context.Context, p transport.Peer, req map[str
 	if err := p.Send(body, online); err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(20 * time.Second)
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -995,19 +1084,27 @@ func (rp *RemotePeer) ListWorkspaces(ctx context.Context) (json.RawMessage, erro
 }
 
 func (rp *RemotePeer) CreateSession(ctx context.Context, workspaceID, requestID, title string) (json.RawMessage, error) {
+	return rp.CreateSessionWithOptions(ctx, workspaceID, requestID, title, RequestOptions{})
+}
+
+func (rp *RemotePeer) CreateSessionWithOptions(ctx context.Context, workspaceID, requestID, title string, opts RequestOptions) (json.RawMessage, error) {
 	p, err := rp.currentPeer()
 	if err != nil {
 		return nil, err
 	}
-	if requestID == "" {
-		requestID = NewRequestID()
-	}
-	return rp.request(ctx, p, map[string]any{
+	req := map[string]any{
 		"type":         "session.create",
-		"request_id":   requestID,
+		"request_id":   ScopedRequestID(opts.Namespace, requestID),
 		"workspace_id": workspaceID,
 		"title":        title,
-	}, true)
+	}
+	if strings.TrimSpace(opts.LinkOrigin) != "" {
+		req["link_origin"] = strings.TrimSpace(opts.LinkOrigin)
+	}
+	if opts.ModeLimit != nil {
+		req["mode_limit"] = opts.ModeLimit
+	}
+	return rp.request(ctx, p, req, true)
 }
 
 func (rp *RemotePeer) ListSessions(ctx context.Context) (json.RawMessage, error) {
@@ -1068,6 +1165,51 @@ func (rp *RemotePeer) Acknowledge(sessionID string, seq int64) error {
 }
 
 func (rp *RemotePeer) StartRun(ctx context.Context, sessionID, requestID, text string) (json.RawMessage, error) {
+	return rp.StartRunWithOptions(ctx, sessionID, requestID, text, RequestOptions{})
+}
+
+func (rp *RemotePeer) StartRunWithOptions(ctx context.Context, sessionID, requestID, text string, opts RequestOptions) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	req := map[string]any{
+		"type":       "run.start",
+		"request_id": ScopedRequestID(opts.Namespace, requestID),
+		"session_id": sessionID,
+		"text":       text,
+	}
+	if strings.TrimSpace(opts.LinkOrigin) != "" {
+		req["link_origin"] = strings.TrimSpace(opts.LinkOrigin)
+	}
+	if opts.ModeLimit != nil {
+		req["mode_limit"] = opts.ModeLimit
+	}
+	return rp.request(ctx, p, req, true)
+}
+
+func (rp *RemotePeer) CancelRun(ctx context.Context, sessionID, runID string) (json.RawMessage, error) {
+	return rp.CancelRunWithOrigin(ctx, sessionID, runID, "")
+}
+
+func (rp *RemotePeer) CancelRunWithOrigin(ctx context.Context, sessionID, runID, linkOrigin string) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	req := map[string]any{
+		"type":       "run.cancel",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+		"run_id":     runID,
+	}
+	if strings.TrimSpace(linkOrigin) != "" {
+		req["link_origin"] = strings.TrimSpace(linkOrigin)
+	}
+	return rp.request(ctx, p, req, true)
+}
+
+func (rp *RemotePeer) SubmitGuestRequest(ctx context.Context, sessionID, requestID, text string) (json.RawMessage, error) {
 	p, err := rp.currentPeer()
 	if err != nil {
 		return nil, err
@@ -1076,24 +1218,25 @@ func (rp *RemotePeer) StartRun(ctx context.Context, sessionID, requestID, text s
 		requestID = NewRequestID()
 	}
 	return rp.request(ctx, p, map[string]any{
-		"type":       "run.start",
+		"type":       "guest.request",
 		"request_id": requestID,
 		"session_id": sessionID,
 		"text":       text,
-	}, true)
+	}, false)
 }
 
-func (rp *RemotePeer) CancelRun(ctx context.Context, sessionID, runID string) (json.RawMessage, error) {
+func (rp *RemotePeer) RespondGuestRequest(ctx context.Context, sessionID, guestRequestID, action string) (json.RawMessage, error) {
 	p, err := rp.currentPeer()
 	if err != nil {
 		return nil, err
 	}
 	return rp.request(ctx, p, map[string]any{
-		"type":       "run.cancel",
-		"request_id": NewRequestID(),
-		"session_id": sessionID,
-		"run_id":     runID,
-	}, true)
+		"type":             "guest.respond",
+		"request_id":       NewRequestID(),
+		"session_id":       sessionID,
+		"guest_request_id": guestRequestID,
+		"action":           action,
+	}, action == "approve")
 }
 
 func (rp *RemotePeer) RespondUI(ctx context.Context, sessionID, runID, uiID string, payload UIResponse) (json.RawMessage, error) {

@@ -123,6 +123,10 @@ func runCtl(args []string) error {
 	default:
 		return errors.New(usage)
 	}
+	if strings.TrimSpace(os.Getenv("VANORA_LINK_ORIGIN")) != "" &&
+		(action == "pair" || action == "create" || action == "run" || action == "cancel") {
+		return errTransitiveDelegation
+	}
 	fs := flag.NewFlagSet("ctl "+action, flag.ContinueOnError)
 	channelFlag := fs.String("channel", envOrDefault("VANORA_RELAY_CHANNEL", ""), "channel: cn, global, self, or lan")
 
@@ -161,6 +165,11 @@ func runCtl(args []string) error {
 	runFlag := fs.String("run", "", "target run_id for cancel")
 	textFlag := fs.String("text", "", "prompt text for run")
 	requestIDFlag := fs.String("request-id", "", "optional idempotency request_id")
+	namespaceFlag := fs.String("namespace", "", "optional idempotency namespace for multi-agent delegation")
+	linkOriginFlag := fs.String("link-origin", "", "optional link_origin session fence tag")
+	readOnlyFlag := fs.Bool("read-only", false, "monotonically narrow delegated session/run to read-only")
+	noToolsFlag := fs.Bool("no-tools", false, "monotonically narrow delegated session/run to text-only (--no-tools)")
+	toolsFlag := fs.String("tools", "", "comma-separated tool subset for monotonic narrowing")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -352,6 +361,27 @@ func runCtl(args []string) error {
 		}
 		ch := info.Channel
 		peerID := info.PeerID
+		buildOpts := func() remote.RequestOptions {
+			var ml *remote.ModeLimit
+			if *readOnlyFlag || *noToolsFlag || strings.TrimSpace(*toolsFlag) != "" {
+				ml = &remote.ModeLimit{
+					ReadOnly: *readOnlyFlag,
+					NoTools:  *noToolsFlag,
+				}
+				if raw := strings.TrimSpace(*toolsFlag); raw != "" {
+					for _, part := range strings.Split(raw, ",") {
+						if t := strings.TrimSpace(part); t != "" {
+							ml.Tools = append(ml.Tools, t)
+						}
+					}
+				}
+			}
+			return remote.RequestOptions{
+				Namespace:  *namespaceFlag,
+				LinkOrigin: *linkOriginFlag,
+				ModeLimit:  ml,
+			}
+		}
 		switch action {
 		case "workspaces":
 			data, err := rm.ListWorkspaces(ctx, ch, peerID)
@@ -379,7 +409,7 @@ func runCtl(args []string) error {
 			if strings.TrimSpace(*workspaceFlag) == "" {
 				return errors.New("-workspace is required")
 			}
-			data, err := rm.CreateSession(ctx, ch, peerID, *workspaceFlag, *requestIDFlag, *titleFlag)
+			data, err := rm.CreateSessionWithOptions(ctx, ch, peerID, *workspaceFlag, *requestIDFlag, *titleFlag, buildOpts())
 			if err != nil {
 				return err
 			}
@@ -407,7 +437,7 @@ func runCtl(args []string) error {
 			if strings.TrimSpace(*sessionFlag) == "" || strings.TrimSpace(*runFlag) == "" {
 				return errors.New("-session and -run are required")
 			}
-			data, err := rm.CancelRun(ctx, ch, peerID, *sessionFlag, *runFlag)
+			data, err := rm.CancelRunWithOrigin(ctx, ch, peerID, *sessionFlag, *runFlag, *linkOriginFlag)
 			if err != nil {
 				return err
 			}
@@ -424,7 +454,7 @@ func runCtl(args []string) error {
 			if _, err := rm.OpenSession(ctx, ch, peerID, *sessionFlag); err != nil {
 				return err
 			}
-			data, err := rm.StartRun(ctx, ch, peerID, *sessionFlag, *requestIDFlag, *textFlag)
+			data, err := rm.StartRunWithOptions(ctx, ch, peerID, *sessionFlag, *requestIDFlag, *textFlag, buildOpts())
 			if err != nil {
 				return err
 			}

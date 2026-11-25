@@ -508,6 +508,23 @@ func (s *Server) serve(entry *listener, w http.ResponseWriter, r *http.Request) 
 	}
 	source, err := netip.ParseAddrPort(r.RemoteAddr)
 	id := peerFingerprint(*r.TLS)
+	if err == nil && localAddress(source.Addr()) && id != "" && id != s.pin && r.URL.Query().Get("probe") == "1" {
+		w.Header().Set("Cache-Control", "no-store")
+		s.mu.Lock()
+		_, ok := s.networkClient(id)
+		live := s.listening == entry && entry.ctx.Err() == nil
+		s.mu.Unlock()
+		if !live {
+			http.NotFound(w, r)
+			return
+		}
+		if !ok {
+			http.Error(w, "LAN access denied", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err == nil && localAddress(source.Addr()) && id != "" && r.URL.Query().Has("pairing") {
 		locator := r.URL.Query().Get("pairing")
 		s.mu.Lock()
@@ -559,7 +576,7 @@ func (s *Server) serve(entry *listener, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	user := userID(client)
-	p := newPeer(entry.ctx, socket, user, func() bool { return s.Allows(user) })
+	p := newPeer(entry.ctx, socket, user, pathForAddress(source.Addr()), func() bool { return s.Allows(user) })
 	s.mu.Lock()
 	if current, ok := s.networkClient(id); s.listening != entry || !ok || userID(current) != user {
 		s.mu.Unlock()

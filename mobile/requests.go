@@ -143,3 +143,38 @@ func (c *Client) RespondUI(sessionID, runID, uiID, payloadJSON string) (string, 
 	}
 	return c.request(p, req, true)
 }
+
+// SubmitGuestRequest submits an owner-gated prompt request on a session that
+// sets allow_guest_requests: true, returning JSON with guest_request_id and
+// status ("pending").
+func (c *Client) SubmitGuestRequest(sessionID, requestID, text string) (string, error) {
+	p, err := c.currentPeer()
+	if err != nil {
+		return "", err
+	}
+	if requestID == "" {
+		requestID = NewRequestID()
+	}
+	return c.request(p, map[string]any{
+		"type":       "guest.request",
+		"request_id": requestID,
+		"session_id": sessionID,
+		"text":       text,
+	}, false)
+}
+
+// RespondGuestRequest approves ("approve") or dismisses ("dismiss") a pending
+// guest prompt request as the session owner.
+func (c *Client) RespondGuestRequest(sessionID, guestRequestID, action string) (string, error) {
+	p, err := c.currentPeer()
+	if err != nil {
+		return "", err
+	}
+	return c.request(p, map[string]any{
+		"type":             "guest.respond",
+		"request_id":       NewRequestID(),
+		"session_id":       sessionID,
+		"guest_request_id": guestRequestID,
+		"action":           action,
+	}, action == "approve")
+}

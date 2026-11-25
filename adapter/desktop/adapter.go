@@ -61,11 +61,13 @@ type Adapter struct {
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
-	now             func() time.Time
-	buildCommand    func(*normalizedSession) (*exec.Cmd, error)
-	logger          *slog.Logger
-	observer        func(map[string]any)
-	maxRequestBytes int
+	now                  func() time.Time
+	buildCommand         func(*normalizedSession) (*exec.Cmd, error)
+	logger               *slog.Logger
+	observer             func(map[string]any)
+	activitySink         func(ActivityEvent)
+	activityForceEnabled bool
+	maxRequestBytes      int
 }
 
 var _ transport.Handler = (*Adapter)(nil)
@@ -253,23 +255,48 @@ func sessionFromWorkspace(w *normalizedWorkspace, rec createdSessionRecord, sess
 	if title == "" {
 		title = rec.ID
 	}
-	return &normalizedSession{
-		id:             rec.ID,
-		workspaceID:    w.id,
-		title:          title,
-		workDir:        w.workDir,
-		sessionFile:    sessionFile,
-		owner:          w.owner,
-		officialOwner:  w.officialOwner,
-		lanAccess:      w.lanAccess,
-		selfAccess:     w.selfAccess,
-		tools:          slices.Clone(w.tools),
-		arguments:      slices.Clone(w.arguments),
-		showThinking:   w.showThinking,
-		showTools:      w.showTools,
-		approvalPolicy: w.approvalPolicy,
-		grants:         grants,
+	tools := slices.Clone(w.tools)
+	if rec.HasToolsLimit {
+		tools = intersectTools(tools, rec.ToolsLimit)
 	}
+	return &normalizedSession{
+		id:                 rec.ID,
+		workspaceID:        w.id,
+		title:              title,
+		workDir:            w.workDir,
+		sessionFile:        sessionFile,
+		owner:              w.owner,
+		officialOwner:      w.officialOwner,
+		lanAccess:          w.lanAccess,
+		selfAccess:         w.selfAccess,
+		tools:              tools,
+		arguments:          slices.Clone(w.arguments),
+		showThinking:       w.showThinking,
+		showTools:          w.showTools,
+		approvalPolicy:     w.approvalPolicy,
+		fencePeerSessions:  w.fencePeerSessions,
+		allowGuestRequests: w.allowGuestRequests,
+		linkOrigin:         rec.LinkOrigin,
+		readOnly:           rec.ReadOnly,
+		grants:             grants,
+	}
+}
+
+func intersectTools(allowed, limit []string) []string {
+	if len(allowed) == 0 || len(limit) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(limit))
+	for _, t := range limit {
+		set[t] = struct{}{}
+	}
+	var out []string
+	for _, t := range allowed {
+		if _, ok := set[t]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (a *Adapter) ensureApprovalExtension() (string, error) {
@@ -439,7 +466,7 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 		}
 		if d.visibility != "" {
 			allowed := sr.cfg.canSeeEvent(user, d.visibility)
-			if allowed && d.visibility == visApproval && !sr.cfg.owns(user) && (d.approvalUser == "" || user != d.approvalUser) {
+			if allowed && (d.visibility == visApproval || d.visibility == visGuest) && !sr.cfg.owns(user) && (d.approvalUser == "" || user != d.approvalUser) {
 				allowed = false
 			}
 			if !allowed {
@@ -790,6 +817,10 @@ func sameExecution(a, b *normalizedSession) bool {
 	return a.workDir == b.workDir &&
 		a.sessionFile == b.sessionFile &&
 		a.approvalPolicy == b.approvalPolicy &&
+		a.linkOrigin == b.linkOrigin &&
+		a.readOnly == b.readOnly &&
+		a.fencePeerSessions == b.fencePeerSessions &&
+		a.allowGuestRequests == b.allowGuestRequests &&
 		slices.Equal(a.tools, b.tools) &&
 		slices.Equal(a.arguments, b.arguments)
 }
@@ -992,18 +1023,24 @@ func (a *Adapter) checkRuns() {
 		}
 		reason := ""
 		sr := a.sessions[r.sessionID]
-		switch {
-		case sr == nil || !sr.cfg.canRead(r.userID) || !sr.cfg.canRun(r.userID):
-			reason = "acl_revoked"
-		case !a.userOnlineLocked(r.userID):
-			reason = "authority_lost"
-			if lan.Access(r.userID) != "" {
-				reason = "lan_access_revoked"
-			} else if selfrelay.Access(r.userID) != "" {
-				reason = "self_access_revoked"
+		if r.localApproved {
+			if sr == nil {
+				reason = "acl_revoked"
 			}
-		case !r.authorityUntil.IsZero() && !now.Before(r.authorityUntil):
-			reason = "authority_lost"
+		} else {
+			switch {
+			case sr == nil || !sr.cfg.canRead(r.userID) || !sr.cfg.canRun(r.userID):
+				reason = "acl_revoked"
+			case !a.userOnlineLocked(r.userID):
+				reason = "authority_lost"
+				if lan.Access(r.userID) != "" {
+					reason = "lan_access_revoked"
+				} else if selfrelay.Access(r.userID) != "" {
+					reason = "self_access_revoked"
+				}
+			case !r.authorityUntil.IsZero() && !now.Before(r.authorityUntil):
+				reason = "authority_lost"
+			}
 		}
 		// Transport peer connectivity is deliberately not part of ongoing
 		// authority. A disconnected phone must not cancel accepted local work.
@@ -1024,6 +1061,9 @@ func (a *Adapter) checkRuns() {
 }
 
 func officialRun(r *run) bool {
+	if r.localApproved {
+		return false
+	}
 	return lan.Access(r.userID) == "" && selfrelay.Access(r.userID) == ""
 }
 

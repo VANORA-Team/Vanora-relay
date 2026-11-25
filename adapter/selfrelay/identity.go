@@ -17,12 +17,14 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"vanora-relay/internal/identity"
+	"vanora-relay/protocol"
 )
 
 const (
@@ -314,4 +316,33 @@ func sameSignalOrigin(raw string, got *url.URL) bool {
 
 func parseErrf(format string, args ...any) error {
 	return fmt.Errorf("selfrelay: "+format, args...)
+}
+
+// SignActivityPoll signs a timestamped activity.poll proof for querying redacted
+// session states of a paired self-hosted desktop identified by targetPin.
+func SignActivityPoll(seed, targetPin string, now time.Time) (pubKeyB64, targetDeviceID, proofB64 string, err error) {
+	priv, _, pubB64, callerDevID, err := parseKeySeed(seed)
+	if err != nil {
+		return "", "", "", err
+	}
+	targetPub, err := parsePublicKeyB64(strings.TrimSpace(targetPin))
+	if err != nil {
+		return "", "", "", err
+	}
+	targetDevID, err := identity.SelfDeviceID(targetPub)
+	if err != nil {
+		return "", "", "", err
+	}
+	if callerDevID == targetDevID {
+		return "", "", "", errors.New("selfrelay: cannot poll self")
+	}
+	m := protocol.Message{
+		Type: "activity.poll",
+		From: callerDevID,
+		To:   targetDevID,
+	}
+	if err := m.Sign(priv, []byte(strconv.FormatInt(now.UnixMilli(), 10))); err != nil {
+		return "", "", "", err
+	}
+	return pubB64, targetDevID, base64.RawURLEncoding.EncodeToString(protocol.Encode(m)), nil
 }

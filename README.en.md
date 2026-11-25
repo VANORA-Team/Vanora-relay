@@ -29,10 +29,10 @@
   Choose account-free **LAN direct (`lan`)**, account-free **Self-hosted relay (`self`)**, or strictly isolated **CN / GLOBAL official relays (`cn` / `global`)**. You can stay signed into multiple model providers locally while freely pairing them with any relay channel.
 - **Scan-to-Join Pairing Network & Bidirectional PC-to-PC Control**
   Scan a QR code or enter a 16-character encrypted pairing code to join a decentralized Pairing Network (PairNet). Devices in the same network automatically synchronize membership for **Mobile ↔ Desktop** and **Desktop ↔ Desktop** control, while each desktop enforces its own local ACL independently.
-- **Direct P2P First, Seamless TURN Fallback**
-  Establishes peer-to-peer WebRTC links via STUN first, automatically falls back to TURN across restrictive NATs, and migrates back to direct links whenever available. Built-in support for network handoffs, sequence-based replay (`events.resume`), and `request_id` idempotency.
-- **Fine-Grained Local ACL & Remote Tool Approval**
-  A local `desktop.json` allowlist governs every exposed workspace, session, and tool. With `approval_policy: "remote"`, write or destructive tool calls pause for real-time approval over the encrypted channel, and revoking access immediately cancels affected guest runs.
+- **Direct P2P First, Multi-Route Auto-Failback & Probe-Before-Reconnect**
+  Establishes peer-to-peer WebRTC links via STUN first and falls back to TURN across restrictive NATs. Supports **LAN + Tailnet (`100.64.0.0/10`) multi-route priority ordering and automatic failback**, **non-destructive `Wakeup` liveness probing with parallel silent-socket replacement**, sequence-based replay (`events.resume`), and namespaced `request_id` idempotency.
+- **Fine-Grained Local ACL, Peer Delegation Fences & Owner-Gated Guest Requests**
+  A local `desktop.json` allowlist governs every exposed workspace, session, and tool—augmented with **`link_origin` peer session fences**, **monotonic `mode_limit` permission narrowing**, **non-transitive delegation guards**, **`approval_policy: "remote"` live approvals**, **`allow_guest_requests` owner-gated guest prompts**, and **zero-trust redacted activity awareness (`PollActivity` / Push Webhooks)**.
 - **Embeddable Sidecar & Native Mobile SDKs**
   Ships `vanora-desktop` (standalone CLI + hot-switching Sidecar process) alongside `gomobile`-built Android AAR and iOS XCFramework bindings integrated with native OS keystores (Keychain / AndroidKeyStore / Credential Manager).
 

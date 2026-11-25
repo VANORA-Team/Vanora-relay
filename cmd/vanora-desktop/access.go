@@ -35,32 +35,38 @@ type accessOptions struct {
 }
 
 type accessCommand struct {
-	Type         string     `json:"type"`
-	RequestID    string     `json:"request_id"`
-	Channel      string     `json:"channel"`
-	Token        string     `json:"token"`
-	SignalURL    string     `json:"signal_url"`
-	SignalToken  string     `json:"signal_token"`
-	Enabled      *bool      `json:"enabled"`
-	IncludeToken *bool      `json:"include_token"`
-	Address      string     `json:"address"`
-	Access       string     `json:"access"`
-	ID           string     `json:"id"`
-	PeerID       string     `json:"peer_id"`
-	Input        string     `json:"input"`
-	GrantAccess  string     `json:"grant_access"`
-	WorkspaceID  string     `json:"workspace_id"`
-	SessionID    string     `json:"session_id"`
-	Title        string     `json:"title"`
-	Text         string     `json:"text"`
-	RunID        string     `json:"run_id"`
-	UIID         string     `json:"ui_id"`
-	AfterSeq     *int64     `json:"after_seq"`
-	Seq          *int64     `json:"seq"`
-	Confirmed    *bool      `json:"confirmed"`
-	Value        *string    `json:"value"`
-	Answers      [][]string `json:"answers"`
-	Cancelled    bool       `json:"cancelled"`
+	Type           string            `json:"type"`
+	RequestID      string            `json:"request_id"`
+	Channel        string            `json:"channel"`
+	Token          string            `json:"token"`
+	SignalURL      string            `json:"signal_url"`
+	SignalToken    string            `json:"signal_token"`
+	Enabled        *bool             `json:"enabled"`
+	IncludeToken   *bool             `json:"include_token"`
+	Address        string            `json:"address"`
+	Access         string            `json:"access"`
+	ID             string            `json:"id"`
+	PeerID         string            `json:"peer_id"`
+	Input          string            `json:"input"`
+	GrantAccess    string            `json:"grant_access"`
+	WorkspaceID    string            `json:"workspace_id"`
+	SessionID      string            `json:"session_id"`
+	Title          string            `json:"title"`
+	Text           string            `json:"text"`
+	RunID          string            `json:"run_id"`
+	UIID           string            `json:"ui_id"`
+	AfterSeq       *int64            `json:"after_seq"`
+	Seq            *int64            `json:"seq"`
+	Confirmed      *bool             `json:"confirmed"`
+	Value          *string           `json:"value"`
+	Answers        [][]string        `json:"answers"`
+	Cancelled      bool              `json:"cancelled"`
+	LongResume     *bool             `json:"long_resume"`
+	Namespace      string            `json:"namespace"`
+	LinkOrigin     string            `json:"link_origin"`
+	ModeLimit      *remote.ModeLimit `json:"mode_limit"`
+	GuestRequestID string            `json:"guest_request_id"`
+	Action         string            `json:"action"`
 }
 
 type officialSlot struct {
@@ -89,17 +95,46 @@ type accessManager struct {
 	retry            chan struct{}
 	requireHostToken bool
 
-	mu            sync.Mutex
-	local         *lan.Server
-	selfServer    *selfrelay.Server
-	selfStore     selfrelay.Store
-	selfURL       string
-	selfToken     string
-	activeChannel string // "", "cn", "global", or "self"
-	activeSlot    *officialSlot
-	stopRelay     context.CancelFunc
-	relayDone     chan struct{}
-	remote        *remote.Manager
+	mu              sync.Mutex
+	local           *lan.Server
+	selfServer      *selfrelay.Server
+	selfStore       selfrelay.Store
+	selfURL         string
+	selfToken       string
+	activeChannel   string // "", "cn", "global", or "self"
+	activeSlot      *officialSlot
+	stopRelay       context.CancelFunc
+	relayDone       chan struct{}
+	remote          *remote.Manager
+	activityEnabled atomic.Bool
+}
+
+func (m *accessManager) activeRelayActivityTarget() (signalURL, deviceID, pairingTicket string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch m.activeChannel {
+	case "cn", "global":
+		slot := m.slots[m.activeChannel]
+		if slot == nil || !slot.online.Load() || slot.account == nil {
+			return "", "", ""
+		}
+		sock := slot.socket.Load()
+		if sock == nil {
+			return "", "", ""
+		}
+		return slot.url, slot.account.DeviceID(), sock.PairingTicket()
+	case "self":
+		if m.selfServer == nil {
+			return "", "", ""
+		}
+		st := m.selfServer.Status()
+		if !st.Online {
+			return "", "", ""
+		}
+		return m.selfURL, st.DeviceID, m.selfServer.PairingTicket()
+	default:
+		return "", "", ""
+	}
 }
 
 func (m *accessManager) primaryOfficialSlotLocked() *officialSlot {
@@ -219,15 +254,22 @@ func (m *accessManager) statusLocked() map[string]any {
 			relayOnline = slot.online.Load()
 		}
 	}
+	activityPublishing := m.activityEnabled.Load()
+	if !activityPublishing && m.config != nil {
+		if cfg := m.config(); cfg != nil && cfg.PublishActivity {
+			activityPublishing = true
+		}
+	}
 	return map[string]any{
-		"type":             "access.status",
-		"active_channel":   m.activeChannel,
-		"channels":         channels,
-		"lan":              lanStatus,
-		"relay_configured": relayConfigured,
-		"relay_enabled":    relayEnabled,
-		"relay_authorized": relayAuthorized,
-		"relay_online":     relayOnline,
+		"type":                "access.status",
+		"active_channel":      m.activeChannel,
+		"channels":            channels,
+		"lan":                 lanStatus,
+		"relay_configured":    relayConfigured,
+		"relay_enabled":       relayEnabled,
+		"relay_authorized":    relayAuthorized,
+		"relay_online":        relayOnline,
+		"activity_publishing": activityPublishing,
 	}
 }
 
@@ -392,6 +434,34 @@ func (m *accessManager) command(cmd accessCommand) {
 			break
 		}
 		err = m.setRelayLocked(*cmd.Enabled, cmd.Channel, cmd.SignalURL, cmd.SignalToken)
+	case "access.activity.set":
+		if cmd.Enabled == nil {
+			err = errors.New("enabled is required")
+			break
+		}
+		m.activityEnabled.Store(*cmd.Enabled)
+		if m.service != nil {
+			m.service.SetActivityEnabled(*cmd.Enabled)
+		}
+	case "session.guest.respond":
+		if m.service == nil {
+			err = errors.New("desktop service unavailable")
+			break
+		}
+		m.mu.Unlock()
+		res, gErr := m.service.RespondGuestLocal(cmd.SessionID, cmd.GuestRequestID, cmd.Action)
+		m.mu.Lock()
+		if gErr != nil {
+			err = gErr
+			break
+		}
+		result["type"] = "session.guest.responded"
+		result["session_id"] = cmd.SessionID
+		result["guest_request_id"] = res.GuestRequestID
+		result["status"] = res.Status
+		if res.RunID != "" {
+			result["run_id"] = res.RunID
+		}
 	case "access.invite.create":
 		if m.local == nil {
 			err = errors.New("LAN listener is disabled")

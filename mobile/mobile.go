@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vanora-relay/adapter/account"
@@ -19,6 +21,7 @@ import (
 	"vanora-relay/adapter/transport"
 	"vanora-relay/internal/pairing"
 	"vanora-relay/internal/pairnet"
+	"vanora-relay/internal/routes"
 )
 
 // Store is supplied by the native app's secure storage. Missing state returns "", nil.
@@ -62,6 +65,12 @@ type Client struct {
 	events         []event
 	ready          chan struct{}
 	retry          chan struct{}
+	retryNow       chan struct{}
+	generation     atomic.Uint64
+	inboundFrames  atomic.Uint64
+	betterWake     chan struct{}
+	altLANRoutes   []string
+	routeTracker   *routes.Tracker
 }
 
 type reply struct {
@@ -142,8 +151,12 @@ func newClient(signalURL string, source transport.IdentitySource) *Client {
 		subscriptions: make(map[string]*cursor),
 		ready:         make(chan struct{}, 1),
 		retry:         make(chan struct{}, 1),
+		retryNow:      make(chan struct{}, 1),
+		betterWake:    make(chan struct{}, 1),
+		routeTracker:  routes.NewTracker(),
 	}
 	go c.recoverConnection()
+	go c.maintainRoutes()
 	return c
 }
 
@@ -225,6 +238,8 @@ func (c *Client) ConnectionState() string {
 			path = live
 		}
 	}
+	gen := c.generation.Load()
+	hint := c.routeTracker.TransportHint(time.Now())
 	b, _ := json.Marshal(map[string]string{
 		"state":          state,
 		"device_id":      device,
@@ -233,6 +248,8 @@ func (c *Client) ConnectionState() string {
 		"error":          errMsg,
 		"user_id":        c.UserID(),
 		"self_device_id": c.DeviceID(),
+		"generation":     strconv.FormatUint(gen, 10),
+		"transport_hint": hint,
 	})
 	return string(b)
 }
@@ -601,10 +618,13 @@ func (c *Client) connectLocked() error {
 		return errors.New("desktop authorization expired")
 	}
 	c.peer = p
+	c.generation.Add(1)
 	c.group = group
 	c.synced = make(chan struct{})
 	synced := c.synced
-	c.setStateLocked("connected", peerPath(p), "")
+	activePath := peerPath(p)
+	c.routeTracker.RecordActivePath(activePath, time.Now())
+	c.setStateLocked("connected", activePath, "")
 	resume := make(map[string]int64, len(c.subscriptions))
 	for id, cur := range c.subscriptions {
 		resume[id] = cur.applied
@@ -632,7 +652,10 @@ func (c *Client) connectLocked() error {
 	}
 	for id, seq := range resume {
 		if _, err := c.subscribe(p, id, seq); err != nil {
-			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
+			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) || p.Allows(false) {
+				// Decouple session subscription health from transport health: if the
+				// underlying peer remains live, surface a session-scoped error instead
+				// of tearing down healthy subscriptions on the same connection.
 				c.mu.Lock()
 				delete(c.subscriptions, id)
 				c.enqueueLocked(event{payload: controlEvent(id, err.Error())})
@@ -648,11 +671,7 @@ func (c *Client) connectLocked() error {
 
 func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) {
 	if c.lanTarget != nil {
-		p, start, err := lan.Dial(c.ctx, *c.lanTarget, c.lanKey, c.lanName, (*handler)(c))
-		if err == nil {
-			c.lanTarget.Token = ""
-		}
-		return p, start, err
+		return c.dialLANPeer()
 	}
 	if c.selfTarget != nil {
 		p, start, err := selfrelay.Dial(c.ctx, *c.selfTarget, c.selfKey, c.selfName, (*handler)(c))
@@ -699,6 +718,7 @@ func (c *Client) recoverConnection() {
 		case <-c.ctx.Done():
 			return
 		case <-c.retry:
+		case <-c.retryNow:
 		}
 		for delay := time.Second; ; delay = min(delay*2, 15*time.Second) {
 			timer := time.NewTimer(delay)
@@ -706,6 +726,9 @@ func (c *Client) recoverConnection() {
 			case <-c.ctx.Done():
 				timer.Stop()
 				return
+			case <-c.retryNow:
+				timer.Stop()
+				delay = time.Second
 			case <-timer.C:
 			}
 			c.op.Lock()
@@ -717,7 +740,7 @@ func (c *Client) recoverConnection() {
 				err = c.connectLocked()
 			}
 			c.op.Unlock()
-			if err == nil || c.handleAuthError(err) {
+			if !want || err == nil || c.handleAuthError(err) {
 				break
 			}
 		}
@@ -880,6 +903,7 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 		c.mu.Unlock()
 		return
 	}
+	c.inboundFrames.Add(1)
 	if m.Type == "pairnet.removed" && c.group != nil {
 		group, id := c.group, c.device
 		c.mu.Unlock()
@@ -914,6 +938,7 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 		c.mu.Unlock()
 		if changed {
 			signal(c.mesh.wake)
+			signal(c.betterWake)
 		}
 		return
 	}
@@ -1013,6 +1038,10 @@ func (c *Client) currentPeer() (transport.Peer, error) {
 	return c.peer, nil
 }
 func (c *Client) request(p transport.Peer, req map[string]any, online bool) (string, error) {
+	return c.requestWithTimeout(p, req, online, 20*time.Second)
+}
+
+func (c *Client) requestWithTimeout(p transport.Peer, req map[string]any, online bool, timeout time.Duration) (string, error) {
 	id := req["request_id"].(string)
 	if id == "" || len(id) > 128 {
 		return "", errors.New("request_id must be 1..128 bytes")
@@ -1039,7 +1068,10 @@ func (c *Client) request(p transport.Peer, req map[string]any, online bool) (str
 	if err := p.Send(body, online); err != nil {
 		return "", err
 	}
-	timer := time.NewTimer(20 * time.Second)
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-c.ctx.Done():

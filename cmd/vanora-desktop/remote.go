@@ -122,6 +122,17 @@ func (m *accessManager) LAN() (*remote.LANChannel, error) {
 	}, nil
 }
 
+var errTransitiveDelegation = errors.New("transitive peer delegation is not permitted from a linked session")
+
+func isOutboundMutationCommand(cmdType string) bool {
+	switch cmdType {
+	case "remote.pair", "remote.session.create", "remote.run.start", "remote.run.cancel", "remote.ui.respond", "remote.guest.request", "remote.guest.respond":
+		return true
+	default:
+		return false
+	}
+}
+
 // remoteCommand handles outbound remote.* Sidecar commands without holding
 // accessManager.mu during network I/O.
 func (m *accessManager) remoteCommand(cmd accessCommand) {
@@ -146,6 +157,10 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 			ev["code"] = code
 		}
 		output.Emit(ev)
+	}
+	if strings.TrimSpace(os.Getenv("VANORA_LINK_ORIGIN")) != "" && isOutboundMutationCommand(cmd.Type) {
+		emitErr(errTransitiveDelegation)
+		return
 	}
 	emitData := func(data json.RawMessage) {
 		output.Emit(map[string]any{
@@ -219,6 +234,40 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 			"request_id": cmd.RequestID,
 			"peer":       info,
 		})
+	case "remote.wakeup":
+		longResume := cmd.LongResume != nil && *cmd.LongResume
+		info, err := rm.Wakeup(ctx, cmd.Channel, cmd.PeerID, longResume)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		output.Emit(map[string]any{
+			"type":       "remote.connected",
+			"request_id": cmd.RequestID,
+			"peer":       info,
+		})
+	case "remote.route.add":
+		info, err := rm.AddRoute(cmd.Channel, cmd.PeerID, cmd.Address)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		output.Emit(map[string]any{
+			"type":       "remote.route.updated",
+			"request_id": cmd.RequestID,
+			"peer":       info,
+		})
+	case "remote.route.remove":
+		info, err := rm.RemoveRoute(cmd.Channel, cmd.PeerID, cmd.Address)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		output.Emit(map[string]any{
+			"type":       "remote.route.updated",
+			"request_id": cmd.RequestID,
+			"peer":       info,
+		})
 	case "remote.workspace.list":
 		data, err := rm.ListWorkspaces(ctx, cmd.Channel, cmd.PeerID)
 		if err != nil {
@@ -227,7 +276,11 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		}
 		emitData(data)
 	case "remote.session.create":
-		data, err := rm.CreateSession(ctx, cmd.Channel, cmd.PeerID, cmd.WorkspaceID, cmd.RequestID, cmd.Title)
+		data, err := rm.CreateSessionWithOptions(ctx, cmd.Channel, cmd.PeerID, cmd.WorkspaceID, cmd.RequestID, cmd.Title, remote.RequestOptions{
+			Namespace:  cmd.Namespace,
+			LinkOrigin: cmd.LinkOrigin,
+			ModeLimit:  cmd.ModeLimit,
+		})
 		if err != nil {
 			emitErr(err)
 			return
@@ -270,14 +323,32 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		raw, _ := json.Marshal(map[string]any{"session_id": cmd.SessionID, "seq": *cmd.Seq})
 		emitData(raw)
 	case "remote.run.start":
-		data, err := rm.StartRun(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RequestID, cmd.Text)
+		data, err := rm.StartRunWithOptions(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RequestID, cmd.Text, remote.RequestOptions{
+			Namespace:  cmd.Namespace,
+			LinkOrigin: cmd.LinkOrigin,
+			ModeLimit:  cmd.ModeLimit,
+		})
 		if err != nil {
 			emitErr(err)
 			return
 		}
 		emitData(data)
 	case "remote.run.cancel":
-		data, err := rm.CancelRun(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RunID)
+		data, err := rm.CancelRunWithOrigin(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RunID, cmd.LinkOrigin)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		emitData(data)
+	case "remote.guest.request":
+		data, err := rm.SubmitGuestRequest(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RequestID, cmd.Text)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		emitData(data)
+	case "remote.guest.respond":
+		data, err := rm.RespondGuestRequest(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.GuestRequestID, cmd.Action)
 		if err != nil {
 			emitErr(err)
 			return

@@ -712,9 +712,9 @@ func TestSignalDuplicateDeviceIDAndStaleReconnectWindow(t *testing.T) {
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		t.Logf("stale half-open socket blocked legitimate reconnect for %s (15s ping + 5s timeout)", blockedFor.Round(100*time.Millisecond))
-		if blockedFor > 22*time.Second {
-			sectest.Finding(t, "VR-SEC-08", "stale socket blocked reconnect for %s (>22s) (socket.go:151-160,191-208)", blockedFor.Round(100*time.Millisecond))
+		t.Logf("stale half-open socket blocked legitimate reconnect for %s (fast duplicate-login liveness probe)", blockedFor.Round(100*time.Millisecond))
+		if blockedFor > 5*time.Second {
+			sectest.Finding(t, "VR-SEC-08", "stale socket blocked reconnect for %s (>5s) (socket.go:151-160,191-208)", blockedFor.Round(100*time.Millisecond))
 		}
 	})
 }

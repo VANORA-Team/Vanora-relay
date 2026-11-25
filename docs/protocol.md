@@ -236,12 +236,15 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 | `type` | 关键请求字段 | 成功返回 `data` | 说明 |
 | :--- | :--- | :--- | :--- |
 | `workspace.list` | — | `workspaces[]` | 返回当前访问者可新建会话的白名单工作区 |
-| `session.create` | `workspace_id`, `title?` | 新会话摘要 | 在白名单工作区新建 Vanora 原生 v3 JSONL 会话（按 `request_id` 幂等） |
-| `session.list` | — | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`、`tools_enabled`、可见性与 `has_active_run` |
-| `session.open` | `session_id` | `messages`, `last_seq`, `pending_ui?` | 按当前查看者权限返回可见消息快照、最新序号与待审批弹窗 |
-| `run.start` | `session_id`, `text` | `run_id` | 保留期内同 `request_id` + 同正文返回原 `run_id`；正文不一致返回 `request_conflict` |
-| `run.cancel` | `session_id`, `run_id` | `run_id`, `status` | 校验运行归属会话且访问者有权限（非所有者/非发起者统一返回 `unavailable`） |
+| `session.create` | `workspace_id`, `title?`, `link_origin?`, `mode_limit?` | 新会话摘要 | 在白名单工作区新建 Vanora v3 JSONL 会话（支持会话归属围栏与单调权限收窄） |
+| `session.list` | — | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`、`tools_enabled`、`link_origin?`、`allow_guest_requests?` 与 `has_active_run` |
+| `session.open` | `session_id` | `messages`, `last_seq`, `pending_ui?`, `pending_guest?` | 按查看者权限返回可见消息快照、最新序号、待审批弹窗与待确认访客提问 |
+| `run.start` | `session_id`, `text`, `link_origin?`, `mode_limit?` | `run_id` | 保留期内同 `request_id` + 同载荷返回原 `run_id`；支持单调工具收窄与会话围栏校验 |
+| `run.cancel` | `session_id`, `run_id`, `link_origin?` | `run_id`, `status` | 校验运行归属、访问权限与 `link_origin` 围栏 |
 | `ui.respond` | `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | `ui_id`, `status` | 响应远程审批（`confirm`/`select`）或提问（`ask`/`input`/`editor`）弹窗 |
+| `guest.request` | `session_id`, `text` | `guest_request_id`, `status` | 在开启 `allow_guest_requests` 的会话中由只读查看者提交待主人确认的提示词请求 |
+| `guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`) | `guest_request_id`, `status`, `run_id?` | 仅限会话主人批准（以主人权限拉起运行）或忽略待确认的访客提问 |
+| `ping` | — | `pong`, `server_time` | 加密通道内轻量双向保活探测，供客户端 `Wakeup` 无损探活使用 |
 | `events.resume` | `session_id`, `after_seq` | `session_id`, `after_seq` | 补发 `seq > after_seq` 的事件并续订实时流；超窗口返 `snapshot_required` |
 
 ```json
@@ -262,8 +265,17 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 | **文本与思考** | `text.delta` / `thinking.delta` | 流式正文与模型思考块（思考块需权限） |
 | **工具执行** | `tool.call` / `tool.start` / `tool.update` / `tool.end` | 工具调用与输出流（需工具可见权限） |
 | **远程交互** | `ui.request` / `ui.resolved` | 工具审批与提问弹窗（严格按发起人/所有者隔离，防止跨访客泄露） |
+| **访客提问门禁** | `guest.request` / `guest.resolved` | 只读访客提问与主人批准/忽略结果（仅对主人及提问者本人可见，其余访客收 `sync`） |
 | **权限占位** | `sync` | 混合权限会话中维持未授权查看者序号连续，不携带任何敏感内容 |
 | **运行终态** | `run.completed` / `run.cancelled` / `run.failed` | 任务结束通知 |
+
+### 7. 信令健康探测与零信任脱敏态势接口（HTTP/S）
+
+| 方法与路径 | 鉴权方式 | 用途与安全边界 |
+| :--- | :--- | :--- |
+| `GET /v1/signal?probe=1` | 自建模式校验 `Bearer RELAY_SELF_TOKEN` | 不占用预认证槽位的无状态 HTTP `204` 探活（配合客户端静默死连接检测）；局域网对应 `GET /v1/lan?probe=1`（核验 mTLS 与固定公钥指纹） |
+| `POST /v1/signal?activity=1` | `Vanora-Desktop: <device_id>` + `Bearer <pairing_ticket>` | 在线桌面发布脱敏会话阶段（`running` / `awaiting_approval` / `awaiting_guest_approval` / `completed` / `failed` / `cancelled` / `cleared`），**不含任何提示词、输出或工具参数**；相同状态自动去重，可选经 `RELAY_PUSH_WEBHOOK_URL` 推送 |
+| `GET /v1/signal?activity=<device_id>` | `X-Vanora-Activity-Proof`（`±60s` 时间戳 Ed25519 签名；官方站额外强制账号/访客表隔离） | 移动端后台或桌面小组件无需建立 WebRTC DataChannel 即可拉取目标电脑待处理态势 |
 
 | 错误码 (`code`) | 含义与客户端处理建议 |
 | :--- | :--- |

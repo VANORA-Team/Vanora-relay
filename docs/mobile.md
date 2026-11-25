@@ -171,9 +171,9 @@ NSString *savedTarget = [client selfRelayTarget];
 | :--- | :--- | :--- |
 | **身份管理** *(官方)* | `Enroll(token)` / `UpdateToken(token)` / `Reset()` / `UserID()` / `DeviceID()` | 绑定宿主令牌、刷新令牌续期、安全重置本机密钥以切换账号 |
 | **配对与连接** | `Pair(input, signalURL, relayToken, name)` / `Connect(devID, owner)` / `ConnectSelfRelay(link, name)` / `ConnectSelfRelayWithToken(link, token, name)` / `ConnectLAN(link, name)` | 首次配对或使用已持久化目标重连 |
-| **状态与网络** | `ConnectionState()` / `Reconnect()` / `Disconnect()` / `Close()` / `Devices()` / `SelfRelayTarget()` / `LANAddress()` | 查询连接与直连/中继路径、切网重连、清理资源 |
+| **状态、唤醒与多路由** | `ConnectionState()` / `Wakeup(longResume)` / `Probe(timeoutMs)` / `Reconnect()` / `AddRoute(addr)` / `RemoveRoute(addr)` / `Routes()` / `PollActivity()` / `Disconnect()` / `Close()` | 查询状态（含 `generation` 与 `transport_hint`）、无损探活唤醒、管理局域网/Tailnet 多路由并自动回切、后台拉取脱敏运行态势 |
 | **配对网** | `PairingNetwork()` / `OpenNetworkDesktop(id)` / `RemoveNetworkDevice(id)` | 成员管理与多电脑并发句柄 |
-| **会话与运行** | `ListWorkspaces()` / `CreateSession(wsID, reqID, title)` / `ListSessions()` / `OpenSession(sessID)` / `Resume(sessID, afterSeq)` / `StartRun(sessID, reqID, text)` / `CancelRun(sessID, runID)` / `RespondUI(sessID, runID, uiID, payloadJSON)` | 全通道一致的 AI 会话、流式控制与远程审批操作 |
+| **会话、运行与访客提问** | `ListWorkspaces()` / `CreateSession(...)` / `ListSessions()` / `OpenSession(...)` / `Resume(...)` / `StartRun(...)` / `CancelRun(...)` / `RespondUI(...)` / `SubmitGuestRequest(sessID, reqID, text)` / `RespondGuestRequest(sessID, guestReqID, action)` | 全通道一致的 AI 会话、流式控制、远程审批与主人确认型访客提问操作 |
 | **事件消费** | `NextEvent(timeoutMillis)` / `Acknowledge(sessID, seq)` / `Mobile.NewRequestID()` | 单消费者阻塞拉取事件并确认游标 |
 
 </details>
@@ -187,5 +187,5 @@ NSString *savedTarget = [client selfRelayTarget];
   - `subscription.error`：游标超出保留窗口（`snapshot_required`）或资源不可用
 - **幂等提交提示词**：调用 `StartRun` 或 `CreateSession` 前，先本地持久化 `NewRequestID()` 与提示词正文；网络抖动重试必须复用同一组参数。
 - **游标推进与快照重建**：业务事件渲染并落盘后，立即调用 `Acknowledge(sessionID, seq)` 更新本地确认游标；收到 `snapshot_required` 时调用 `OpenSession(sessionID)` 全量替换本地快照。
-- **前后台与切网恢复**：网络从 Wi-Fi 切换至蜂窝或 App 回到前台时调用 `Reconnect()` 主动重建链路并自动续订游标；进程重启后先调用对应通道的重连方法，再对活跃会话调用 `Resume(sessionID, lastAppliedSeq)`。
+- **前后台与切网恢复**：App 从后台切回前台或发生网络切换时，优先调用 **`Wakeup(longResume)`**（先在现有加密通道内探活并并行检测静默半开死连接，连接健康时零中断保留会话，仅在失活或断开时秒级重建并自动续订游标；单会话恢复失败仅发出 `subscription.error` 而不误杀整条底层连接）；进程重启后先调用对应通道的重连方法，再对活跃会话调用 `Resume(sessionID, lastAppliedSeq)`。后台保活或小组件可调用 **`PollActivity()`** 轻量查询脱敏态势而无需拉起 WebRTC。
 - **退出清理**：切换账号或销毁页面配置档时务必调用 `Close()` 释放底层 WebRTC、信令与子句柄资源。

@@ -12,6 +12,8 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+
+	"vanora-relay/internal/routes"
 )
 
 const (
@@ -110,15 +112,28 @@ func validToken(value string) bool {
 	return err == nil && len(raw) == sha256.Size
 }
 
+// IsTailnetAddress reports whether address is in RFC 6598 100.64.0.0/10
+// shared address space (Tailscale / Headscale / WireGuard tailnets).
+func IsTailnetAddress(address netip.Addr) bool {
+	return routes.IsTailnetAddr(address)
+}
+
 func localAddress(address netip.Addr) bool {
 	address = address.Unmap()
-	return address.IsPrivate() || address.IsLoopback()
+	return address.IsPrivate() || address.IsLoopback() || IsTailnetAddress(address)
+}
+
+func pathForAddress(address netip.Addr) string {
+	if IsTailnetAddress(address) {
+		return "tailnet"
+	}
+	return "lan"
 }
 
 func parseLocalAddress(raw string) (netip.AddrPort, error) {
 	address, err := netip.ParseAddrPort(raw)
 	if err != nil || !localAddress(address.Addr()) || address.Addr().Zone() != "" {
-		return netip.AddrPort{}, errors.New("LAN: address must specify a private IP and port")
+		return netip.AddrPort{}, errors.New("LAN: address must specify a private or tailnet IP and port")
 	}
 	return address, nil
 }

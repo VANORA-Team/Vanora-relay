@@ -632,6 +632,9 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		selfToken:        strings.TrimSpace(options.selfToken),
 	}
 	access.initRemote()
+	activityPub := desktop.NewActivityPublisher(ctx, access.activeRelayActivityTarget)
+	defer activityPub.Close()
+	service.SetActivitySink(activityPub.Enqueue)
 	if options.relayEnabled && options.activeChannel != "" {
 		access.activeChannel = options.activeChannel
 	}
@@ -714,6 +717,8 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 				!strings.HasPrefix(cmd.Type, "access.network.") &&
 				!strings.HasPrefix(cmd.Type, "access.invite.") &&
 				cmd.Type != "access.client.access.set" &&
+				cmd.Type != "access.activity.set" &&
+				cmd.Type != "session.guest.respond" &&
 				!strings.HasPrefix(cmd.Type, "remote.") {
 				continue
 			}

@@ -131,7 +131,7 @@ func DialWithOptions(ctx context.Context, target Target, seed, name, role, local
 		}
 		return nil, nil, err
 	}
-	p := newPeer(ctx, socket, target.Pin, func() bool { return true })
+	p := newPeer(ctx, socket, target.Pin, pathForAddress(address.Addr()), func() bool { return true })
 	return p, func() { go p.run(handler, transport.MaxFrameSize) }, nil
 }
 
@@ -170,4 +170,61 @@ func ResolveCode(ctx context.Context, input, address, seed string) (string, erro
 		return "", pairing.ErrInvalid
 	}
 	return link, nil
+}
+
+// ProbeTarget performs a lightweight mTLS reachability and desktop-pin check
+// against target without opening or replacing a WebSocket session.
+func ProbeTarget(ctx context.Context, target Target, seed string, timeout time.Duration) error {
+	address, err := parseLocalAddress(target.Address)
+	if err != nil || address.Port() == 0 || !validToken(target.Pin) {
+		return errors.New("LAN: invalid desktop target")
+	}
+	certificate, localPin, err := makeCertificate(seed)
+	if err != nil {
+		return err
+	}
+	if localPin == target.Pin {
+		return errors.New("LAN: cannot connect to self")
+	}
+	if timeout <= 0 {
+		timeout = 2500 * time.Millisecond
+	}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		Certificates:       []tls.Certificate{certificate},
+		InsecureSkipVerify: true,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if peerFingerprint(state) != target.Pin {
+				return errors.New("LAN: desktop public key differs from pairing link")
+			}
+			return nil
+		},
+	}}
+	defer tr.CloseIdleConnections()
+	pctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	probeURL := (&url.URL{Scheme: "https", Host: address.String(), Path: path, RawQuery: "probe=1"}).String()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrUnpaired
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return errors.New("LAN: probe failed")
+	}
+	return nil
 }
