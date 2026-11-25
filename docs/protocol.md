@@ -237,15 +237,17 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 | :--- | :--- | :--- | :--- |
 | `workspace.list` | — | `workspaces[]` | 返回当前访问者可新建会话的白名单工作区 |
 | `session.create` | `workspace_id`, `title?`, `link_origin?`, `mode_limit?` | 新会话摘要 | 在白名单工作区新建 Vanora v3 JSONL 会话（支持会话归属围栏与单调权限收窄） |
-| `session.list` | — | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`、`tools_enabled`、`link_origin?`、`allow_guest_requests?` 与 `has_active_run` |
-| `session.open` | `session_id` | `messages`, `last_seq`, `pending_ui?`, `pending_guest?` | 按查看者权限返回可见消息快照、最新序号、待审批弹窗与待确认访客提问 |
-| `run.start` | `session_id`, `text`, `link_origin?`, `mode_limit?` | `run_id` | 保留期内同 `request_id` + 同载荷返回原 `run_id`；支持单调工具收窄与会话围栏校验 |
-| `run.cancel` | `session_id`, `run_id`, `link_origin?` | `run_id`, `status` | 校验运行归属、访问权限与 `link_origin` 围栏 |
-| `ui.respond` | `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | `ui_id`, `status` | 响应远程审批（`confirm`/`select`）或提问（`ask`/`input`/`editor`）弹窗 |
-| `guest.request` | `session_id`, `text` | `guest_request_id`, `status` | 在开启 `allow_guest_requests` 的会话中由只读查看者提交待主人确认的提示词请求 |
-| `guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`) | `guest_request_id`, `status`, `run_id?` | 仅限会话主人批准（以主人权限拉起运行）或忽略待确认的访客提问 |
+| `session.list` | — | `sessions[]` | 每项含 `session_id`、`title`、`can_run_tools`、`tools_enabled`、`link_origin?`、`allow_guest_requests?`、`has_active_run`、`active_run_id?`、`active_run_user_id?`、`queued_run_count?`、`pending_guest_count?`（按权限隔离计数）与 `viewer_count?` |
+| `session.open` | `session_id`, `watch_presence?` | `messages`, `last_seq`, `active_run?`, `queued_runs?`, `participants?`, `pending_ui?`, `pending_guest?` | 按查看者权限返回可见消息快照（含用户消息归属 `user_id`/`requested_by`）、最新序号、运行/排队状态、在线协作者列表、待审批弹窗与待确认访客提问；可选订阅实时在线状态 |
+| `session.close` | `session_id` | `session_id`, `closed` | 显式取消该会话的实时事件与在线状态订阅，并即时更新其他协作者视图中的在线列表 |
+| `session.presence` | `session_id`, `watch?` | `session_id`, `participants[]`, `watching` | 查询当前在线协作者列表，并按需开启/关闭该会话的实时 `presence.updated` 推送（默认不推送以保持严格连续 `seq` 兼容） |
+| `run.start` | `session_id`, `text`, `link_origin?`, `mode_limit?`, `queue_policy?` (`enqueue`\|`reject`) | `run_id`, `status?`, `queued?`, `queue_position?` | 保留期内同 `request_id` + 同载荷返回原 `run_id`；默认启用每会话 FIFO 协作轮次队列（上限 8 条/会话、3 条/人，出队时实时重验 ACL/围栏）；传 `queue_policy: "reject"` 时会话忙碌直接返回 `session_busy` |
+| `run.cancel` | `session_id`, `run_id`, `link_origin?` | `run_id`, `status` | 校验运行归属、访问权限与 `link_origin` 围栏；同时支持取消运行中或排队中的任务 |
+| `ui.respond` | `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | `ui_id`, `status` | 响应远程审批（`confirm`/`select`）或提问（`ask`/`input`/`editor`）弹窗；`ui.resolved` 附带 `resolved_by` 标识审批人 |
+| `guest.request` | `session_id`, `text` | `guest_request_id`, `status` | 在开启 `allow_guest_requests` 的非只读会话中由查看者提交待确认提示词请求（单用户待确认上限 4 条，超限返 `guest_request_limit`） |
+| `guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`\|`cancel`), `text?`, `mode_limit?` | `guest_request_id`, `status`, `run_id?`, `queued?`, `queue_position?` | 官方渠道由会话主人、局域网/自建渠道由 `control` 协作者批准或忽略（批准时可选改写 `text`、通过 `mode_limit` 单调收窄工具，且会话忙碌时自动进入 FIFO 队列）；提问访客本人可传 `action: "cancel"` 撤回待确认请求 |
 | `ping` | — | `pong`, `server_time` | 加密通道内轻量双向保活探测，供客户端 `Wakeup` 无损探活使用 |
-| `events.resume` | `session_id`, `after_seq` | `session_id`, `after_seq` | 补发 `seq > after_seq` 的事件并续订实时流；超窗口返 `snapshot_required` |
+| `events.resume` | `session_id`, `after_seq`, `watch_presence?` | `session_id`, `after_seq` | 补发 `seq > after_seq` 的事件并续订实时流；超窗口返 `snapshot_required` |
 
 ```json
 // 1. 发起端提交任务
@@ -262,10 +264,12 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 
 | 类别 | 值 | 说明 |
 | :--- | :--- | :--- |
+| **运行启动与排队** | `run.started` / `run.queued` | 广播任务开始（含发起人 `user_id`、提示词 `text`、时间戳及可选 `guest_request_id`/`requested_by`）与排队位置变化，保证多人实时同步 |
 | **文本与思考** | `text.delta` / `thinking.delta` | 流式正文与模型思考块（思考块需权限） |
 | **工具执行** | `tool.call` / `tool.start` / `tool.update` / `tool.end` | 工具调用与输出流（需工具可见权限） |
-| **远程交互** | `ui.request` / `ui.resolved` | 工具审批与提问弹窗（严格按发起人/所有者隔离，防止跨访客泄露） |
-| **访客提问门禁** | `guest.request` / `guest.resolved` | 只读访客提问与主人批准/忽略结果（仅对主人及提问者本人可见，其余访客收 `sync`） |
+| **远程交互** | `ui.request` / `ui.resolved` | 工具审批与提问弹窗（严格按发起人/所有者隔离，防止跨访客泄露；`ui.resolved` 含 `resolved_by`） |
+| **访客提问门禁** | `guest.request` / `guest.resolved` | 只读访客提问与批准/忽略/撤回结果（仅对可管理者及提问者本人可见，其余访客收 `sync`；`guest.resolved` 含 `resolved_by`） |
+| **在线协作者状态** | `presence.updated` | **临时事件（`seq: 0`，不落盘、不推进游标）**，仅推送给通过 `watch_presence` 或 `session.presence` 显式订阅的对端 |
 | **权限占位** | `sync` | 混合权限会话中维持未授权查看者序号连续，不携带任何敏感内容 |
 | **运行终态** | `run.completed` / `run.cancelled` / `run.failed` | 任务结束通知 |
 
@@ -280,6 +284,8 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 | 错误码 (`code`) | 含义与客户端处理建议 |
 | :--- | :--- |
 | `unavailable` | 资源不可见、不存在、未授权或当前不可用（防枚举统一错误码） |
+| `session_busy` | 会话正在执行其他运行且 `queue_policy: "reject"`，或协作轮次队列已满（单会话上限 8 条 / 单用户上限 3 条） |
+| `guest_request_limit` | 当前用户在该会话的待确认 `guest.request` 数量达到上限（4 条） |
 | `tool_denied` | 缺少提示词/工具执行权限，或触发了被禁用的斜杠命令 |
 | `request_conflict` | 复用了历史 `request_id` 但提示词正文不一致 |
 | `snapshot_required` | `events.resume` 游标早于保留窗口，须调用 `session.open` 重建快照 |

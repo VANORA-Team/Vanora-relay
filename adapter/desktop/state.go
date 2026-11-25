@@ -12,20 +12,23 @@ import (
 const (
 	stateVersion = 1
 
-	kindTextDelta     = "text.delta"
-	kindThinkingDelta = "thinking.delta"
-	kindToolCall      = "tool.call"
-	kindToolStart     = "tool.start"
-	kindToolUpdate    = "tool.update"
-	kindToolEnd       = "tool.end"
-	kindUIRequest     = "ui.request"
-	kindUIResolved    = "ui.resolved"
-	kindGuestRequest  = "guest.request"
-	kindGuestResolved = "guest.resolved"
-	kindSync          = "sync"
-	kindRunCompleted  = "run.completed"
-	kindRunCancelled  = "run.cancelled"
-	kindRunFailed     = "run.failed"
+	kindTextDelta       = "text.delta"
+	kindThinkingDelta   = "thinking.delta"
+	kindToolCall        = "tool.call"
+	kindToolStart       = "tool.start"
+	kindToolUpdate      = "tool.update"
+	kindToolEnd         = "tool.end"
+	kindUIRequest       = "ui.request"
+	kindUIResolved      = "ui.resolved"
+	kindGuestRequest    = "guest.request"
+	kindGuestResolved   = "guest.resolved"
+	kindPresenceUpdated = "presence.updated"
+	kindSync            = "sync"
+	kindRunQueued       = "run.queued"
+	kindRunStarted      = "run.started"
+	kindRunCompleted    = "run.completed"
+	kindRunCancelled    = "run.cancelled"
+	kindRunFailed       = "run.failed"
 
 	visAll      = ""
 	visThinking = "thinking"
@@ -33,6 +36,7 @@ const (
 	visApproval = "approval"
 	visGuest    = "guest"
 
+	statusQueued     = "queued"
 	statusRunning    = "running"
 	statusCancelling = "cancelling"
 	statusCompleted  = "completed"
@@ -76,7 +80,7 @@ type persistedSession struct {
 	Requests      map[string]requestRecord      `json:"requests,omitempty"`
 	Runs          map[string]runRecord          `json:"runs,omitempty"`
 	GuestRequests map[string]guestRequestRecord `json:"guest_requests,omitempty"`
-	PendingGuest  []guestRequestData            `json:"pending_guest,omitempty"`
+	PendingGuest  []GuestRequestInfo            `json:"pending_guest,omitempty"`
 }
 
 type storedEvent struct {
@@ -151,8 +155,9 @@ type uiRequestData struct {
 }
 
 type uiResolvedData struct {
-	UIID   string `json:"ui_id"`
-	Status string `json:"status"`
+	UIID       string `json:"ui_id"`
+	Status     string `json:"status"`
+	ResolvedBy string `json:"resolved_by,omitempty"`
 }
 
 type guestRequestRecord struct {
@@ -163,7 +168,8 @@ type guestRequestRecord struct {
 	Created        int64  `json:"created"`
 }
 
-type guestRequestData struct {
+// GuestRequestInfo represents one pending owner-gated guest prompt request.
+type GuestRequestInfo struct {
 	GuestRequestID string `json:"guest_request_id"`
 	SessionID      string `json:"session_id"`
 	UserID         string `json:"user_id"`
@@ -175,6 +181,24 @@ type guestResolvedData struct {
 	GuestRequestID string `json:"guest_request_id"`
 	Status         string `json:"status"`
 	RunID          string `json:"run_id,omitempty"`
+	ResolvedBy     string `json:"resolved_by,omitempty"`
+}
+
+type runQueuedData struct {
+	UserID         string `json:"user_id"`
+	Text           string `json:"text"`
+	Timestamp      int64  `json:"timestamp"`
+	Position       int    `json:"position"`
+	GuestRequestID string `json:"guest_request_id,omitempty"`
+	RequestedBy    string `json:"requested_by,omitempty"`
+}
+
+type runStartedData struct {
+	UserID         string `json:"user_id"`
+	Text           string `json:"text"`
+	Timestamp      int64  `json:"timestamp"`
+	GuestRequestID string `json:"guest_request_id,omitempty"`
+	RequestedBy    string `json:"requested_by,omitempty"`
 }
 
 type runCancelledData struct {
@@ -263,7 +287,7 @@ func (ps *persistedSession) validateAndNormalize() error {
 	}
 	for id, rec := range ps.Runs {
 		switch rec.Status {
-		case statusRunning, statusCancelling, statusCompleted, statusCancelled, statusFailed:
+		case statusQueued, statusRunning, statusCancelling, statusCompleted, statusCancelled, statusFailed:
 		default:
 			return fmt.Errorf("run %q has invalid status %q", id, rec.Status)
 		}

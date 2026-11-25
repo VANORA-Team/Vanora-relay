@@ -565,16 +565,30 @@ func (s *Server) Status() Status {
 		st.Enabled = true
 		st.SignalURL = s.running.signalURL
 	}
-	for id, client := range s.state.Clients {
-		active := false
+	isConnected := func(id string) bool {
 		for l := range s.clientLinks[id] {
 			if !l.closed.Load() {
-				active = true
-				break
+				return true
 			}
 		}
-		client.Connected = active
+		return false
+	}
+	seen := make(map[string]struct{}, len(s.state.Clients))
+	for id, client := range s.state.Clients {
+		seen[id] = struct{}{}
+		client.Connected = isConnected(id)
 		st.Clients = append(st.Clients, client)
+	}
+	if s.group != nil {
+		for _, member := range s.group.Snapshot().Members() {
+			if _, ok := seen[member.ID]; ok {
+				continue
+			}
+			if client, allowed := s.networkClient(member.ID); allowed {
+				client.Connected = isConnected(member.ID)
+				st.Clients = append(st.Clients, client)
+			}
+		}
 	}
 	s.pruneInvitationsLocked(time.Now())
 	for _, inv := range s.invitations {

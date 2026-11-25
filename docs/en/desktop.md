@@ -136,6 +136,9 @@ Every command is one JSON line and accepts an optional `request_id` echoed back 
 | `auth.logout` | `channel: "cn" \| "global"`, `request_id?` | Resets and disconnects only the specified official site; returns `auth.logout.ok` |
 | `access.relay.set` | `enabled`, `channel?: "cn" \| "global" \| "self"`, `signal_url?`, `signal_token?` | Starts, stops, or hot-switches the WAN channel |
 | `access.lan.set` | `enabled`, `address?` | Starts or stops LAN hosting (pass private `IP:port`, e.g. `192.168.1.42:3773`) |
+| `session.collaborators` | `session_id?` | Inspects active run, queued turns, online participants, and pending guest requests for one or all sessions |
+| `session.guest.list` | `session_id?` | Lists pending `guest.request` entries for one or all sessions |
+| `session.guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`), `text?`, `mode_limit?` | Locally approves (with optional prompt edit, `mode_limit`, and automatic turn queuing) or dismisses a guest prompt request |
 | `reload` / `status` / `shutdown` | — | Hot-reloads `desktop.json`, returns brief status, or exits gracefully |
 
 ### Pairing Invitations & Pairing Network Management
@@ -184,9 +187,11 @@ Executed asynchronously in dedicated goroutines without blocking local hosting:
 | `remote.pair` | `input`, `channel?`, `signal_url?`, `signal_token?`, `grant_access?` | Redeems a QR link or 16-char code, syncs PairNet, and connects; returns `remote.paired` |
 | `remote.connect` / `disconnect` / `reconnect` | `peer_id`, `channel?` | Connects to a known PairNet desktop / disconnects & pauses retry / reconnects & resumes cursors |
 | `remote.workspace.list` | `peer_id`, `channel?` | Lists allowlisted remote workspaces; returns `remote.result` |
-| `remote.session.create` / `list` / `open` | `peer_id`, `workspace_id` or `session_id`, `title?`, `channel?` | Creates session / lists sessions / opens snapshot & subscribes to live stream |
+| `remote.session.create` / `list` / `open` / `close` | `peer_id`, `workspace_id` or `session_id`, `title?`, `watch_presence?`, `channel?` | Creates session / lists sessions / opens snapshot & subscribes (optional live presence) / unsubscribes & updates presence |
+| `remote.session.presence` | `peer_id`, `session_id`, `watch?`, `channel?` | Queries online collaborators on a remote session and toggles live `presence.updated` events |
 | `remote.events.resume` / `ack` | `peer_id`, `session_id`, `after_seq` or `seq`, `channel?` | Replays missed events / acknowledges consumed sequence cursor |
-| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` or `run_id`, `channel?` | Starts an idempotent remote run / cancels an active run |
+| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` or `run_id`, `queue_policy?` (`enqueue`\|`reject`), `channel?` | Starts or queues an idempotent remote run / cancels an active or queued run |
+| `remote.guest.request` / `respond` | `peer_id`, `session_id`, `text` or `guest_request_id`+`action` (`approve`\|`dismiss`\|`cancel`), `text?`, `mode_limit?` | Submits a gated guest prompt / approves (with optional prompt edit & `mode_limit`), dismisses, or self-cancels |
 | `remote.ui.respond` | `peer_id`, `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | Answers a remote tool approval or prompt dialog |
 
 Async `stdout` events: `remote.connection.state`, `remote.event`, `remote.network.updated`, `remote.access.state`, `remote.auth.state`, `remote.subscription.error`, and `remote.error`.

@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"vanora-relay/adapter/lan"
+	"vanora-relay/adapter/selfrelay"
 )
 
 type processHandle struct {
@@ -59,9 +64,15 @@ type run struct {
 	session        *sessionRuntime
 	userID         string
 	localApproved  bool
+	guestRequestID string
+	requestedBy    string
+	rawLinkOrigin  string
+	hasToolsLimit  bool
+	toolsLimit     []string
 	requestID      string
 	text           string
 	tools          bool
+	queuedAt       int64
 	started        int64
 	status         string
 	authorityUntil time.Time
@@ -246,6 +257,16 @@ func (a *Adapter) executeRun(r *run) {
 	}
 }
 
+func (r *run) approvalOwner() string {
+	if r == nil {
+		return ""
+	}
+	if r.localApproved && r.userID == LocalOwner {
+		return LocalOwner
+	}
+	return r.userID
+}
+
 func (r *run) setFail(reason string) {
 	if r.failReason == "" {
 		r.failReason = reason
@@ -423,7 +444,13 @@ func (a *Adapter) addUserMessage(r *run, env messageEnvelope) {
 	if ts == 0 {
 		ts = a.now().UnixMilli()
 	}
-	r.session.messages = append(r.session.messages, Message{Role: "user", Text: text, Timestamp: ts})
+	r.session.messages = append(r.session.messages, Message{
+		Role:        "user",
+		Text:        text,
+		Timestamp:   ts,
+		UserID:      r.userID,
+		RequestedBy: r.requestedBy,
+	})
 }
 
 func (a *Adapter) emitText(r *run, delta string) {
@@ -676,7 +703,7 @@ func (a *Adapter) handleExtensionUI(r *run, rec rpcRecord) {
 		_ = json.Unmarshal(rec.Message, &msgStr)
 	}
 	a.mu.Lock()
-	if r.terminal || r.stopFlag.Load() || !r.session.cfg.remoteApproval() || !a.userOnlineLocked(r.userID) || len(r.pendingUI) >= maxPendingUI {
+	if r.terminal || r.stopFlag.Load() || !r.session.cfg.remoteApproval() || !a.runOnlineLocked(r) || len(r.pendingUI) >= maxPendingUI {
 		a.mu.Unlock()
 		a.autoCancelExtension(r, rec)
 		return
@@ -712,7 +739,7 @@ func (a *Adapter) handleExtensionUI(r *run, rec rpcRecord) {
 		r.pendingUI = make(map[string]*pendingUIRequest)
 	}
 	r.pendingUI[uiID] = pui
-	a.appendEventVisibleLocked(r.session, r.id, kindUIRequest, info, true, visApproval, r.userID)
+	a.appendEventVisibleLocked(r.session, r.id, kindUIRequest, info, true, visApproval, r.approvalOwner())
 	sessionID := r.session.cfg.id
 	runID := r.id
 	a.mu.Unlock()
@@ -743,7 +770,7 @@ func (a *Adapter) timeoutPendingUI(r *run, uiID string) {
 	pui.resolved = true
 	delete(r.pendingUI, uiID)
 	hasMoreUI := len(r.pendingUI) > 0
-	a.appendEventVisibleLocked(r.session, r.id, kindUIResolved, uiResolvedData{UIID: uiID, Status: "timed_out"}, true, visApproval, r.userID)
+	a.appendEventVisibleLocked(r.session, r.id, kindUIResolved, uiResolvedData{UIID: uiID, Status: "timed_out"}, true, visApproval, r.approvalOwner())
 	sessionID := r.session.cfg.id
 	runID := r.id
 	a.mu.Unlock()
@@ -784,7 +811,7 @@ func (a *Adapter) cancelRunPendingUILocked(r *run, status string) []uiCancelActi
 		delete(r.pendingUI, id)
 		actions = append(actions, uiCancelAction{r: r, id: id})
 		if r.session != nil && !a.closed {
-			a.appendEventVisibleLocked(r.session, r.id, kindUIResolved, uiResolvedData{UIID: id, Status: status}, true, visApproval, r.userID)
+			a.appendEventVisibleLocked(r.session, r.id, kindUIResolved, uiResolvedData{UIID: id, Status: status}, true, visApproval, r.approvalOwner())
 		}
 	}
 	return actions
@@ -880,6 +907,7 @@ func (a *Adapter) finishRun(r *run) {
 			r.session.active = nil
 		}
 		delete(a.runs, r.id)
+		nextRun := a.promoteNextQueuedRunLocked(r.session)
 		r.session.ps.trim(a.cfg.retention)
 		if err := a.saveLocked(); err != nil {
 			a.logger.Error("persist run terminal", "session", r.session.cfg.id, "run", r.id, "error", err)
@@ -894,7 +922,125 @@ func (a *Adapter) finishRun(r *run) {
 			RunID:     runID,
 			Phase:     status,
 		})
+		if nextRun != nil {
+			a.emitActivity(ActivityEvent{
+				SessionID: sessionID,
+				RunID:     nextRun.id,
+				Phase:     statusRunning,
+			})
+			go a.executeRun(nextRun)
+		}
 	})
+}
+
+func (a *Adapter) promoteNextQueuedRunLocked(sr *sessionRuntime) *run {
+	if sr == nil || a.closed || sr.active != nil || a.sessions[sr.cfg.id] != sr {
+		return nil
+	}
+	now := a.now()
+	for len(sr.queue) > 0 {
+		next := sr.queue[0]
+		sr.queue = sr.queue[1:]
+		if next == nil || next.terminal || next.stopFlag.Load() {
+			continue
+		}
+		var cancelReason string
+		if next.localApproved {
+			if sr.cfg.readOnly {
+				cancelReason = "acl_revoked"
+			}
+		} else {
+			fenceOK, _ := allowsSessionFence(sr.cfg, next.userID, next.rawLinkOrigin)
+			switch {
+			case !sr.cfg.canRead(next.userID) || !sr.cfg.canRun(next.userID) || !fenceOK:
+				cancelReason = "acl_revoked"
+			case !a.userOnlineLocked(next.userID):
+				cancelReason = "authority_lost"
+				if lan.Access(next.userID) != "" {
+					cancelReason = "lan_access_revoked"
+				} else if selfrelay.Access(next.userID) != "" {
+					cancelReason = "self_access_revoked"
+				}
+			case !next.authorityUntil.IsZero() && !now.Before(next.authorityUntil):
+				cancelReason = "authority_lost"
+			}
+		}
+		if cancelReason != "" {
+			a.cancelQueuedRunLocked(sr, next, cancelReason)
+			continue
+		}
+		runCfg := sr.cfg
+		if next.hasToolsLimit {
+			narrowed := *sr.cfg
+			narrowed.tools = intersectTools(sr.cfg.tools, next.toolsLimit)
+			runCfg = &narrowed
+		}
+		cmd, err := a.buildCommand(runCfg)
+		if err != nil {
+			a.failQueuedRunLocked(sr, next, "start_failed")
+			continue
+		}
+		if runCfg.linkOrigin != "" {
+			if cmd.Env == nil {
+				cmd.Env = os.Environ()
+			}
+			cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
+		}
+		handle, err := startProcess(cmd)
+		if err != nil {
+			a.logger.Error("start queued vanora", "session", sr.cfg.id, "run", next.id, "error", err)
+			a.failQueuedRunLocked(sr, next, "start_failed")
+			continue
+		}
+		startedAt := now.UnixMilli()
+		next.handle = handle
+		next.status = statusRunning
+		next.tools = len(runCfg.tools) > 0
+		next.started = startedAt
+		next.pendingTimestamp = startedAt
+		sr.active = next
+		sr.ps.Runs[next.id] = runRecord{
+			Status:  statusRunning,
+			UserID:  next.userID,
+			Tools:   next.tools,
+			Created: startedAt,
+		}
+		a.appendEventLocked(sr, next.id, kindRunStarted, runStartedData{
+			UserID:         next.userID,
+			Text:           next.text,
+			Timestamp:      startedAt,
+			GuestRequestID: next.guestRequestID,
+			RequestedBy:    next.requestedBy,
+		}, next.tools)
+		a.wg.Add(1)
+		return next
+	}
+	return nil
+}
+
+func (a *Adapter) failQueuedRunLocked(sr *sessionRuntime, r *run, reason string) {
+	if r == nil || r.terminal {
+		return
+	}
+	r.terminal = true
+	r.status = statusFailed
+	r.failReason = reason
+	if sr != nil {
+		if idx := slices.Index(sr.queue, r); idx >= 0 {
+			sr.queue = slices.Delete(sr.queue, idx, idx+1)
+		}
+		delete(sr.runs, r.id)
+		if rec, ok := sr.ps.Runs[r.id]; ok {
+			rec.Status = statusFailed
+			sr.ps.Runs[r.id] = rec
+		}
+		if !a.closed {
+			a.appendEventLocked(sr, r.id, kindRunFailed, runFailedData{Reason: reason}, r.tools)
+		}
+	}
+	delete(a.runs, r.id)
+	close(r.done)
+	a.markDirtyLocked()
 }
 
 func splitText(s string, max int) []string {

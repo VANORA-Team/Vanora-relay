@@ -294,7 +294,22 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		}
 		emitData(data)
 	case "remote.session.open":
-		data, err := rm.OpenSession(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID)
+		watchPresence := cmd.WatchPresence != nil && *cmd.WatchPresence
+		data, err := rm.OpenSessionWithOptions(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, watchPresence)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		emitData(data)
+	case "remote.session.close":
+		data, err := rm.CloseSession(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID)
+		if err != nil {
+			emitErr(err)
+			return
+		}
+		emitData(data)
+	case "remote.session.presence":
+		data, err := rm.SessionPresence(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.Watch)
 		if err != nil {
 			emitErr(err)
 			return
@@ -324,9 +339,10 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		emitData(raw)
 	case "remote.run.start":
 		data, err := rm.StartRunWithOptions(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.RequestID, cmd.Text, remote.RequestOptions{
-			Namespace:  cmd.Namespace,
-			LinkOrigin: cmd.LinkOrigin,
-			ModeLimit:  cmd.ModeLimit,
+			Namespace:   cmd.Namespace,
+			LinkOrigin:  cmd.LinkOrigin,
+			ModeLimit:   cmd.ModeLimit,
+			QueuePolicy: cmd.QueuePolicy,
 		})
 		if err != nil {
 			emitErr(err)
@@ -348,7 +364,11 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		}
 		emitData(data)
 	case "remote.guest.respond":
-		data, err := rm.RespondGuestRequest(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.GuestRequestID, cmd.Action)
+		data, err := rm.RespondGuestRequestWithOptions(ctx, cmd.Channel, cmd.PeerID, cmd.SessionID, cmd.GuestRequestID, cmd.Action, remote.GuestRespondOptions{
+			Text:       cmd.Text,
+			LinkOrigin: cmd.LinkOrigin,
+			ModeLimit:  cmd.ModeLimit,
+		})
 		if err != nil {
 			emitErr(err)
 			return
@@ -384,7 +404,7 @@ func remoteErrorCode(err error) string {
 		return string(sig)
 	}
 	switch err.Error() {
-	case "unavailable", "tool_denied", "request_conflict", "snapshot_required", "snapshot_too_large", "invalid_request":
+	case "unavailable", "tool_denied", "request_conflict", "snapshot_required", "snapshot_too_large", "invalid_request", "session_busy", "guest_request_limit":
 		return err.Error()
 	}
 	return ""

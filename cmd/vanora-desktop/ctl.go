@@ -170,6 +170,7 @@ func runCtl(args []string) error {
 	readOnlyFlag := fs.Bool("read-only", false, "monotonically narrow delegated session/run to read-only")
 	noToolsFlag := fs.Bool("no-tools", false, "monotonically narrow delegated session/run to text-only (--no-tools)")
 	toolsFlag := fs.String("tools", "", "comma-separated tool subset for monotonic narrowing")
+	queuePolicyFlag := fs.String("queue-policy", "", "queue behavior when target session is busy: enqueue (default) or reject")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -377,9 +378,10 @@ func runCtl(args []string) error {
 				}
 			}
 			return remote.RequestOptions{
-				Namespace:  *namespaceFlag,
-				LinkOrigin: *linkOriginFlag,
-				ModeLimit:  ml,
+				Namespace:   *namespaceFlag,
+				LinkOrigin:  *linkOriginFlag,
+				ModeLimit:   ml,
+				QueuePolicy: *queuePolicyFlag,
 			}
 		}
 		switch action {

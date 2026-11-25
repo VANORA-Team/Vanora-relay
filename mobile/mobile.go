@@ -80,6 +80,7 @@ type reply struct {
 type cursor struct {
 	applied, delivered int64
 	queued             int64
+	watchPresence      bool
 }
 type event struct {
 	session string
@@ -960,6 +961,12 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 			delete(c.pending, m.ID)
 		}
 	case "event":
+		if m.Seq == 0 && m.Session != "" {
+			if len(c.events) < 256 {
+				c.enqueueLocked(event{session: m.Session, seq: 0, payload: string(b)})
+			}
+			break
+		}
 		cur := c.subscriptions[m.Session]
 		if cur != nil && m.Seq > cur.queued {
 			if m.Seq != cur.queued+1 || len(c.events) >= 256 {
@@ -1092,10 +1099,18 @@ func (c *Client) subscribe(p transport.Peer, id string, seq int64) (string, erro
 		c.mu.Unlock()
 		return "", errors.New("too many open sessions")
 	}
-	c.subscriptions[id] = &cursor{applied: seq, delivered: seq, queued: seq}
+	watch := false
+	if existing := c.subscriptions[id]; existing != nil {
+		watch = existing.watchPresence
+	}
+	c.subscriptions[id] = &cursor{applied: seq, delivered: seq, queued: seq, watchPresence: watch}
 	c.events = slices.DeleteFunc(c.events, func(e event) bool { return e.session == id })
 	c.mu.Unlock()
-	data, err := c.request(p, map[string]any{"type": "events.resume", "request_id": NewRequestID(), "session_id": id, "after_seq": seq}, false)
+	req := map[string]any{"type": "events.resume", "request_id": NewRequestID(), "session_id": id, "after_seq": seq}
+	if watch {
+		req["watch_presence"] = true
+	}
+	data, err := c.request(p, req, false)
 	if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
 		c.mu.Lock()
 		delete(c.subscriptions, id)

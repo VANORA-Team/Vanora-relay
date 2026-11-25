@@ -88,8 +88,9 @@ type peerState struct {
 	// Deliveries check it before Send so a stale list cannot be released
 	// after the new ACL is published.
 	aclStale atomic.Bool
-	// subscriptions is guarded by Adapter.mu.
+	// subscriptions and presenceSubs are guarded by Adapter.mu.
 	subscriptions map[string]struct{}
+	presenceSubs  map[string]struct{}
 }
 
 type delivery struct {
@@ -131,9 +132,10 @@ type sessionRuntime struct {
 	stamp    fileStamp
 	loaded   bool
 
-	// active is guarded by Adapter.mu. At most one Vanora process may own a
-	// session file at a time.
+	// active and queue are guarded by Adapter.mu. At most one Vanora process
+	// may own a session file at a time; queued runs execute in FIFO order.
 	active *run
+	queue  []*run
 	runs   map[string]*run
 }
 
@@ -393,6 +395,7 @@ func (a *Adapter) Open(peer transport.Peer) {
 		out:           make(chan delivery, peerQueueSize),
 		done:          make(chan struct{}),
 		subscriptions: make(map[string]struct{}),
+		presenceSubs:  make(map[string]struct{}),
 	}
 	a.peers[peer] = ps
 	a.wg.Add(1)
@@ -417,11 +420,22 @@ func (a *Adapter) Message(peer transport.Peer, data []byte) {
 func (a *Adapter) Closed(peer transport.Peer) {
 	a.mu.Lock()
 	ps := a.peers[peer]
-	delete(a.peers, peer)
+	var affected []string
+	var presenceObs []map[string]any
+	if ps != nil {
+		for sid := range ps.subscriptions {
+			affected = append(affected, sid)
+		}
+		delete(a.peers, peer)
+		presenceObs = a.presenceUpdatesLocked(affected...)
+	}
 	a.mu.Unlock()
 	if ps != nil {
 		ps.close()
 		a.emitObserve(map[string]any{"type": "peer.disconnected", "user_id": peer.UserID()})
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 	}
 }
 
@@ -465,10 +479,7 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 			return
 		}
 		if d.visibility != "" {
-			allowed := sr.cfg.canSeeEvent(user, d.visibility)
-			if allowed && (d.visibility == visApproval || d.visibility == visGuest) && !sr.cfg.owns(user) && (d.approvalUser == "" || user != d.approvalUser) {
-				allowed = false
-			}
+			allowed := a.canSeeRestrictedEventLocked(sr, user, d.visibility, d.approvalUser)
 			if !allowed {
 				if d.seq <= 0 {
 					a.mu.Unlock()
@@ -539,10 +550,19 @@ func (a *Adapter) closePeer(ps *peerState) {
 	}
 	ps.close()
 	a.mu.Lock()
+	var presenceObs []map[string]any
 	if a.peers[ps.peer] == ps {
+		var affected []string
+		for sid := range ps.subscriptions {
+			affected = append(affected, sid)
+		}
 		delete(a.peers, ps.peer)
+		presenceObs = a.presenceUpdatesLocked(affected...)
 	}
 	a.mu.Unlock()
+	for _, ev := range presenceObs {
+		a.emitObserve(ev)
+	}
 }
 
 func (ps *peerState) close() {
@@ -583,6 +603,10 @@ func (a *Adapter) Close() error {
 	}
 	runs := make([]*run, 0, len(a.runs))
 	for _, r := range a.runs {
+		if r.status == statusQueued {
+			a.cancelQueuedRunLocked(r.session, r, "shutdown")
+			continue
+		}
 		runs = append(runs, r)
 		if r.status == statusRunning {
 			r.status = statusCancelling
@@ -684,8 +708,14 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	}
 	var stops []*run
 	var uiCancels []uiCancelAction
+	var observeEvents []map[string]any
+	var activityEvents []ActivityEvent
 	stopRun := func(r *run, reason string) {
 		if r.terminal || r.status == statusCancelling {
+			return
+		}
+		if r.status == statusQueued {
+			a.cancelQueuedRunLocked(r.session, r, reason)
 			return
 		}
 		r.status = statusCancelling
@@ -756,20 +786,45 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 			stopRun(r, "session_removed")
 			continue
 		}
-		if !sr.cfg.canRead(r.userID) || !sr.cfg.canRun(r.userID) {
+		if r.localApproved {
+			if sr.cfg.readOnly {
+				stopRun(r, "acl_revoked")
+			}
+			continue
+		}
+		fenceOK, _ := allowsSessionFence(sr.cfg, r.userID, r.rawLinkOrigin)
+		if !sr.cfg.canRead(r.userID) || !sr.cfg.canRun(r.userID) || !fenceOK {
 			stopRun(r, "acl_revoked")
 		}
 	}
 	for _, workspace := range nc.workspaces {
 		workspace.officialOwner = a.officialOwner
 	}
+	// Prune pending guest requests whose requester lost access or when guest
+	// requests were disabled on the session.
+	for _, sr := range next {
+		obs, acts := a.prunePendingGuestsLocked(sr, func(item GuestRequestInfo) bool {
+			return !sr.cfg.allowGuestRequests || sr.cfg.readOnly || !sr.cfg.canRead(item.UserID)
+		})
+		observeEvents = append(observeEvents, obs...)
+		activityEvents = append(activityEvents, acts...)
+	}
 	var closePeers []*peerState
+	affectedPresence := make(map[string]struct{})
 	for _, ps := range a.peers {
 		user := ps.peer.UserID()
 		for id := range ps.subscriptions {
 			sr := next[id]
 			if sr == nil || !sr.cfg.canRead(user) {
 				delete(ps.subscriptions, id)
+				delete(ps.presenceSubs, id)
+				affectedPresence[id] = struct{}{}
+			}
+		}
+		for id := range ps.presenceSubs {
+			sr := next[id]
+			if sr == nil || !sr.cfg.canRead(user) {
+				delete(ps.presenceSubs, id)
 			}
 		}
 		anyVisible := false
@@ -798,6 +853,13 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	a.sessions = next
 	a.cfg = nc
 	a.maxRequestBytes = max(64<<10, nc.maxText+16<<10)
+	if len(affectedPresence) > 0 {
+		sids := make([]string, 0, len(affectedPresence))
+		for sid := range affectedPresence {
+			sids = append(sids, sid)
+		}
+		observeEvents = append(observeEvents, a.presenceUpdatesLocked(sids...)...)
+	}
 	a.mu.Unlock()
 
 	flushUICancels(uiCancels)
@@ -806,6 +868,12 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	}
 	for _, ps := range closePeers {
 		a.closePeer(ps)
+	}
+	for _, ev := range observeEvents {
+		a.emitObserve(ev)
+	}
+	for _, ev := range activityEvents {
+		a.emitActivity(ev)
 	}
 	return nil
 }
@@ -857,10 +925,25 @@ func (a *Adapter) RefreshLANAccess() {
 	stops, uiCancels := a.stopRunsLocked("lan_access_revoked", func(r *run) bool {
 		return lan.Access(r.userID) != "" && !a.userOnlineLocked(r.userID)
 	})
+	var observeEvents []map[string]any
+	var activityEvents []ActivityEvent
+	for _, sr := range a.sessions {
+		obs, acts := a.prunePendingGuestsLocked(sr, func(item GuestRequestInfo) bool {
+			return lan.Access(item.UserID) != "" && !a.userOnlineLocked(item.UserID)
+		})
+		observeEvents = append(observeEvents, obs...)
+		activityEvents = append(activityEvents, acts...)
+	}
 	a.mu.Unlock()
 	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
+	}
+	for _, ev := range observeEvents {
+		a.emitObserve(ev)
+	}
+	for _, ev := range activityEvents {
+		a.emitActivity(ev)
 	}
 }
 
@@ -869,10 +952,25 @@ func (a *Adapter) RefreshSelfAccess() {
 	stops, uiCancels := a.stopRunsLocked("self_access_revoked", func(r *run) bool {
 		return selfrelay.Access(r.userID) != "" && !a.userOnlineLocked(r.userID)
 	})
+	var observeEvents []map[string]any
+	var activityEvents []ActivityEvent
+	for _, sr := range a.sessions {
+		obs, acts := a.prunePendingGuestsLocked(sr, func(item GuestRequestInfo) bool {
+			return selfrelay.Access(item.UserID) != "" && !a.userOnlineLocked(item.UserID)
+		})
+		observeEvents = append(observeEvents, obs...)
+		activityEvents = append(activityEvents, acts...)
+	}
 	a.mu.Unlock()
 	flushUICancels(uiCancels)
 	for _, r := range stops {
 		r.stop(0)
+	}
+	for _, ev := range observeEvents {
+		a.emitObserve(ev)
+	}
+	for _, ev := range activityEvents {
+		a.emitActivity(ev)
 	}
 }
 
@@ -1018,13 +1116,13 @@ func (a *Adapter) checkRuns() {
 	var uiCancels []uiCancelAction
 	now := a.now()
 	for _, r := range a.runs {
-		if r.terminal || r.status != statusRunning {
+		if r.terminal || (r.status != statusRunning && r.status != statusQueued) {
 			continue
 		}
 		reason := ""
 		sr := a.sessions[r.sessionID]
 		if r.localApproved {
-			if sr == nil {
+			if sr == nil || sr.cfg.readOnly {
 				reason = "acl_revoked"
 			}
 		} else {
@@ -1045,6 +1143,10 @@ func (a *Adapter) checkRuns() {
 		// Transport peer connectivity is deliberately not part of ongoing
 		// authority. A disconnected phone must not cancel accepted local work.
 		if reason == "" {
+			continue
+		}
+		if r.status == statusQueued {
+			a.cancelQueuedRunLocked(r.session, r, reason)
 			continue
 		}
 		r.status = statusCancelling
@@ -1074,6 +1176,10 @@ func (a *Adapter) stopRunsLocked(reason string, matches func(*run) bool) ([]*run
 		if r.terminal || r.status == statusCancelling || !matches(r) {
 			continue
 		}
+		if r.status == statusQueued {
+			a.cancelQueuedRunLocked(r.session, r, reason)
+			continue
+		}
 		r.status = statusCancelling
 		r.stopReason = reason
 		r.stopFlag.Store(true)
@@ -1081,6 +1187,236 @@ func (a *Adapter) stopRunsLocked(reason string, matches func(*run) bool) ([]*run
 		stops = append(stops, r)
 	}
 	return stops, uiCancels
+}
+
+func (a *Adapter) runOnlineLocked(r *run) bool {
+	if r == nil {
+		return false
+	}
+	if r.localApproved {
+		return true
+	}
+	return a.userOnlineLocked(r.userID)
+}
+
+func (a *Adapter) canSeeRestrictedEventLocked(sr *sessionRuntime, user, visibility, approvalUser string) bool {
+	if sr == nil || !sr.cfg.canSeeEvent(user, visibility) {
+		return false
+	}
+	switch visibility {
+	case visGuest:
+		return sr.cfg.canManageGuests(user) || (approvalUser != "" && user == approvalUser)
+	case visApproval:
+		if sr.cfg.owns(user) || (approvalUser != "" && user == approvalUser) {
+			return true
+		}
+		return approvalUser == LocalOwner && sr.cfg.canManageGuests(user)
+	default:
+		return true
+	}
+}
+
+func (a *Adapter) canSeeRunApprovalLocked(cfg *normalizedSession, r *run, user string) bool {
+	if cfg == nil || r == nil {
+		return false
+	}
+	if cfg.owns(user) || user == r.userID {
+		return true
+	}
+	return r.localApproved && r.userID == LocalOwner && cfg.canManageGuests(user)
+}
+
+func (a *Adapter) cancelQueuedRunLocked(sr *sessionRuntime, r *run, reason string) {
+	if r == nil || r.terminal {
+		return
+	}
+	r.terminal = true
+	r.status = statusCancelled
+	r.stopReason = reason
+	r.stopFlag.Store(true)
+	if sr != nil {
+		if idx := slices.Index(sr.queue, r); idx >= 0 {
+			sr.queue = slices.Delete(sr.queue, idx, idx+1)
+		}
+		delete(sr.runs, r.id)
+		if rec, ok := sr.ps.Runs[r.id]; ok {
+			rec.Status = statusCancelled
+			sr.ps.Runs[r.id] = rec
+		}
+		if !a.closed {
+			a.appendEventLocked(sr, r.id, kindRunCancelled, runCancelledData{Reason: reason}, r.tools)
+		}
+	}
+	delete(a.runs, r.id)
+	close(r.done)
+	a.markDirtyLocked()
+}
+
+func (a *Adapter) prunePendingGuestsLocked(sr *sessionRuntime, match func(GuestRequestInfo) bool) ([]map[string]any, []ActivityEvent) {
+	if sr == nil || len(sr.ps.PendingGuest) == 0 {
+		return nil, nil
+	}
+	var kept []GuestRequestInfo
+	var removed []GuestRequestInfo
+	for _, item := range sr.ps.PendingGuest {
+		if match(item) {
+			removed = append(removed, item)
+		} else {
+			kept = append(kept, item)
+		}
+	}
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	sr.ps.PendingGuest = kept
+	var observeEvents []map[string]any
+	for _, item := range removed {
+		for k, rec := range sr.ps.GuestRequests {
+			if rec.GuestRequestID == item.GuestRequestID {
+				rec.Status = "dismissed"
+				sr.ps.GuestRequests[k] = rec
+			}
+		}
+		if !a.closed {
+			a.appendEventVisibleLocked(sr, "", kindGuestResolved, guestResolvedData{
+				GuestRequestID: item.GuestRequestID,
+				Status:         "dismissed",
+				ResolvedBy:     "system",
+			}, false, visGuest, item.UserID)
+		}
+		observeEvents = append(observeEvents, map[string]any{
+			"type":             "guest.resolved",
+			"session_id":       sr.cfg.id,
+			"guest_request_id": item.GuestRequestID,
+			"status":           "dismissed",
+			"resolved_by":      "system",
+		})
+	}
+	a.markDirtyLocked()
+	nextPhase := "cleared"
+	var activeRunID string
+	if sr.active != nil {
+		nextPhase = statusRunning
+		activeRunID = sr.active.id
+	} else if len(sr.ps.PendingGuest) > 0 {
+		nextPhase = "awaiting_guest_approval"
+	}
+	activityEvents := []ActivityEvent{{
+		SessionID: sr.cfg.id,
+		RunID:     activeRunID,
+		Phase:     nextPhase,
+	}}
+	return observeEvents, activityEvents
+}
+
+func (a *Adapter) sessionParticipantsLocked(sr *sessionRuntime) []ParticipantInfo {
+	if sr == nil {
+		return nil
+	}
+	counts := make(map[string]int)
+	for peer, ps := range a.peers {
+		if ps == nil || ps.closed.Load() {
+			continue
+		}
+		if _, subscribed := ps.subscriptions[sr.cfg.id]; !subscribed {
+			continue
+		}
+		uid := peer.UserID()
+		if !sr.cfg.canRead(uid) {
+			continue
+		}
+		counts[uid]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make([]ParticipantInfo, 0, len(counts))
+	for uid, n := range counts {
+		fenceOK, _ := allowsSessionFence(sr.cfg, uid, "")
+		out = append(out, ParticipantInfo{
+			UserID:      uid,
+			Role:        sr.cfg.roleFor(uid),
+			Connections: n,
+			CanRun:      sr.cfg.canRun(uid) && fenceOK,
+			CanApprove:  sr.cfg.canApprove(uid),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Role != out[j].Role {
+			if out[i].Role == "owner" {
+				return true
+			}
+			if out[j].Role == "owner" {
+				return false
+			}
+			if out[i].Role == "controller" {
+				return true
+			}
+			if out[j].Role == "controller" {
+				return false
+			}
+		}
+		return out[i].UserID < out[j].UserID
+	})
+	return out
+}
+
+func (a *Adapter) presenceUpdatesLocked(sessionIDs ...string) []map[string]any {
+	if len(sessionIDs) == 0 || a.closed {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(sessionIDs))
+	var obs []map[string]any
+	for _, sid := range sessionIDs {
+		if _, dup := seen[sid]; dup {
+			continue
+		}
+		seen[sid] = struct{}{}
+		sr := a.sessions[sid]
+		if sr == nil {
+			continue
+		}
+		participants := a.sessionParticipantsLocked(sr)
+		if participants == nil {
+			participants = []ParticipantInfo{}
+		}
+		obs = append(obs, map[string]any{
+			"type":         "session.presence",
+			"session_id":   sid,
+			"participants": participants,
+			"viewer_count": len(participants),
+		})
+		rawData, err := json.Marshal(presenceData{Participants: participants})
+		if err != nil {
+			continue
+		}
+		wire, err := json.Marshal(wireEvent{
+			Type:      "event",
+			SessionID: sid,
+			Seq:       0,
+			Kind:      kindPresenceUpdated,
+			Data:      rawData,
+		})
+		if err != nil {
+			continue
+		}
+		for peer, ps := range a.peers {
+			if ps == nil || ps.closed.Load() {
+				continue
+			}
+			if _, watching := ps.presenceSubs[sid]; !watching {
+				continue
+			}
+			if !sr.cfg.canRead(peer.UserID()) {
+				continue
+			}
+			a.enqueueLocked(ps, delivery{
+				data:      wire,
+				sessionID: sid,
+			})
+		}
+	}
+	return obs
 }
 
 func (a *Adapter) userOnlineLocked(user string) bool {
@@ -1134,12 +1470,21 @@ func (a *Adapter) appendEventLocked(sr *sessionRuntime, runID, kind string, data
 }
 
 func (a *Adapter) appendEventVisibleLocked(sr *sessionRuntime, runID, kind string, data any, requiresOnline bool, visibility, approvalUser string) *storedEvent {
+	e, wire := a.recordEventVisibleLocked(sr, runID, kind, data, requiresOnline, visibility, approvalUser, true)
+	if e == nil {
+		return nil
+	}
+	a.broadcastEventLocked(sr, e, wire)
+	return e
+}
+
+func (a *Adapter) recordEventVisibleLocked(sr *sessionRuntime, runID, kind string, data any, requiresOnline bool, visibility, approvalUser string, trim bool) (*storedEvent, []byte) {
 	var raw json.RawMessage
 	if data != nil {
 		encoded, err := json.Marshal(data)
 		if err != nil {
 			a.logger.Error("encode event", "session", sr.cfg.id, "kind", kind, "error", err)
-			return nil
+			return nil, nil
 		}
 		raw = encoded
 	}
@@ -1153,7 +1498,9 @@ func (a *Adapter) appendEventVisibleLocked(sr *sessionRuntime, runID, kind strin
 		ApprovalUser:   approvalUser,
 	}
 	sr.ps.appendEvent(e)
-	sr.ps.trim(a.cfg.retention)
+	if trim {
+		sr.ps.trim(a.cfg.retention)
+	}
 	wire, err := json.Marshal(wireEvent{
 		Type:      "event",
 		SessionID: sr.cfg.id,
@@ -1165,26 +1512,34 @@ func (a *Adapter) appendEventVisibleLocked(sr *sessionRuntime, runID, kind strin
 	if err != nil {
 		a.logger.Error("encode event wire", "session", sr.cfg.id, "error", err)
 		a.markDirtyLocked()
-		return &e
+		return &e, nil
 	}
-	for peer, ps := range a.peers {
-		if !sr.cfg.canRead(peer.UserID()) {
-			continue
+	return &e, wire
+}
+
+func (a *Adapter) broadcastEventLocked(sr *sessionRuntime, e *storedEvent, wire []byte) {
+	if e == nil {
+		return
+	}
+	if len(wire) > 0 {
+		for peer, ps := range a.peers {
+			if !sr.cfg.canRead(peer.UserID()) {
+				continue
+			}
+			if _, subscribed := ps.subscriptions[sr.cfg.id]; !subscribed {
+				continue
+			}
+			a.enqueueLocked(ps, delivery{
+				data:           wire,
+				requiresOnline: e.RequiresOnline,
+				sessionID:      sr.cfg.id,
+				visibility:     e.Visibility,
+				approvalUser:   e.ApprovalUser,
+				seq:            e.Seq,
+			})
 		}
-		if _, subscribed := ps.subscriptions[sr.cfg.id]; !subscribed {
-			continue
-		}
-		a.enqueueLocked(ps, delivery{
-			data:           wire,
-			requiresOnline: requiresOnline,
-			sessionID:      sr.cfg.id,
-			visibility:     visibility,
-			approvalUser:   approvalUser,
-			seq:            e.Seq,
-		})
 	}
 	a.markDirtyLocked()
-	return &e
 }
 
 func (a *Adapter) orderedSessionsLocked() []*sessionRuntime {
@@ -1238,7 +1593,7 @@ func (sr *sessionRuntime) syncLocked(a *Adapter) {
 func (a *Adapter) recoverRunRecordsLocked() {
 	for _, sr := range a.sessions {
 		for id, rec := range sr.ps.Runs {
-			if rec.Status != statusRunning && rec.Status != statusCancelling {
+			if rec.Status != statusRunning && rec.Status != statusCancelling && rec.Status != statusQueued {
 				continue
 			}
 			rec.Status = statusFailed

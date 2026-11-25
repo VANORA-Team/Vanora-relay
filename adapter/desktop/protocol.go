@@ -3,6 +3,7 @@ package desktop
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"slices"
 	"sort"
@@ -18,37 +19,39 @@ const (
 	codeSnapshotNeeded  = "snapshot_required"
 	codeSnapshotLarge   = "snapshot_too_large"
 	codeInvalidRequest  = "invalid_request"
+	codeSessionBusy     = "session_busy"
+	codeGuestLimit      = "guest_request_limit"
 	// maxReplayEvents bounds a single resume response well below the peer
 	// output queue. A larger backlog is served by a fresh snapshot instead of
 	// filling the queue and disconnecting the peer.
 	maxReplayEvents         = 128
 	maxPendingGuestRequests = 16
+	maxPendingGuestPerUser  = 4
+	maxQueuedRuns           = 8
+	maxQueuedRunsPerUser    = 3
 )
 
-type wireModeLimit struct {
-	ReadOnly bool     `json:"read_only,omitempty"`
-	NoTools  bool     `json:"no_tools,omitempty"`
-	Tools    []string `json:"tools,omitempty"`
-}
-
 type wireRequest struct {
-	Type           string         `json:"type"`
-	RequestID      string         `json:"request_id"`
-	SessionID      string         `json:"session_id"`
-	WorkspaceID    string         `json:"workspace_id"`
-	Title          string         `json:"title"`
-	Text           string         `json:"text"`
-	RunID          string         `json:"run_id"`
-	UIID           string         `json:"ui_id"`
-	Confirmed      *bool          `json:"confirmed"`
-	Value          *string        `json:"value"`
-	Answers        [][]string     `json:"answers"`
-	Cancelled      bool           `json:"cancelled"`
-	AfterSeq       *int64         `json:"after_seq"`
-	LinkOrigin     string         `json:"link_origin,omitempty"`
-	ModeLimit      *wireModeLimit `json:"mode_limit,omitempty"`
-	GuestRequestID string         `json:"guest_request_id,omitempty"`
-	Action         string         `json:"action,omitempty"`
+	Type           string     `json:"type"`
+	RequestID      string     `json:"request_id"`
+	SessionID      string     `json:"session_id"`
+	WorkspaceID    string     `json:"workspace_id"`
+	Title          string     `json:"title"`
+	Text           string     `json:"text"`
+	RunID          string     `json:"run_id"`
+	UIID           string     `json:"ui_id"`
+	Confirmed      *bool      `json:"confirmed"`
+	Value          *string    `json:"value"`
+	Answers        [][]string `json:"answers"`
+	Cancelled      bool       `json:"cancelled"`
+	AfterSeq       *int64     `json:"after_seq"`
+	LinkOrigin     string     `json:"link_origin,omitempty"`
+	ModeLimit      *ModeLimit `json:"mode_limit,omitempty"`
+	GuestRequestID string     `json:"guest_request_id,omitempty"`
+	Action         string     `json:"action,omitempty"`
+	QueuePolicy    string     `json:"queue_policy,omitempty"`
+	Watch          *bool      `json:"watch,omitempty"`
+	WatchPresence  *bool      `json:"watch_presence,omitempty"`
 }
 
 type resultEnvelope struct {
@@ -86,6 +89,11 @@ type sessionSummary struct {
 	ShowTools          bool   `json:"show_tools,omitempty"`
 	ApprovalPolicy     string `json:"approval_policy,omitempty"`
 	HasActiveRun       bool   `json:"has_active_run,omitempty"`
+	ActiveRunID        string `json:"active_run_id,omitempty"`
+	ActiveRunUserID    string `json:"active_run_user_id,omitempty"`
+	QueuedRunCount     int    `json:"queued_run_count,omitempty"`
+	PendingGuestCount  int    `json:"pending_guest_count,omitempty"`
+	ViewerCount        int    `json:"viewer_count,omitempty"`
 	LinkOrigin         string `json:"link_origin,omitempty"`
 	AllowGuestRequests bool   `json:"allow_guest_requests,omitempty"`
 }
@@ -124,17 +132,89 @@ type GuestRespondResult struct {
 	GuestRequestID string `json:"guest_request_id"`
 	Status         string `json:"status"`
 	RunID          string `json:"run_id,omitempty"`
+	Queued         bool   `json:"queued,omitempty"`
+	QueuePosition  int    `json:"queue_position,omitempty"`
+}
+
+// GuestRespondOptions configures optional approver overrides when approving a
+// pending guest prompt request.
+type GuestRespondOptions struct {
+	Text      string     `json:"text,omitempty"`
+	ModeLimit *ModeLimit `json:"mode_limit,omitempty"`
+}
+
+// ActiveRunInfo summarizes a session's currently executing run.
+type ActiveRunInfo struct {
+	RunID          string `json:"run_id"`
+	UserID         string `json:"user_id"`
+	Status         string `json:"status"`
+	StartedAt      int64  `json:"started_at"`
+	GuestRequestID string `json:"guest_request_id,omitempty"`
+	RequestedBy    string `json:"requested_by,omitempty"`
+	AwaitingUI     bool   `json:"awaiting_ui,omitempty"`
+}
+
+// QueuedRunInfo summarizes a run waiting in a session's FIFO turn queue.
+type QueuedRunInfo struct {
+	RunID          string `json:"run_id"`
+	UserID         string `json:"user_id"`
+	Text           string `json:"text"`
+	QueuedAt       int64  `json:"queued_at"`
+	Position       int    `json:"position"`
+	GuestRequestID string `json:"guest_request_id,omitempty"`
+	RequestedBy    string `json:"requested_by,omitempty"`
+}
+
+// ParticipantInfo describes one authenticated user currently subscribed to a session.
+type ParticipantInfo struct {
+	UserID      string `json:"user_id"`
+	Role        string `json:"role"`
+	Connections int    `json:"connections"`
+	CanRun      bool   `json:"can_run"`
+	CanApprove  bool   `json:"can_approve,omitempty"`
+}
+
+// SessionCollaboration summarizes live multi-user collaboration state for one
+// session (returned to the local desktop host / Sidecar).
+type SessionCollaboration struct {
+	SessionID    string             `json:"session_id"`
+	Title        string             `json:"title"`
+	ActiveRun    *ActiveRunInfo     `json:"active_run,omitempty"`
+	QueuedRuns   []QueuedRunInfo    `json:"queued_runs,omitempty"`
+	Participants []ParticipantInfo  `json:"participants,omitempty"`
+	PendingGuest []GuestRequestInfo `json:"pending_guest,omitempty"`
+}
+
+type presenceData struct {
+	Participants []ParticipantInfo `json:"participants"`
+}
+
+type presenceResult struct {
+	SessionID    string            `json:"session_id"`
+	Participants []ParticipantInfo `json:"participants"`
+	Watching     bool              `json:"watching"`
+}
+
+type sessionCloseResult struct {
+	SessionID string `json:"session_id"`
+	Closed    bool   `json:"closed"`
 }
 
 type snapshotResult struct {
 	Messages     []Message          `json:"messages"`
 	LastSeq      int64              `json:"last_seq"`
+	ActiveRun    *ActiveRunInfo     `json:"active_run,omitempty"`
+	QueuedRuns   []QueuedRunInfo    `json:"queued_runs,omitempty"`
+	Participants []ParticipantInfo  `json:"participants,omitempty"`
 	PendingUI    []uiRequestData    `json:"pending_ui,omitempty"`
-	PendingGuest []guestRequestData `json:"pending_guest,omitempty"`
+	PendingGuest []GuestRequestInfo `json:"pending_guest,omitempty"`
 }
 
 type runStartedResult struct {
-	RunID string `json:"run_id"`
+	RunID         string `json:"run_id"`
+	Status        string `json:"status,omitempty"`
+	Queued        bool   `json:"queued,omitempty"`
+	QueuePosition int    `json:"queue_position,omitempty"`
 }
 
 type runStatusResult struct {
@@ -182,6 +262,10 @@ func (a *Adapter) handleData(ps *peerState, data []byte) {
 		a.handleSessionList(ps, req)
 	case "session.open":
 		a.handleSessionOpen(ps, req)
+	case "session.close":
+		a.handleSessionClose(ps, req)
+	case "session.presence":
+		a.handleSessionPresence(ps, req)
 	case "events.resume":
 		a.handleEventsResume(ps, req)
 	case "run.start":
@@ -471,6 +555,23 @@ func (a *Adapter) sessionSummaryLocked(sr *sessionRuntime, user string) sessionS
 	}
 	fenceOK, _ := allowsSessionFence(s, user, "")
 	canRun := s.canRun(user) && fenceOK
+	var activeRunID, activeRunUser string
+	if sr.active != nil {
+		activeRunID = sr.active.id
+		activeRunUser = sr.active.userID
+	}
+	pendingGuests := 0
+	if len(sr.ps.PendingGuest) > 0 {
+		if s.canManageGuests(user) {
+			pendingGuests = len(sr.ps.PendingGuest)
+		} else {
+			for _, item := range sr.ps.PendingGuest {
+				if item.UserID == user {
+					pendingGuests++
+				}
+			}
+		}
+	}
 	return sessionSummary{
 		SessionID:          s.id,
 		WorkspaceID:        s.workspaceID,
@@ -481,6 +582,11 @@ func (a *Adapter) sessionSummaryLocked(sr *sessionRuntime, user string) sessionS
 		ShowTools:          s.canSeeTools(user),
 		ApprovalPolicy:     policy,
 		HasActiveRun:       sr.active != nil,
+		ActiveRunID:        activeRunID,
+		ActiveRunUserID:    activeRunUser,
+		QueuedRunCount:     len(sr.queue),
+		PendingGuestCount:  pendingGuests,
+		ViewerCount:        len(a.sessionParticipantsLocked(sr)),
 		LinkOrigin:         s.linkOrigin,
 		AllowGuestRequests: s.allowGuestRequests,
 	}
@@ -498,16 +604,81 @@ func (a *Adapter) sessionListLocked(user string) sessionListResult {
 	return out
 }
 
+func (a *Adapter) activeRunInfoLocked(sr *sessionRuntime, user string, includeApproval bool) *ActiveRunInfo {
+	if sr == nil || sr.active == nil {
+		return nil
+	}
+	r := sr.active
+	awaitingUI := false
+	if includeApproval && len(r.pendingUI) > 0 {
+		for _, pui := range r.pendingUI {
+			if !pui.resolved {
+				awaitingUI = true
+				break
+			}
+		}
+	}
+	return &ActiveRunInfo{
+		RunID:          r.id,
+		UserID:         r.userID,
+		Status:         r.status,
+		StartedAt:      r.started,
+		GuestRequestID: r.guestRequestID,
+		RequestedBy:    r.requestedBy,
+		AwaitingUI:     awaitingUI,
+	}
+}
+
+func queuedRunInfosLocked(sr *sessionRuntime) []QueuedRunInfo {
+	if sr == nil || len(sr.queue) == 0 {
+		return nil
+	}
+	out := make([]QueuedRunInfo, 0, len(sr.queue))
+	for i, r := range sr.queue {
+		out = append(out, QueuedRunInfo{
+			RunID:          r.id,
+			UserID:         r.userID,
+			Text:           r.text,
+			QueuedAt:       r.queuedAt,
+			Position:       i + 1,
+			GuestRequestID: r.guestRequestID,
+			RequestedBy:    r.requestedBy,
+		})
+	}
+	return out
+}
+
+func queuePositionLocked(sr *sessionRuntime, runID string) int {
+	if sr == nil || runID == "" {
+		return 0
+	}
+	for i, r := range sr.queue {
+		if r.id == runID {
+			return i + 1
+		}
+	}
+	return 0
+}
+
 func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 	user := ps.peer.UserID()
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	var presenceObs []map[string]any
 	sr, ok := a.sessions[req.SessionID]
 	if !ok || !sr.cfg.canRead(user) {
 		// Do not attach the requested session id to this delivery. The
 		// delivery ACL check would otherwise suppress the error itself.
+		_, wasSub := ps.subscriptions[req.SessionID]
 		delete(ps.subscriptions, req.SessionID)
+		delete(ps.presenceSubs, req.SessionID)
+		if wasSub {
+			presenceObs = a.presenceUpdatesLocked(req.SessionID)
+		}
 		a.sendErrorLocked(ps, req.RequestID, codeUnavailable, "", false)
+		a.mu.Unlock()
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 		return
 	}
 	sr.syncLocked(a)
@@ -524,11 +695,25 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		})
 	}
 	visibleMsgs := filterMessagesForViewer(rawMsgs, sr.cfg.canSeeThinking(user), sr.cfg.canSeeTools(user))
-	snapshot := snapshotResult{
-		Messages: visibleMsgs,
-		LastSeq:  sr.ps.LastSeq,
+	_, wasSub := ps.subscriptions[req.SessionID]
+	_, wasPresenceSub := ps.presenceSubs[req.SessionID]
+	ps.subscriptions[req.SessionID] = struct{}{}
+	if req.WatchPresence != nil {
+		if *req.WatchPresence {
+			ps.presenceSubs[req.SessionID] = struct{}{}
+		} else {
+			delete(ps.presenceSubs, req.SessionID)
+		}
 	}
-	if sr.active != nil && sr.cfg.canApprove(user) && (sr.cfg.owns(user) || user == sr.active.userID) && len(sr.active.pendingUI) > 0 {
+	canSeeApproval := sr.active != nil && sr.cfg.canApprove(user) && a.canSeeRunApprovalLocked(sr.cfg, sr.active, user)
+	snapshot := snapshotResult{
+		Messages:     visibleMsgs,
+		LastSeq:      sr.ps.LastSeq,
+		ActiveRun:    a.activeRunInfoLocked(sr, user, canSeeApproval),
+		QueuedRuns:   queuedRunInfosLocked(sr),
+		Participants: a.sessionParticipantsLocked(sr),
+	}
+	if canSeeApproval && len(sr.active.pendingUI) > 0 {
 		pending := make([]uiRequestData, 0, len(sr.active.pendingUI))
 		for _, pui := range sr.active.pendingUI {
 			if !pui.resolved {
@@ -539,9 +724,9 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		snapshot.PendingUI = pending
 	}
 	if len(sr.ps.PendingGuest) > 0 {
-		var guests []guestRequestData
+		var guests []GuestRequestInfo
 		for _, item := range sr.ps.PendingGuest {
-			if sr.cfg.owns(user) || item.UserID == user {
+			if sr.cfg.canManageGuests(user) || item.UserID == user {
 				guests = append(guests, item)
 			}
 		}
@@ -552,19 +737,94 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
-		delete(ps.subscriptions, req.SessionID)
+		if !wasSub {
+			delete(ps.subscriptions, req.SessionID)
+		}
+		if wasPresenceSub {
+			ps.presenceSubs[req.SessionID] = struct{}{}
+		} else {
+			delete(ps.presenceSubs, req.SessionID)
+		}
 		a.sendErrorLocked(ps, req.RequestID, codeUnavailable, "", false)
+		a.mu.Unlock()
 		return
 	}
 	if len(encoded) > a.cfg.maxSnapshot {
 		// A bounded error is preferable to a frame the transport must reject
 		// or a phone that waits forever for a snapshot it cannot receive.
 		delete(ps.subscriptions, req.SessionID)
+		delete(ps.presenceSubs, req.SessionID)
+		if wasSub {
+			presenceObs = a.presenceUpdatesLocked(req.SessionID)
+		}
 		a.sendErrorLocked(ps, req.RequestID, codeSnapshotLarge, "", false)
+		a.mu.Unlock()
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 		return
 	}
-	ps.subscriptions[req.SessionID] = struct{}{}
 	a.sendResultLocked(ps, req.RequestID, snapshot, req.SessionID, false)
+	if !wasSub {
+		presenceObs = a.presenceUpdatesLocked(req.SessionID)
+	}
+	a.mu.Unlock()
+	for _, ev := range presenceObs {
+		a.emitObserve(ev)
+	}
+}
+
+func (a *Adapter) handleSessionClose(ps *peerState, req wireRequest) {
+	if strings.TrimSpace(req.SessionID) == "" {
+		a.sendError(ps, req.RequestID, codeInvalidRequest)
+		return
+	}
+	a.mu.Lock()
+	_, wasSub := ps.subscriptions[req.SessionID]
+	delete(ps.subscriptions, req.SessionID)
+	delete(ps.presenceSubs, req.SessionID)
+	var presenceObs []map[string]any
+	if wasSub {
+		presenceObs = a.presenceUpdatesLocked(req.SessionID)
+	}
+	a.sendResultLocked(ps, req.RequestID, sessionCloseResult{SessionID: req.SessionID, Closed: true}, "", false)
+	a.mu.Unlock()
+	for _, ev := range presenceObs {
+		a.emitObserve(ev)
+	}
+}
+
+func (a *Adapter) handleSessionPresence(ps *peerState, req wireRequest) {
+	user := ps.peer.UserID()
+	if strings.TrimSpace(req.SessionID) == "" {
+		a.sendError(ps, req.RequestID, codeInvalidRequest)
+		return
+	}
+	a.mu.Lock()
+	sr, ok := a.sessions[req.SessionID]
+	if !ok || !sr.cfg.canRead(user) {
+		a.sendErrorLocked(ps, req.RequestID, codeUnavailable, "", false)
+		a.mu.Unlock()
+		return
+	}
+	if req.Watch != nil {
+		if *req.Watch {
+			ps.presenceSubs[req.SessionID] = struct{}{}
+		} else {
+			delete(ps.presenceSubs, req.SessionID)
+		}
+	}
+	participants := a.sessionParticipantsLocked(sr)
+	if participants == nil {
+		participants = []ParticipantInfo{}
+	}
+	_, watching := ps.presenceSubs[req.SessionID]
+	a.sendResultLocked(ps, req.RequestID, presenceResult{
+		SessionID:    req.SessionID,
+		Participants: participants,
+		Watching:     watching,
+	}, req.SessionID, false)
+	a.mu.Unlock()
 }
 
 func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
@@ -575,18 +835,36 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 	}
 	after := *req.AfterSeq
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	var presenceObs []map[string]any
 	sr, ok := a.sessions[req.SessionID]
 	if !ok || !sr.cfg.canRead(user) {
+		_, wasSub := ps.subscriptions[req.SessionID]
 		delete(ps.subscriptions, req.SessionID)
+		delete(ps.presenceSubs, req.SessionID)
+		if wasSub {
+			presenceObs = a.presenceUpdatesLocked(req.SessionID)
+		}
 		a.sendErrorLocked(ps, req.RequestID, codeUnavailable, "", false)
+		a.mu.Unlock()
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 		return
 	}
 	last := sr.ps.LastSeq
 	first := sr.ps.FirstSeq
 	if after > last || (last > 0 && (first == 0 || after < first-1)) {
+		_, wasSub := ps.subscriptions[req.SessionID]
 		delete(ps.subscriptions, req.SessionID)
+		delete(ps.presenceSubs, req.SessionID)
+		if wasSub {
+			presenceObs = a.presenceUpdatesLocked(req.SessionID)
+		}
 		a.sendErrorLocked(ps, req.RequestID, codeSnapshotNeeded, "", false)
+		a.mu.Unlock()
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 		return
 	}
 	pending := 0
@@ -601,13 +879,30 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 	// create a gap the client could not fill after the rejected resume.
 	free := cap(ps.out) - len(ps.out)
 	if pending > maxReplayEvents || pending+1 > free {
+		_, wasSub := ps.subscriptions[req.SessionID]
 		delete(ps.subscriptions, req.SessionID)
+		delete(ps.presenceSubs, req.SessionID)
+		if wasSub {
+			presenceObs = a.presenceUpdatesLocked(req.SessionID)
+		}
 		if free > 0 {
 			a.sendErrorLocked(ps, req.RequestID, codeSnapshotNeeded, "", false)
 		}
+		a.mu.Unlock()
+		for _, ev := range presenceObs {
+			a.emitObserve(ev)
+		}
 		return
 	}
+	_, wasSub := ps.subscriptions[req.SessionID]
 	ps.subscriptions[req.SessionID] = struct{}{}
+	if req.WatchPresence != nil {
+		if *req.WatchPresence {
+			ps.presenceSubs[req.SessionID] = struct{}{}
+		} else {
+			delete(ps.presenceSubs, req.SessionID)
+		}
+	}
 	a.sendResultLocked(ps, req.RequestID, resumeResult{SessionID: req.SessionID, AfterSeq: after}, req.SessionID, false)
 	for _, e := range sr.ps.Events {
 		if e.Seq <= after {
@@ -619,10 +914,7 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 				approvalUser = rec.UserID
 			}
 		}
-		visible := sr.cfg.canSeeEvent(user, e.Visibility)
-		if visible && (e.Visibility == visApproval || e.Visibility == visGuest) && !sr.cfg.owns(user) && (approvalUser == "" || user != approvalUser) {
-			visible = false
-		}
+		visible := a.canSeeRestrictedEventLocked(sr, user, e.Visibility, approvalUser)
 		var wire []byte
 		var err error
 		if visible {
@@ -654,6 +946,13 @@ func (a *Adapter) handleEventsResume(ps *peerState, req wireRequest) {
 			seq:            e.Seq,
 		})
 	}
+	if !wasSub {
+		presenceObs = a.presenceUpdatesLocked(req.SessionID)
+	}
+	a.mu.Unlock()
+	for _, ev := range presenceObs {
+		a.emitObserve(ev)
+	}
 }
 
 func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
@@ -684,12 +983,12 @@ func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
 		return
 	}
 	r := sr.runs[req.RunID]
-	if r == nil || r.terminal || r.stopFlag.Load() || !a.userOnlineLocked(r.userID) {
+	if r == nil || r.terminal || r.stopFlag.Load() || !a.runOnlineLocked(r) {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
-	if !sr.cfg.owns(user) && user != r.userID {
+	if !a.canSeeRunApprovalLocked(sr.cfg, r, user) {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -743,7 +1042,7 @@ func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
 	}
 	delete(r.pendingUI, req.UIID)
 	hasMoreUI := len(r.pendingUI) > 0
-	a.appendEventVisibleLocked(sr, r.id, kindUIResolved, uiResolvedData{UIID: req.UIID, Status: status}, true, visApproval, r.userID)
+	a.appendEventVisibleLocked(sr, r.id, kindUIResolved, uiResolvedData{UIID: req.UIID, Status: status, ResolvedBy: user}, true, visApproval, r.approvalOwner())
 	a.mu.Unlock()
 
 	if err := r.writeJSON(reply); err != nil {
@@ -758,11 +1057,12 @@ func (a *Adapter) handleUIRespond(ps *peerState, req wireRequest) {
 		})
 	}
 	a.emitObserve(map[string]any{
-		"type":       "ui.resolved",
-		"session_id": req.SessionID,
-		"run_id":     req.RunID,
-		"ui_id":      req.UIID,
-		"status":     status,
+		"type":        "ui.resolved",
+		"session_id":  req.SessionID,
+		"run_id":      req.RunID,
+		"ui_id":       req.UIID,
+		"status":      status,
+		"resolved_by": user,
 	})
 	a.sendResult(ps, req.RequestID, uiRespondResult{UIID: req.UIID, Status: status}, req.SessionID, true)
 }
@@ -816,6 +1116,13 @@ func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
 		return
 	}
 	status := r.status
+	if status == statusQueued {
+		a.cancelQueuedRunLocked(sr, r, "requested")
+		_ = a.saveLocked()
+		a.sendResultLocked(ps, req.RequestID, runStatusResult{RunID: r.id, Status: statusCancelled}, req.SessionID, r.tools)
+		a.mu.Unlock()
+		return
+	}
 	transitioned := status == statusRunning
 	var uiCancels []uiCancelAction
 	if transitioned {
@@ -836,39 +1143,43 @@ func (a *Adapter) handleRunCancel(ps *peerState, req wireRequest) {
 }
 
 func (a *Adapter) handleRunStart(ps *peerState, req wireRequest) {
-	runID, r, code := a.startRun(ps, req)
+	r, code := a.startRun(ps, req)
 	if code != "" {
 		a.sendError(ps, req.RequestID, code)
 		return
 	}
-	// Enqueue the run id before the process reader can enqueue any event, so
-	// a client never observes text for a run it has not learned about.
-	a.sendResult(ps, req.RequestID, runStartedResult{RunID: runID}, req.SessionID, true)
 	if r != nil {
 		go a.executeRun(r)
 	}
 }
 
-func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string) {
+func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 	user := ps.peer.UserID()
 	if req.SessionID == "" || req.Text == "" || !utf8.ValidString(req.Text) {
-		return "", nil, codeInvalidRequest
+		return nil, codeInvalidRequest
 	}
 	if strings.TrimSpace(req.Text) == "" {
-		return "", nil, codeInvalidRequest
+		return nil, codeInvalidRequest
+	}
+	queuePolicy := strings.ToLower(strings.TrimSpace(req.QueuePolicy))
+	if queuePolicy == "" {
+		queuePolicy = "enqueue"
+	}
+	if queuePolicy != "enqueue" && queuePolicy != "reject" {
+		return nil, codeInvalidRequest
 	}
 	var limitTools []string
 	hasToolsLimit := false
 	if req.ModeLimit != nil {
 		if req.ModeLimit.ReadOnly {
-			return "", nil, codeToolDenied
+			return nil, codeToolDenied
 		}
 		if req.ModeLimit.NoTools {
 			hasToolsLimit = true
 		} else if len(req.ModeLimit.Tools) > 0 {
 			validated, err := validateTools(req.ModeLimit.Tools)
 			if err != nil {
-				return "", nil, codeInvalidRequest
+				return nil, codeInvalidRequest
 			}
 			hasToolsLimit = true
 			limitTools = validated
@@ -887,64 +1198,163 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	if len(req.Text) > a.cfg.maxText {
 		a.mu.Unlock()
-		return "", nil, codeInvalidRequest
+		return nil, codeInvalidRequest
 	}
 	if !a.cfg.allowSlash && strings.HasPrefix(strings.TrimLeft(req.Text, " \t\r\n"), "/") {
 		a.mu.Unlock()
-		return "", nil, codeToolDenied
+		return nil, codeToolDenied
 	}
 	sr, ok := a.sessions[req.SessionID]
 	if !ok || !sr.cfg.canRead(user) {
 		a.mu.Unlock()
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	if !sr.cfg.canRun(user) {
 		a.mu.Unlock()
-		return "", nil, codeToolDenied
+		return nil, codeToolDenied
 	}
 	if fenceOK, valid := allowsSessionFence(sr.cfg, user, req.LinkOrigin); !valid {
 		a.mu.Unlock()
-		return "", nil, codeInvalidRequest
+		return nil, codeInvalidRequest
 	} else if !fenceOK {
 		a.mu.Unlock()
-		return "", nil, codeToolDenied
+		return nil, codeToolDenied
 	}
 	if !a.userOnlineLocked(user) || !ps.peer.Allows(true) || ps.closed.Load() {
 		a.mu.Unlock()
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	if rec, exists := sr.ps.Requests[key]; exists {
-		a.mu.Unlock()
 		if rec.TextSHA != textHash {
-			return "", nil, codeRequestConflict
+			a.mu.Unlock()
+			return nil, codeRequestConflict
 		}
-		return rec.RunID, nil, ""
-	}
-	if sr.active != nil {
+		res := runStartedResult{RunID: rec.RunID}
+		if runRec, ok := sr.ps.Runs[rec.RunID]; ok {
+			res.Status = runRec.Status
+		}
+		if pos := queuePositionLocked(sr, rec.RunID); pos > 0 {
+			res.Queued = true
+			res.QueuePosition = pos
+		}
+		a.sendResultLocked(ps, req.RequestID, res, req.SessionID, true)
 		a.mu.Unlock()
-		return "", nil, codeUnavailable
+		return nil, ""
 	}
+
 	runCfg := sr.cfg
 	if hasToolsLimit {
 		narrowed := *sr.cfg
 		narrowed.tools = intersectTools(sr.cfg.tools, limitTools)
 		runCfg = &narrowed
 	}
+
+	if sr.active != nil {
+		if queuePolicy == "reject" || len(sr.queue) >= maxQueuedRuns {
+			a.mu.Unlock()
+			return nil, codeSessionBusy
+		}
+		userQueued := 0
+		for _, qr := range sr.queue {
+			if qr.userID == user {
+				userQueued++
+			}
+		}
+		if userQueued >= maxQueuedRunsPerUser {
+			a.mu.Unlock()
+			return nil, codeSessionBusy
+		}
+		runID, err := newRunID()
+		if err != nil {
+			a.mu.Unlock()
+			a.logger.Error("generate queued run id", "session", sr.cfg.id, "error", err)
+			return nil, codeUnavailable
+		}
+		now := a.now().UnixMilli()
+		r := &run{
+			id:            runID,
+			sessionID:     sr.cfg.id,
+			session:       sr,
+			userID:        user,
+			rawLinkOrigin: req.LinkOrigin,
+			hasToolsLimit: hasToolsLimit,
+			toolsLimit:    slices.Clone(limitTools),
+			requestID:     req.RequestID,
+			text:          req.Text,
+			tools:         len(runCfg.tools) > 0,
+			queuedAt:      now,
+			status:        statusQueued,
+			pendingUI:     make(map[string]*pendingUIRequest),
+			done:          make(chan struct{}),
+		}
+		if officialRun(r) {
+			r.authorityUntil = a.authorityUntil
+		}
+		origEvents := slices.Clone(sr.ps.Events)
+		origLastSeq := sr.ps.LastSeq
+		origFirstSeq := sr.ps.FirstSeq
+
+		sr.queue = append(sr.queue, r)
+		pos := len(sr.queue)
+		sr.runs[runID] = r
+		a.runs[runID] = r
+		sr.ps.Requests[key] = requestRecord{RunID: runID, TextSHA: textHash, Created: now}
+		sr.ps.Runs[runID] = runRecord{Status: statusQueued, UserID: user, Tools: r.tools, Created: now}
+		ev, wire := a.recordEventVisibleLocked(sr, runID, kindRunQueued, runQueuedData{
+			UserID:    user,
+			Text:      req.Text,
+			Timestamp: now,
+			Position:  pos,
+		}, r.tools, visAll, "", false)
+		if err := a.saveLocked(); err != nil {
+			sr.queue = sr.queue[:len(sr.queue)-1]
+			delete(sr.ps.Requests, key)
+			delete(sr.ps.Runs, runID)
+			delete(sr.runs, runID)
+			delete(a.runs, runID)
+			sr.ps.Events = origEvents
+			sr.ps.LastSeq = origLastSeq
+			sr.ps.FirstSeq = origFirstSeq
+			a.mu.Unlock()
+			a.logger.Error("persist queued run", "session", sr.cfg.id, "run", runID, "error", err)
+			return nil, codeUnavailable
+		}
+		sr.ps.trim(a.cfg.retention)
+		a.sendResultLocked(ps, req.RequestID, runStartedResult{
+			RunID:         runID,
+			Status:        statusQueued,
+			Queued:        true,
+			QueuePosition: pos,
+		}, sr.cfg.id, true)
+		a.broadcastEventLocked(sr, ev, wire)
+		sessionID := sr.cfg.id
+		a.mu.Unlock()
+
+		a.emitObserve(map[string]any{
+			"type":           "run.queued",
+			"session_id":     sessionID,
+			"run_id":         runID,
+			"user_id":        user,
+			"queue_position": pos,
+		})
+		return nil, ""
+	}
+
 	runID, err := newRunID()
 	if err != nil {
 		a.mu.Unlock()
 		a.logger.Error("generate run id", "session", sr.cfg.id, "error", err)
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	cmd, err := a.buildCommand(runCfg)
 	if err != nil {
 		a.mu.Unlock()
 		a.logger.Error("build vanora command", "session", sr.cfg.id, "error", err)
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	if runCfg.linkOrigin != "" {
 		if cmd.Env == nil {
@@ -952,36 +1362,45 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		}
 		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
 	}
+	now := a.now().UnixMilli()
 	r := &run{
 		id:               runID,
 		sessionID:        sr.cfg.id,
 		session:          sr,
 		userID:           user,
+		rawLinkOrigin:    req.LinkOrigin,
+		hasToolsLimit:    hasToolsLimit,
+		toolsLimit:       slices.Clone(limitTools),
 		requestID:        req.RequestID,
 		text:             req.Text,
 		tools:            len(runCfg.tools) > 0,
-		started:          a.now().UnixMilli(),
+		started:          now,
 		status:           statusRunning,
-		pendingTimestamp: a.now().UnixMilli(),
+		pendingTimestamp: now,
 		pendingUI:        make(map[string]*pendingUIRequest),
 		done:             make(chan struct{}),
 	}
 	if officialRun(r) {
 		r.authorityUntil = a.authorityUntil
 	}
+	origEvents := slices.Clone(sr.ps.Events)
+	origLastSeq := sr.ps.LastSeq
+	origFirstSeq := sr.ps.FirstSeq
 	discardRun := func() {
 		delete(sr.ps.Requests, key)
 		delete(sr.ps.Runs, runID)
 		delete(sr.runs, runID)
 		delete(a.runs, runID)
 		sr.active = nil
+		sr.ps.Events = origEvents
+		sr.ps.LastSeq = origLastSeq
+		sr.ps.FirstSeq = origFirstSeq
 	}
 	sr.active = r
 	sr.runs[runID] = r
 	a.runs[runID] = r
 	sr.ps.Requests[key] = requestRecord{RunID: runID, TextSHA: textHash, Created: r.started}
 	sr.ps.Runs[runID] = runRecord{Status: statusRunning, UserID: user, Tools: r.tools, Created: r.started}
-	sr.ps.trim(a.cfg.retention)
 	// Persist the idempotency record before spawning. A crash between this
 	// write and the process start must not let a retry create a second run;
 	// recovery marks the incomplete record failed instead.
@@ -989,7 +1408,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		discardRun()
 		a.mu.Unlock()
 		a.logger.Error("persist run request", "session", sr.cfg.id, "run", runID, "error", err)
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	handle, err := startProcess(cmd)
 	if err != nil {
@@ -999,9 +1418,19 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		}
 		a.mu.Unlock()
 		a.logger.Error("start vanora", "session", sr.cfg.id, "error", err)
-		return "", nil, codeUnavailable
+		return nil, codeUnavailable
 	}
 	r.handle = handle
+	// Enqueue the run id result before broadcasting run.started and before the
+	// process reader can enqueue any delta, preserving causal order for both
+	// the initiator and all subscribed collaborators.
+	a.sendResultLocked(ps, req.RequestID, runStartedResult{RunID: runID, Status: statusRunning}, sr.cfg.id, true)
+	a.appendEventLocked(sr, runID, kindRunStarted, runStartedData{
+		UserID:    user,
+		Text:      req.Text,
+		Timestamp: now,
+	}, r.tools)
+	sr.ps.trim(a.cfg.retention)
 	a.wg.Add(1)
 	sessionID := sr.cfg.id
 	a.mu.Unlock()
@@ -1011,7 +1440,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (string, *run, string
 		RunID:     runID,
 		Phase:     statusRunning,
 	})
-	return runID, r, ""
+	return r, ""
 }
 
 func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
@@ -1045,7 +1474,7 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
-	if !sr.cfg.allowGuestRequests {
+	if !sr.cfg.allowGuestRequests || sr.cfg.readOnly {
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeToolDenied)
 		return
@@ -1067,7 +1496,18 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 	}
 	if len(sr.ps.PendingGuest) >= maxPendingGuestRequests {
 		a.mu.Unlock()
-		a.sendError(ps, req.RequestID, codeUnavailable)
+		a.sendError(ps, req.RequestID, codeGuestLimit)
+		return
+	}
+	userPending := 0
+	for _, existing := range sr.ps.PendingGuest {
+		if existing.UserID == user {
+			userPending++
+		}
+	}
+	if userPending >= maxPendingGuestPerUser {
+		a.mu.Unlock()
+		a.sendError(ps, req.RequestID, codeGuestLimit)
 		return
 	}
 	guestID, err := newRunID()
@@ -1077,13 +1517,17 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 		return
 	}
 	now := a.now().UnixMilli()
-	item := guestRequestData{
+	item := GuestRequestInfo{
 		GuestRequestID: guestID,
 		SessionID:      sr.cfg.id,
 		UserID:         user,
 		Text:           req.Text,
 		CreatedAt:      now,
 	}
+	origEvents := slices.Clone(sr.ps.Events)
+	origLastSeq := sr.ps.LastSeq
+	origFirstSeq := sr.ps.FirstSeq
+
 	sr.ps.PendingGuest = append(sr.ps.PendingGuest, item)
 	sr.ps.GuestRequests[key] = guestRequestRecord{
 		GuestRequestID: guestID,
@@ -1091,16 +1535,24 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 		Status:         "pending",
 		Created:        now,
 	}
-	a.appendEventVisibleLocked(sr, "", kindGuestRequest, item, false, visGuest, user)
-	sr.ps.trim(a.cfg.retention)
+	ev, wire := a.recordEventVisibleLocked(sr, "", kindGuestRequest, item, false, visGuest, user, false)
 	if err := a.saveLocked(); err != nil {
 		sr.ps.PendingGuest = sr.ps.PendingGuest[:len(sr.ps.PendingGuest)-1]
 		delete(sr.ps.GuestRequests, key)
+		sr.ps.Events = origEvents
+		sr.ps.LastSeq = origLastSeq
+		sr.ps.FirstSeq = origFirstSeq
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
 	}
+	sr.ps.trim(a.cfg.retention)
 	sessionID := sr.cfg.id
+	a.sendResultLocked(ps, req.RequestID, GuestRequestResult{
+		GuestRequestID: guestID,
+		Status:         "pending",
+	}, sessionID, false)
+	a.broadcastEventLocked(sr, ev, wire)
 	a.mu.Unlock()
 
 	a.emitObserve(map[string]any{
@@ -1115,29 +1567,35 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 		Phase:     "awaiting_guest_approval",
 		UIID:      guestID,
 	})
-	a.sendResult(ps, req.RequestID, GuestRequestResult{
-		GuestRequestID: guestID,
-		Status:         "pending",
-	}, sessionID, false)
 }
 
 func (a *Adapter) handleGuestRespond(ps *peerState, req wireRequest) {
 	user := ps.peer.UserID()
-	res, r, code := a.respondGuest(user, false, ps, req.SessionID, req.GuestRequestID, req.Action)
+	_, r, code := a.respondGuest(user, false, ps, req.RequestID, req.SessionID, req.GuestRequestID, req.Action, req.LinkOrigin, GuestRespondOptions{
+		Text:      req.Text,
+		ModeLimit: req.ModeLimit,
+	})
 	if code != "" {
 		a.sendError(ps, req.RequestID, code)
 		return
 	}
-	a.sendResult(ps, req.RequestID, res, req.SessionID, res.Status == "approved")
 	if r != nil {
 		go a.executeRun(r)
 	}
 }
 
-// RespondGuestLocal approves or dismisses a pending guest prompt request on
-// behalf of the local desktop host user (e.g. via Sidecar session.guest.respond).
+// RespondGuestLocal approves, dismisses, or cancels a pending guest prompt
+// request on behalf of the local desktop host user (e.g. via Sidecar
+// session.guest.respond).
 func (a *Adapter) RespondGuestLocal(sessionID, guestRequestID, action string) (GuestRespondResult, error) {
-	res, r, code := a.respondGuest("", true, nil, sessionID, guestRequestID, action)
+	return a.RespondGuestLocalWithOptions(sessionID, guestRequestID, action, GuestRespondOptions{})
+}
+
+// RespondGuestLocalWithOptions approves, dismisses, or cancels a pending guest
+// prompt request locally, optionally refining the prompt text or narrowing the
+// tool allowlist via ModeLimit.
+func (a *Adapter) RespondGuestLocalWithOptions(sessionID, guestRequestID, action string, opts GuestRespondOptions) (GuestRespondResult, error) {
+	res, r, code := a.respondGuest("", true, nil, "", sessionID, guestRequestID, action, "", opts)
 	if code != "" {
 		return GuestRespondResult{}, errors.New(code)
 	}
@@ -1147,13 +1605,80 @@ func (a *Adapter) RespondGuestLocal(sessionID, guestRequestID, action string) (G
 	return res, nil
 }
 
-func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessionID, guestRequestID, rawAction string) (GuestRespondResult, *run, string) {
+// PendingGuestRequests returns a snapshot of pending guest prompt requests for
+// sessionID (or across all sessions when sessionID is empty).
+func (a *Adapter) PendingGuestRequests(sessionID string) []GuestRequestInfo {
+	sessionID = strings.TrimSpace(sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []GuestRequestInfo
+	for _, sr := range a.orderedSessionsLocked() {
+		if sessionID != "" && sr.cfg.id != sessionID {
+			continue
+		}
+		out = append(out, sr.ps.PendingGuest...)
+	}
+	if out == nil {
+		out = []GuestRequestInfo{}
+	}
+	return out
+}
+
+// CollaborationSnapshot returns a point-in-time summary of active runs, queued
+// turns, online participants, and pending guest requests for sessionID (or all
+// sessions when sessionID is empty).
+func (a *Adapter) CollaborationSnapshot(sessionID string) []SessionCollaboration {
+	sessionID = strings.TrimSpace(sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ordered := a.orderedSessionsLocked()
+	out := make([]SessionCollaboration, 0, len(ordered))
+	for _, sr := range ordered {
+		if sessionID != "" && sr.cfg.id != sessionID {
+			continue
+		}
+		out = append(out, SessionCollaboration{
+			SessionID:    sr.cfg.id,
+			Title:        sr.cfg.title,
+			ActiveRun:    a.activeRunInfoLocked(sr, "", true),
+			QueuedRuns:   queuedRunInfosLocked(sr),
+			Participants: a.sessionParticipantsLocked(sr),
+			PendingGuest: slices.Clone(sr.ps.PendingGuest),
+		})
+	}
+	return out
+}
+
+func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID, sessionID, guestRequestID, rawAction, rawLinkOrigin string, opts GuestRespondOptions) (GuestRespondResult, *run, string) {
 	sessionID = strings.TrimSpace(sessionID)
 	guestRequestID = strings.TrimSpace(guestRequestID)
 	action := strings.ToLower(strings.TrimSpace(rawAction))
-	if sessionID == "" || guestRequestID == "" || (action != "approve" && action != "dismiss") {
+	if sessionID == "" || guestRequestID == "" || (action != "approve" && action != "dismiss" && action != "cancel") {
 		return GuestRespondResult{}, nil, codeInvalidRequest
 	}
+	var limitTools []string
+	hasToolsLimit := false
+	if action == "approve" && opts.ModeLimit != nil {
+		if opts.ModeLimit.ReadOnly {
+			return GuestRespondResult{}, nil, codeToolDenied
+		}
+		if opts.ModeLimit.NoTools {
+			hasToolsLimit = true
+		} else if len(opts.ModeLimit.Tools) > 0 {
+			validated, err := validateTools(opts.ModeLimit.Tools)
+			if err != nil {
+				return GuestRespondResult{}, nil, codeInvalidRequest
+			}
+			hasToolsLimit = true
+			limitTools = validated
+		}
+	}
+	if action == "approve" && opts.Text != "" {
+		if !utf8.ValidString(opts.Text) || strings.TrimSpace(opts.Text) == "" {
+			return GuestRespondResult{}, nil, codeInvalidRequest
+		}
+	}
+
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -1168,24 +1693,47 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
-	if !localHost {
-		if !sr.cfg.canRead(user) {
-			a.mu.Unlock()
-			return GuestRespondResult{}, nil, codeUnavailable
-		}
-		if !sr.cfg.owns(user) {
-			a.mu.Unlock()
-			return GuestRespondResult{}, nil, codeToolDenied
-		}
+	if !localHost && !sr.cfg.canRead(user) {
+		a.mu.Unlock()
+		return GuestRespondResult{}, nil, codeUnavailable
 	}
-	idx := slices.IndexFunc(sr.ps.PendingGuest, func(g guestRequestData) bool {
+	idx := slices.IndexFunc(sr.ps.PendingGuest, func(g GuestRequestInfo) bool {
 		return g.GuestRequestID == guestRequestID
 	})
 	if idx < 0 {
+		if !localHost && action != "cancel" && !sr.cfg.canManageGuests(user) {
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeToolDenied
+		}
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
 	item := sr.ps.PendingGuest[idx]
+	if !localHost {
+		if action == "cancel" {
+			if user != item.UserID && !sr.cfg.canManageGuests(user) {
+				a.mu.Unlock()
+				return GuestRespondResult{}, nil, codeToolDenied
+			}
+		} else {
+			if !sr.cfg.canManageGuests(user) {
+				a.mu.Unlock()
+				return GuestRespondResult{}, nil, codeToolDenied
+			}
+			if fenceOK, valid := allowsSessionFence(sr.cfg, user, rawLinkOrigin); !valid {
+				a.mu.Unlock()
+				return GuestRespondResult{}, nil, codeInvalidRequest
+			} else if !fenceOK {
+				a.mu.Unlock()
+				return GuestRespondResult{}, nil, codeToolDenied
+			}
+		}
+	}
+
+	resolvedBy := user
+	if localHost {
+		resolvedBy = LocalOwner
+	}
 
 	updateIdempotency := func(status, runID string) {
 		for k, rec := range sr.ps.GuestRequests {
@@ -1197,12 +1745,21 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 		}
 	}
 
-	if action == "dismiss" {
+	if action == "dismiss" || action == "cancel" {
+		resolvedStatus := "dismissed"
+		if action == "cancel" {
+			resolvedStatus = "cancelled"
+		}
 		sr.ps.PendingGuest = slices.Delete(sr.ps.PendingGuest, idx, idx+1)
-		updateIdempotency("dismissed", "")
+		updateIdempotency(resolvedStatus, "")
+		res := GuestRespondResult{GuestRequestID: guestRequestID, Status: resolvedStatus}
+		if ps != nil {
+			a.sendResultLocked(ps, reqID, res, sessionID, false)
+		}
 		a.appendEventVisibleLocked(sr, "", kindGuestResolved, guestResolvedData{
 			GuestRequestID: guestRequestID,
-			Status:         "dismissed",
+			Status:         resolvedStatus,
+			ResolvedBy:     resolvedBy,
 		}, false, visGuest, item.UserID)
 		_ = a.saveLocked()
 		nextPhase := "cleared"
@@ -1218,40 +1775,167 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 			"type":             "guest.resolved",
 			"session_id":       sessionID,
 			"guest_request_id": guestRequestID,
-			"status":           "dismissed",
+			"status":           resolvedStatus,
+			"resolved_by":      resolvedBy,
 		})
 		a.emitActivity(ActivityEvent{
 			SessionID: sessionID,
 			RunID:     activeRunID,
 			Phase:     nextPhase,
 		})
-		return GuestRespondResult{GuestRequestID: guestRequestID, Status: "dismissed"}, nil, ""
+		return res, nil, ""
 	}
 
 	// action == "approve"
-	if sr.active != nil || sr.cfg.readOnly {
+	if sr.cfg.readOnly {
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
+	promptText := item.Text
+	if opts.Text != "" {
+		if len(opts.Text) > a.cfg.maxText {
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeInvalidRequest
+		}
+		if !a.cfg.allowSlash && strings.HasPrefix(strings.TrimLeft(opts.Text, " \t\r\n"), "/") {
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeToolDenied
+		}
+		promptText = opts.Text
+	}
+	runCfg := sr.cfg
+	if hasToolsLimit {
+		narrowed := *sr.cfg
+		narrowed.tools = intersectTools(sr.cfg.tools, limitTools)
+		runCfg = &narrowed
+	}
+	runUser := user
+	if localHost {
+		if sr.cfg.owner == LocalOwner && sr.cfg.officialOwner != "" {
+			runUser = sr.cfg.officialOwner
+		} else {
+			runUser = sr.cfg.owner
+		}
+	}
+
+	// If another run is currently active on this session, enqueue the approved
+	// guest prompt cleanly in FIFO order instead of failing with unavailable.
+	if sr.active != nil {
+		if len(sr.queue) >= maxQueuedRuns {
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeSessionBusy
+		}
+		runID, err := newRunID()
+		if err != nil {
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeUnavailable
+		}
+		now := a.now().UnixMilli()
+		r := &run{
+			id:             runID,
+			sessionID:      sr.cfg.id,
+			session:        sr,
+			userID:         runUser,
+			localApproved:  localHost,
+			guestRequestID: guestRequestID,
+			requestedBy:    item.UserID,
+			rawLinkOrigin:  rawLinkOrigin,
+			hasToolsLimit:  hasToolsLimit,
+			toolsLimit:     slices.Clone(limitTools),
+			requestID:      guestRequestID,
+			text:           promptText,
+			tools:          len(runCfg.tools) > 0,
+			queuedAt:       now,
+			status:         statusQueued,
+			pendingUI:      make(map[string]*pendingUIRequest),
+			done:           make(chan struct{}),
+		}
+		if officialRun(r) {
+			r.authorityUntil = a.authorityUntil
+		}
+		origPending := slices.Clone(sr.ps.PendingGuest)
+		origGuestReqs := maps.Clone(sr.ps.GuestRequests)
+		origEvents := slices.Clone(sr.ps.Events)
+		origLastSeq := sr.ps.LastSeq
+		origFirstSeq := sr.ps.FirstSeq
+
+		sr.ps.PendingGuest = slices.Delete(sr.ps.PendingGuest, idx, idx+1)
+		updateIdempotency("approved", runID)
+		sr.queue = append(sr.queue, r)
+		pos := len(sr.queue)
+		sr.runs[runID] = r
+		a.runs[runID] = r
+		sr.ps.Runs[runID] = runRecord{Status: statusQueued, UserID: runUser, Tools: r.tools, Created: now}
+		resolvedEv, resolvedWire := a.recordEventVisibleLocked(sr, runID, kindGuestResolved, guestResolvedData{
+			GuestRequestID: guestRequestID,
+			Status:         "approved",
+			RunID:          runID,
+			ResolvedBy:     resolvedBy,
+		}, false, visGuest, item.UserID, false)
+		queuedEv, queuedWire := a.recordEventVisibleLocked(sr, runID, kindRunQueued, runQueuedData{
+			UserID:         runUser,
+			Text:           promptText,
+			Timestamp:      now,
+			Position:       pos,
+			GuestRequestID: guestRequestID,
+			RequestedBy:    item.UserID,
+		}, r.tools, visAll, "", false)
+		if err := a.saveLocked(); err != nil {
+			sr.ps.PendingGuest = origPending
+			sr.ps.GuestRequests = origGuestReqs
+			sr.queue = sr.queue[:len(sr.queue)-1]
+			delete(sr.ps.Runs, runID)
+			delete(sr.runs, runID)
+			delete(a.runs, runID)
+			sr.ps.Events = origEvents
+			sr.ps.LastSeq = origLastSeq
+			sr.ps.FirstSeq = origFirstSeq
+			a.mu.Unlock()
+			return GuestRespondResult{}, nil, codeUnavailable
+		}
+		sr.ps.trim(a.cfg.retention)
+		res := GuestRespondResult{
+			GuestRequestID: guestRequestID,
+			Status:         "approved",
+			RunID:          runID,
+			Queued:         true,
+			QueuePosition:  pos,
+		}
+		if ps != nil {
+			a.sendResultLocked(ps, reqID, res, sessionID, true)
+		}
+		a.broadcastEventLocked(sr, resolvedEv, resolvedWire)
+		a.broadcastEventLocked(sr, queuedEv, queuedWire)
+		a.mu.Unlock()
+
+		a.emitObserve(map[string]any{
+			"type":             "guest.resolved",
+			"session_id":       sessionID,
+			"guest_request_id": guestRequestID,
+			"status":           "approved",
+			"run_id":           runID,
+			"queued":           true,
+			"queue_position":   pos,
+			"resolved_by":      resolvedBy,
+		})
+		return res, nil, ""
+	}
+
 	runID, err := newRunID()
 	if err != nil {
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
-	cmd, err := a.buildCommand(sr.cfg)
+	cmd, err := a.buildCommand(runCfg)
 	if err != nil {
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
-	if sr.cfg.linkOrigin != "" {
+	if runCfg.linkOrigin != "" {
 		if cmd.Env == nil {
 			cmd.Env = os.Environ()
 		}
-		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+sr.cfg.linkOrigin)
-	}
-	runUser := user
-	if localHost {
-		runUser = sr.cfg.owner
+		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
 	}
 	now := a.now().UnixMilli()
 	r := &run{
@@ -1260,9 +1944,14 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 		session:          sr,
 		userID:           runUser,
 		localApproved:    localHost,
+		guestRequestID:   guestRequestID,
+		requestedBy:      item.UserID,
+		rawLinkOrigin:    rawLinkOrigin,
+		hasToolsLimit:    hasToolsLimit,
+		toolsLimit:       slices.Clone(limitTools),
 		requestID:        guestRequestID,
-		text:             item.Text,
-		tools:            len(sr.cfg.tools) > 0,
+		text:             promptText,
+		tools:            len(runCfg.tools) > 0,
 		started:          now,
 		status:           statusRunning,
 		pendingTimestamp: now,
@@ -1272,37 +1961,67 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 	if officialRun(r) {
 		r.authorityUntil = a.authorityUntil
 	}
+	origPending := slices.Clone(sr.ps.PendingGuest)
+	origGuestReqs := maps.Clone(sr.ps.GuestRequests)
+	origEvents := slices.Clone(sr.ps.Events)
+	origLastSeq := sr.ps.LastSeq
+	origFirstSeq := sr.ps.FirstSeq
+
+	rollback := func() {
+		sr.ps.PendingGuest = origPending
+		sr.ps.GuestRequests = origGuestReqs
+		delete(sr.ps.Runs, runID)
+		delete(sr.runs, runID)
+		delete(a.runs, runID)
+		sr.active = nil
+		sr.ps.Events = origEvents
+		sr.ps.LastSeq = origLastSeq
+		sr.ps.FirstSeq = origFirstSeq
+	}
+
 	sr.ps.PendingGuest = slices.Delete(sr.ps.PendingGuest, idx, idx+1)
 	updateIdempotency("approved", runID)
 	sr.active = r
 	sr.runs[runID] = r
 	a.runs[runID] = r
 	sr.ps.Runs[runID] = runRecord{Status: statusRunning, UserID: runUser, Tools: r.tools, Created: now}
-	a.appendEventVisibleLocked(sr, runID, kindGuestResolved, guestResolvedData{
+	resolvedEv, resolvedWire := a.recordEventVisibleLocked(sr, runID, kindGuestResolved, guestResolvedData{
 		GuestRequestID: guestRequestID,
 		Status:         "approved",
 		RunID:          runID,
-	}, false, visGuest, item.UserID)
-	sr.ps.trim(a.cfg.retention)
+		ResolvedBy:     resolvedBy,
+	}, false, visGuest, item.UserID, false)
+	startedEv, startedWire := a.recordEventVisibleLocked(sr, runID, kindRunStarted, runStartedData{
+		UserID:         runUser,
+		Text:           promptText,
+		Timestamp:      now,
+		GuestRequestID: guestRequestID,
+		RequestedBy:    item.UserID,
+	}, r.tools, visAll, "", false)
 	if err := a.saveLocked(); err != nil {
-		delete(sr.ps.Runs, runID)
-		delete(sr.runs, runID)
-		delete(a.runs, runID)
-		sr.active = nil
+		rollback()
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
 	handle, err := startProcess(cmd)
 	if err != nil {
-		delete(sr.ps.Runs, runID)
-		delete(sr.runs, runID)
-		delete(a.runs, runID)
-		sr.active = nil
+		rollback()
 		_ = a.saveLocked()
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
 	r.handle = handle
+	sr.ps.trim(a.cfg.retention)
+	res := GuestRespondResult{
+		GuestRequestID: guestRequestID,
+		Status:         "approved",
+		RunID:          runID,
+	}
+	if ps != nil {
+		a.sendResultLocked(ps, reqID, res, sessionID, true)
+	}
+	a.broadcastEventLocked(sr, resolvedEv, resolvedWire)
+	a.broadcastEventLocked(sr, startedEv, startedWire)
 	a.wg.Add(1)
 	a.mu.Unlock()
 
@@ -1312,17 +2031,14 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, sessi
 		"guest_request_id": guestRequestID,
 		"status":           "approved",
 		"run_id":           runID,
+		"resolved_by":      resolvedBy,
 	})
 	a.emitActivity(ActivityEvent{
 		SessionID: sessionID,
 		RunID:     runID,
 		Phase:     statusRunning,
 	})
-	return GuestRespondResult{
-		GuestRequestID: guestRequestID,
-		Status:         "approved",
-		RunID:          runID,
-	}, r, ""
+	return res, r, ""
 }
 
 func (a *Adapter) sendResult(ps *peerState, requestID string, data any, sessionID string, requiresOnline bool) {

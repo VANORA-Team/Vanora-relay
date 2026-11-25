@@ -67,6 +67,9 @@ type accessCommand struct {
 	ModeLimit      *remote.ModeLimit `json:"mode_limit"`
 	GuestRequestID string            `json:"guest_request_id"`
 	Action         string            `json:"action"`
+	QueuePolicy    string            `json:"queue_policy"`
+	Watch          *bool             `json:"watch"`
+	WatchPresence  *bool             `json:"watch_presence"`
 }
 
 type officialSlot struct {
@@ -448,8 +451,16 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = errors.New("desktop service unavailable")
 			break
 		}
+		opts := desktop.GuestRespondOptions{Text: cmd.Text}
+		if cmd.ModeLimit != nil {
+			opts.ModeLimit = &desktop.ModeLimit{
+				ReadOnly: cmd.ModeLimit.ReadOnly,
+				NoTools:  cmd.ModeLimit.NoTools,
+				Tools:    cmd.ModeLimit.Tools,
+			}
+		}
 		m.mu.Unlock()
-		res, gErr := m.service.RespondGuestLocal(cmd.SessionID, cmd.GuestRequestID, cmd.Action)
+		res, gErr := m.service.RespondGuestLocalWithOptions(cmd.SessionID, cmd.GuestRequestID, cmd.Action, opts)
 		m.mu.Lock()
 		if gErr != nil {
 			err = gErr
@@ -461,6 +472,36 @@ func (m *accessManager) command(cmd accessCommand) {
 		result["status"] = res.Status
 		if res.RunID != "" {
 			result["run_id"] = res.RunID
+		}
+		if res.Queued {
+			result["queued"] = true
+			result["queue_position"] = res.QueuePosition
+		}
+	case "session.guest.list":
+		if m.service == nil {
+			err = errors.New("desktop service unavailable")
+			break
+		}
+		m.mu.Unlock()
+		requests := m.service.PendingGuestRequests(cmd.SessionID)
+		m.mu.Lock()
+		result["type"] = "session.guest.list"
+		result["requests"] = requests
+		if cmd.SessionID != "" {
+			result["session_id"] = cmd.SessionID
+		}
+	case "session.collaborators":
+		if m.service == nil {
+			err = errors.New("desktop service unavailable")
+			break
+		}
+		m.mu.Unlock()
+		sessions := m.service.CollaborationSnapshot(cmd.SessionID)
+		m.mu.Lock()
+		result["type"] = "session.collaborators"
+		result["sessions"] = sessions
+		if cmd.SessionID != "" {
+			result["session_id"] = cmd.SessionID
 		}
 	case "access.invite.create":
 		if m.local == nil {
@@ -667,7 +708,7 @@ func (m *accessManager) command(cmd accessCommand) {
 		output = &jsonEmitter{out: os.Stdout}
 	}
 	output.Emit(result)
-	if err == nil && cmd.Type != "access.status" {
+	if err == nil && cmd.Type != "access.status" && cmd.Type != "session.guest.list" && cmd.Type != "session.collaborators" {
 		m.emitter.Emit(m.statusLocked())
 	}
 }

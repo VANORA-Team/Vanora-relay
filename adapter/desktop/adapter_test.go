@@ -417,11 +417,13 @@ func waitRunStatus(t *testing.T, a *Adapter, runID, status string) {
 	}
 }
 
+var testReqSeq atomic.Int64
+
 func sendRequest(t *testing.T, a *Adapter, p *fakePeer, req map[string]any) string {
 	t.Helper()
 	id, _ := req["request_id"].(string)
 	if id == "" {
-		id = fmt.Sprintf("req-%d", time.Now().UnixNano())
+		id = fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), testReqSeq.Add(1))
 		req["request_id"] = id
 	}
 	raw, err := json.Marshal(req)

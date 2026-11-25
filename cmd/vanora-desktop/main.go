@@ -719,6 +719,8 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 				cmd.Type != "access.client.access.set" &&
 				cmd.Type != "access.activity.set" &&
 				cmd.Type != "session.guest.respond" &&
+				cmd.Type != "session.guest.list" &&
+				cmd.Type != "session.collaborators" &&
 				!strings.HasPrefix(cmd.Type, "remote.") {
 				continue
 			}

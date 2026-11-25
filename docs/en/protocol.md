@@ -234,12 +234,16 @@ Every request includes `type` and a non-empty `request_id` (`<= 256` bytes, no c
 | :--- | :--- | :--- | :--- |
 | `workspace.list` | — | `workspaces[]` | Lists workspaces where this caller may create sessions |
 | `session.create` | `workspace_id`, `title?` | Session summary | Creates a native Vanora v3 JSONL session (idempotent on `request_id`) |
-| `session.list` | — | `sessions[]` | Lists visible sessions (`can_run_tools`, `tools_enabled`, visibility flags, `has_active_run`) |
-| `session.open` | `session_id` | `messages`, `last_seq`, `pending_ui?` | Returns ACL-filtered message snapshot, latest sequence, and pending approvals |
-| `run.start` | `session_id`, `text` | `run_id` | Replaying same `request_id` + `text` returns existing `run_id`; different text returns `request_conflict` |
-| `run.cancel` | `session_id`, `run_id` | `run_id`, `status` | Verifies session ownership & caller permission (unauthorized callers receive `unavailable`) |
-| `ui.respond` | `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | `ui_id`, `status` | Answers remote tool confirmation (`confirm`/`select`) or prompt (`ask`/`input`/`editor`) |
-| `events.resume` | `session_id`, `after_seq` | `session_id`, `after_seq` | Replays events with `seq > after_seq` and streams live updates; returns `snapshot_required` if behind window |
+| `session.list` | — | `sessions[]` | Lists visible sessions (`can_run_tools`, `tools_enabled`, visibility flags, `has_active_run`, `active_run_id?`, `active_run_user_id?`, `queued_run_count?`, privacy-scoped `pending_guest_count?`, `viewer_count?`) |
+| `session.open` | `session_id`, `watch_presence?` | `messages`, `last_seq`, `active_run?`, `queued_runs?`, `participants?`, `pending_ui?`, `pending_guest?` | Returns ACL-filtered message snapshot (with user attribution `user_id`/`requested_by`), latest sequence, active/queued runs, online participants, pending approvals/guest requests; optionally subscribes to live presence |
+| `session.close` | `session_id` | `session_id`, `closed` | Unsubscribes from session streams and updates online collaborator presence |
+| `session.presence` | `session_id`, `watch?` | `session_id`, `participants[]`, `watching` | Queries online collaborators and optionally toggles live ephemeral `presence.updated` (`seq: 0`) events |
+| `run.start` | `session_id`, `text`, `link_origin?`, `mode_limit?`, `queue_policy?` (`enqueue`\|`reject`) | `run_id`, `status?`, `queued?`, `queue_position?` | Idempotent on `request_id` + payload; defaults to per-session FIFO turn queue (8/session, 3/user, live ACL re-check on dequeue); `queue_policy: "reject"` fails immediately with `session_busy` |
+| `run.cancel` | `session_id`, `run_id`, `link_origin?` | `run_id`, `status` | Verifies session ownership & caller permission for both active and queued runs |
+| `ui.respond` | `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | `ui_id`, `status` | Answers remote tool confirmation (`confirm`/`select`) or prompt (`ask`/`input`/`editor`); `ui.resolved` includes `resolved_by` |
+| `guest.request` | `session_id`, `text` | `guest_request_id`, `status` | Submits a gated prompt on non-read-only sessions with `allow_guest_requests: true` (cap 4 pending per user, else `guest_request_limit`) |
+| `guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`\|`cancel`), `text?`, `mode_limit?` | `guest_request_id`, `status`, `run_id?`, `queued?`, `queue_position?` | Official owner or LAN/self `control` peer may approve (with optional prompt edit, `mode_limit`, and automatic queuing when busy) or dismiss; requesting guest may `cancel` their own pending request |
+| `events.resume` | `session_id`, `after_seq`, `watch_presence?` | `session_id`, `after_seq` | Replays events with `seq > after_seq` and streams live updates; returns `snapshot_required` if behind window |
 
 ```json
 // 1. Caller starts a run
@@ -256,15 +260,20 @@ Every request includes `type` and a non-empty `request_id` (`<= 256` bytes, no c
 
 | Category | Values | Notes |
 | :--- | :--- | :--- |
+| **Run Start & Queue** | `run.started` / `run.queued` | Broadcasts run start (with author `user_id`, `text`, timestamp, optional `guest_request_id`/`requested_by`) and FIFO queue placement |
 | **Text & Reasoning** | `text.delta` / `thinking.delta` | Streaming output and reasoning blocks (reasoning requires visibility grant) |
 | **Tool Execution** | `tool.call` / `tool.start` / `tool.update` / `tool.end` | Tool invocations and output (requires tool visibility grant) |
-| **Remote Approvals** | `ui.request` / `ui.resolved` | Tool approval & prompt dialogs (strictly isolated to owner or initiating user) |
+| **Remote Approvals** | `ui.request` / `ui.resolved` | Tool approval & prompt dialogs (strictly isolated to owner or initiating user; `ui.resolved` includes `resolved_by`) |
+| **Guest Prompt Gate** | `guest.request` / `guest.resolved` | Viewer prompt requests and approve/dismiss/cancel outcomes (visible only to managers and requester; others receive `sync`) |
+| **Live Presence** | `presence.updated` | Ephemeral (`seq: 0`, unpersisted) collaborator roster updates sent only to peers opting in via `watch_presence` or `session.presence` |
 | **Placeholder** | `sync` | Keeps sequence numbers contiguous for unauthorized viewers without leaking payloads |
 | **Run Lifecycle** | `run.completed` / `run.cancelled` / `run.failed` | Terminal run events |
 
 | Error Code | Meaning |
 | :--- | :--- |
 | `unavailable` | Resource hidden, missing, unauthorized, or currently unavailable (uniform anti-enumeration response) |
+| `session_busy` | Session already has an active run with `queue_policy: "reject"`, or turn queue capacity reached (8/session, 3/user) |
+| `guest_request_limit` | Caller reached the pending `guest.request` cap (4) on this session |
 | `tool_denied` | Missing prompt/tool execution permission, or disallowed slash command |
 | `request_conflict` | Reused `request_id` with mismatched prompt payload |
 | `snapshot_required` | `events.resume` cursor fell behind retention; call `session.open` |

@@ -112,9 +112,19 @@ type ModeLimit struct {
 }
 
 // RequestOptions attaches optional multi-agent delegation fences, idempotency
-// namespacing, and monotonic permission narrowing to session.create / run.start.
+// namespacing, queue policy, and monotonic permission narrowing to
+// session.create / run.start.
 type RequestOptions struct {
-	Namespace  string     `json:"namespace,omitempty"`
+	Namespace   string     `json:"namespace,omitempty"`
+	LinkOrigin  string     `json:"link_origin,omitempty"`
+	ModeLimit   *ModeLimit `json:"mode_limit,omitempty"`
+	QueuePolicy string     `json:"queue_policy,omitempty"`
+}
+
+// GuestRespondOptions configures optional overrides when responding to a
+// remote desktop's pending guest prompt request.
+type GuestRespondOptions struct {
+	Text       string     `json:"text,omitempty"`
 	LinkOrigin string     `json:"link_origin,omitempty"`
 	ModeLimit  *ModeLimit `json:"mode_limit,omitempty"`
 }
@@ -908,11 +918,31 @@ func (m *Manager) ListSessions(ctx context.Context, channel, peerID string) (jso
 }
 
 func (m *Manager) OpenSession(ctx context.Context, channel, peerID, sessionID string) (json.RawMessage, error) {
+	return m.OpenSessionWithOptions(ctx, channel, peerID, sessionID, false)
+}
+
+func (m *Manager) OpenSessionWithOptions(ctx context.Context, channel, peerID, sessionID string, watchPresence bool) (json.RawMessage, error) {
 	rp, err := m.lookupPeer(channel, peerID)
 	if err != nil {
 		return nil, err
 	}
-	return rp.OpenSession(ctx, sessionID)
+	return rp.OpenSessionWithOptions(ctx, sessionID, watchPresence)
+}
+
+func (m *Manager) CloseSession(ctx context.Context, channel, peerID, sessionID string) (json.RawMessage, error) {
+	rp, err := m.lookupPeer(channel, peerID)
+	if err != nil {
+		return nil, err
+	}
+	return rp.CloseSession(ctx, sessionID)
+}
+
+func (m *Manager) SessionPresence(ctx context.Context, channel, peerID, sessionID string, watch *bool) (json.RawMessage, error) {
+	rp, err := m.lookupPeer(channel, peerID)
+	if err != nil {
+		return nil, err
+	}
+	return rp.SessionPresence(ctx, sessionID, watch)
 }
 
 func (m *Manager) Resume(ctx context.Context, channel, peerID, sessionID string, afterSeq int64) error {
@@ -972,11 +1002,15 @@ func (m *Manager) SubmitGuestRequest(ctx context.Context, channel, peerID, sessi
 }
 
 func (m *Manager) RespondGuestRequest(ctx context.Context, channel, peerID, sessionID, guestRequestID, action string) (json.RawMessage, error) {
+	return m.RespondGuestRequestWithOptions(ctx, channel, peerID, sessionID, guestRequestID, action, GuestRespondOptions{})
+}
+
+func (m *Manager) RespondGuestRequestWithOptions(ctx context.Context, channel, peerID, sessionID, guestRequestID, action string, opts GuestRespondOptions) (json.RawMessage, error) {
 	rp, err := m.lookupPeer(channel, peerID)
 	if err != nil {
 		return nil, err
 	}
-	return rp.RespondGuestRequest(ctx, sessionID, guestRequestID, action)
+	return rp.RespondGuestRequestWithOptions(ctx, sessionID, guestRequestID, action, opts)
 }
 
 func decodePin32(b64 string) ([]byte, error) {

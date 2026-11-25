@@ -68,6 +68,50 @@ func (c *Client) OpenSession(sessionID string) (string, error) {
 	return data, nil
 }
 
+// CloseSession unsubscribes from sessionID on the desktop so it stops
+// streaming events and updates online collaborator presence.
+func (c *Client) CloseSession(sessionID string) error {
+	c.op.Lock()
+	defer c.op.Unlock()
+	p, err := c.currentPeer()
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.subscriptions, sessionID)
+	c.mu.Unlock()
+	_, err = c.request(p, map[string]any{
+		"type":       "session.close",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+	}, false)
+	return err
+}
+
+// SessionPresence returns current online collaborators for sessionID and
+// optionally subscribes (watch=true) or unsubscribes (watch=false) to live
+// presence.updated events.
+func (c *Client) SessionPresence(sessionID string, watch bool) (string, error) {
+	p, err := c.currentPeer()
+	if err != nil {
+		return "", err
+	}
+	data, err := c.request(p, map[string]any{
+		"type":       "session.presence",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+		"watch":      watch,
+	}, false)
+	if err == nil {
+		c.mu.Lock()
+		if cur := c.subscriptions[sessionID]; cur != nil {
+			cur.watchPresence = watch
+		}
+		c.mu.Unlock()
+	}
+	return data, err
+}
+
 // Resume restores an existing app snapshot at the last sequence the app applied.
 // On snapshot_required replace the app's state with the result of OpenSession.
 func (c *Client) Resume(sessionID string, afterSeq int64) error {
@@ -81,13 +125,29 @@ func (c *Client) Resume(sessionID string, afterSeq int64) error {
 	return err
 }
 
-// StartRun returns JSON containing run_id. Reuse the same requestID and text after reconnect.
+// StartRun returns JSON containing run_id (and status/queue_position when queued).
+// Reuse the same requestID and text after reconnect.
 func (c *Client) StartRun(sessionID, requestID, text string) (string, error) {
+	return c.StartRunWithPolicy(sessionID, requestID, text, "")
+}
+
+// StartRunWithPolicy starts or enqueues a run on sessionID. queuePolicy may be
+// "" / "enqueue" (default FIFO turn queue) or "reject" (fail with session_busy).
+func (c *Client) StartRunWithPolicy(sessionID, requestID, text, queuePolicy string) (string, error) {
 	p, err := c.currentPeer()
 	if err != nil {
 		return "", err
 	}
-	return c.request(p, map[string]any{"type": "run.start", "request_id": requestID, "session_id": sessionID, "text": text}, true)
+	req := map[string]any{
+		"type":       "run.start",
+		"request_id": requestID,
+		"session_id": sessionID,
+		"text":       text,
+	}
+	if queuePolicy != "" {
+		req["queue_policy"] = queuePolicy
+	}
+	return c.request(p, req, true)
 }
 
 // CancelRun returns JSON containing run_id and status.
@@ -163,18 +223,46 @@ func (c *Client) SubmitGuestRequest(sessionID, requestID, text string) (string, 
 	}, false)
 }
 
-// RespondGuestRequest approves ("approve") or dismisses ("dismiss") a pending
-// guest prompt request as the session owner.
+// RespondGuestRequest approves ("approve"), dismisses ("dismiss"), or cancels
+// ("cancel") a pending guest prompt request.
 func (c *Client) RespondGuestRequest(sessionID, guestRequestID, action string) (string, error) {
+	return c.RespondGuestRequestWithOptions(sessionID, guestRequestID, action, "", "")
+}
+
+// RespondGuestRequestWithOptions responds to a pending guest prompt request,
+// optionally refining the prompt text or narrowing tool access via
+// modeLimitJSON (e.g. {"no_tools":true} or {"tools":["read","grep"]}).
+func (c *Client) RespondGuestRequestWithOptions(sessionID, guestRequestID, action, text, modeLimitJSON string) (string, error) {
 	p, err := c.currentPeer()
 	if err != nil {
 		return "", err
 	}
-	return c.request(p, map[string]any{
+	req := map[string]any{
 		"type":             "guest.respond",
 		"request_id":       NewRequestID(),
 		"session_id":       sessionID,
 		"guest_request_id": guestRequestID,
 		"action":           action,
-	}, action == "approve")
+	}
+	if text != "" {
+		req["text"] = text
+	}
+	if modeLimitJSON != "" {
+		var limit struct {
+			ReadOnly bool     `json:"read_only,omitempty"`
+			NoTools  bool     `json:"no_tools,omitempty"`
+			Tools    []string `json:"tools,omitempty"`
+		}
+		dec := json.NewDecoder(bytes.NewReader([]byte(modeLimitJSON)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&limit); err != nil {
+			return "", errors.New("invalid mode_limit payload")
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return "", errors.New("invalid mode_limit payload")
+		}
+		req["mode_limit"] = limit
+	}
+	return c.request(p, req, action == "approve")
 }

@@ -31,14 +31,16 @@ type ToolCallSummary struct {
 // Thinking, ToolCalls and toolResult entries are stripped unless the viewer's
 // ACL permits them.
 type Message struct {
-	Role       string            `json:"role"`
-	Text       string            `json:"text,omitempty"`
-	Thinking   string            `json:"thinking,omitempty"`
-	ToolCalls  []ToolCallSummary `json:"tool_calls,omitempty"`
-	ToolCallID string            `json:"tool_call_id,omitempty"`
-	ToolName   string            `json:"tool_name,omitempty"`
-	IsError    bool              `json:"is_error,omitempty"`
-	Timestamp  int64             `json:"timestamp,omitempty"`
+	Role        string            `json:"role"`
+	Text        string            `json:"text,omitempty"`
+	Thinking    string            `json:"thinking,omitempty"`
+	ToolCalls   []ToolCallSummary `json:"tool_calls,omitempty"`
+	ToolCallID  string            `json:"tool_call_id,omitempty"`
+	ToolName    string            `json:"tool_name,omitempty"`
+	IsError     bool              `json:"is_error,omitempty"`
+	Timestamp   int64             `json:"timestamp,omitempty"`
+	UserID      string            `json:"user_id,omitempty"`
+	RequestedBy string            `json:"requested_by,omitempty"`
 }
 
 type sessionHeader struct {
@@ -322,7 +324,13 @@ func filterMessagesForViewer(messages []Message, showThinking, showTools bool) [
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
-			out = append(out, Message{Role: "user", Text: m.Text, Timestamp: m.Timestamp})
+			out = append(out, Message{
+				Role:        "user",
+				Text:        m.Text,
+				Timestamp:   m.Timestamp,
+				UserID:      m.UserID,
+				RequestedBy: m.RequestedBy,
+			})
 		case "assistant":
 			copyMsg := Message{Role: "assistant", Text: m.Text, Timestamp: m.Timestamp}
 			if showThinking {

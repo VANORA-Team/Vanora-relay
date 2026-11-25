@@ -172,6 +172,14 @@ type Grant struct {
 	Approve      bool   `json:"approve,omitempty"`
 }
 
+// ModeLimit monotonically narrows permissions for a session, run, or approved
+// guest request. Callers can never widen local desktop.json ACLs.
+type ModeLimit struct {
+	ReadOnly bool     `json:"read_only,omitempty"`
+	NoTools  bool     `json:"no_tools,omitempty"`
+	Tools    []string `json:"tools,omitempty"`
+}
+
 const (
 	defaultMaxEvents   = 4096
 	defaultMaxBytes    = int64(4 << 20)
@@ -285,6 +293,36 @@ func (s *normalizedSession) grant(userID string) (Grant, bool) {
 
 func (s *normalizedSession) owns(userID string) bool {
 	return owns(s.owner, s.officialOwner, userID)
+}
+
+// canManageGuests reports whether userID may view, approve, or dismiss other
+// users' pending guest prompt requests on this session. Official channels
+// restrict management strictly to the session owner; account-free LAN and
+// self-hosted channels delegate management to paired "control" peers.
+func (s *normalizedSession) canManageGuests(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	if s.owns(userID) {
+		return true
+	}
+	if lan.Access(userID) == lan.Control && s.lanAccess {
+		return true
+	}
+	if selfrelay.Access(userID) == selfrelay.Control && s.selfAccess {
+		return true
+	}
+	return false
+}
+
+func (s *normalizedSession) roleFor(userID string) string {
+	if s.owns(userID) {
+		return "owner"
+	}
+	if s.canRun(userID) {
+		return "controller"
+	}
+	return "viewer"
 }
 
 func owns(owner, officialOwner, userID string) bool {

@@ -34,8 +34,9 @@ type rpcReply struct {
 }
 
 type sessionCursor struct {
-	applied   int64
-	delivered int64
+	applied       int64
+	delivered     int64
+	watchPresence bool
 }
 
 // RemotePeer maintains one authenticated outbound control connection to a
@@ -956,6 +957,22 @@ func (h *peerHandler) Message(p transport.Peer, b []byte) {
 		rp.mu.Unlock()
 		return
 	case "event":
+		if m.Seq == 0 && m.Kind != "" && m.Session != "" {
+			rp.mu.Unlock()
+			ev := map[string]any{
+				"type":       "remote.event",
+				"peer_id":    rp.peerID,
+				"channel":    rp.channel,
+				"session_id": m.Session,
+				"seq":        int64(0),
+				"kind":       m.Kind,
+			}
+			if len(m.Data) > 0 {
+				ev["data"] = m.Data
+			}
+			rp.manager.emit(ev)
+			return
+		}
 		cur := rp.subscriptions[m.Session]
 		if cur != nil && m.Seq > cur.delivered {
 			if m.Seq != cur.delivered+1 {
@@ -1059,14 +1076,22 @@ func (rp *RemotePeer) subscribe(ctx context.Context, p transport.Peer, sessionID
 		rp.mu.Unlock()
 		return nil, errors.New("too many open sessions")
 	}
-	rp.subscriptions[sessionID] = &sessionCursor{applied: afterSeq, delivered: afterSeq}
+	watch := false
+	if existing := rp.subscriptions[sessionID]; existing != nil {
+		watch = existing.watchPresence
+	}
+	rp.subscriptions[sessionID] = &sessionCursor{applied: afterSeq, delivered: afterSeq, watchPresence: watch}
 	rp.mu.Unlock()
-	data, err := rp.request(ctx, p, map[string]any{
+	req := map[string]any{
 		"type":       "events.resume",
 		"request_id": NewRequestID(),
 		"session_id": sessionID,
 		"after_seq":  afterSeq,
-	}, false)
+	}
+	if watch {
+		req["watch_presence"] = true
+	}
+	data, err := rp.request(ctx, p, req, false)
 	if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) {
 		rp.mu.Lock()
 		delete(rp.subscriptions, sessionID)
@@ -1116,17 +1141,25 @@ func (rp *RemotePeer) ListSessions(ctx context.Context) (json.RawMessage, error)
 }
 
 func (rp *RemotePeer) OpenSession(ctx context.Context, sessionID string) (json.RawMessage, error) {
+	return rp.OpenSessionWithOptions(ctx, sessionID, false)
+}
+
+func (rp *RemotePeer) OpenSessionWithOptions(ctx context.Context, sessionID string, watchPresence bool) (json.RawMessage, error) {
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	p, err := rp.currentPeer()
 	if err != nil {
 		return nil, err
 	}
-	data, err := rp.request(ctx, p, map[string]any{
+	req := map[string]any{
 		"type":       "session.open",
 		"request_id": NewRequestID(),
 		"session_id": sessionID,
-	}, false)
+	}
+	if watchPresence {
+		req["watch_presence"] = true
+	}
+	data, err := rp.request(ctx, p, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1136,10 +1169,60 @@ func (rp *RemotePeer) OpenSession(ctx context.Context, sessionID string) (json.R
 	if json.Unmarshal(data, &snapshot) != nil || snapshot.Last == nil || *snapshot.Last < 0 {
 		return nil, errors.New("remote: invalid desktop snapshot")
 	}
+	if watchPresence {
+		rp.mu.Lock()
+		if cur := rp.subscriptions[sessionID]; cur != nil {
+			cur.watchPresence = true
+		} else {
+			rp.subscriptions[sessionID] = &sessionCursor{applied: *snapshot.Last, delivered: *snapshot.Last, watchPresence: true}
+		}
+		rp.mu.Unlock()
+	}
 	if _, err := rp.subscribe(ctx, p, sessionID, *snapshot.Last); err != nil {
 		return nil, err
 	}
 	return data, nil
+}
+
+func (rp *RemotePeer) CloseSession(ctx context.Context, sessionID string) (json.RawMessage, error) {
+	rp.op.Lock()
+	defer rp.op.Unlock()
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	rp.mu.Lock()
+	delete(rp.subscriptions, sessionID)
+	rp.mu.Unlock()
+	return rp.request(ctx, p, map[string]any{
+		"type":       "session.close",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+	}, false)
+}
+
+func (rp *RemotePeer) SessionPresence(ctx context.Context, sessionID string, watch *bool) (json.RawMessage, error) {
+	p, err := rp.currentPeer()
+	if err != nil {
+		return nil, err
+	}
+	req := map[string]any{
+		"type":       "session.presence",
+		"request_id": NewRequestID(),
+		"session_id": sessionID,
+	}
+	if watch != nil {
+		req["watch"] = *watch
+	}
+	data, err := rp.request(ctx, p, req, false)
+	if err == nil && watch != nil {
+		rp.mu.Lock()
+		if cur := rp.subscriptions[sessionID]; cur != nil {
+			cur.watchPresence = *watch
+		}
+		rp.mu.Unlock()
+	}
+	return data, err
 }
 
 func (rp *RemotePeer) Resume(ctx context.Context, sessionID string, afterSeq int64) error {
@@ -1185,6 +1268,9 @@ func (rp *RemotePeer) StartRunWithOptions(ctx context.Context, sessionID, reques
 	if opts.ModeLimit != nil {
 		req["mode_limit"] = opts.ModeLimit
 	}
+	if strings.TrimSpace(opts.QueuePolicy) != "" {
+		req["queue_policy"] = strings.TrimSpace(opts.QueuePolicy)
+	}
 	return rp.request(ctx, p, req, true)
 }
 
@@ -1226,17 +1312,31 @@ func (rp *RemotePeer) SubmitGuestRequest(ctx context.Context, sessionID, request
 }
 
 func (rp *RemotePeer) RespondGuestRequest(ctx context.Context, sessionID, guestRequestID, action string) (json.RawMessage, error) {
+	return rp.RespondGuestRequestWithOptions(ctx, sessionID, guestRequestID, action, GuestRespondOptions{})
+}
+
+func (rp *RemotePeer) RespondGuestRequestWithOptions(ctx context.Context, sessionID, guestRequestID, action string, opts GuestRespondOptions) (json.RawMessage, error) {
 	p, err := rp.currentPeer()
 	if err != nil {
 		return nil, err
 	}
-	return rp.request(ctx, p, map[string]any{
+	req := map[string]any{
 		"type":             "guest.respond",
 		"request_id":       NewRequestID(),
 		"session_id":       sessionID,
 		"guest_request_id": guestRequestID,
 		"action":           action,
-	}, action == "approve")
+	}
+	if opts.Text != "" {
+		req["text"] = opts.Text
+	}
+	if strings.TrimSpace(opts.LinkOrigin) != "" {
+		req["link_origin"] = strings.TrimSpace(opts.LinkOrigin)
+	}
+	if opts.ModeLimit != nil {
+		req["mode_limit"] = opts.ModeLimit
+	}
+	return rp.request(ctx, p, req, action == "approve")
 }
 
 func (rp *RemotePeer) RespondUI(ctx context.Context, sessionID, runID, uiID string, payload UIResponse) (json.RawMessage, error) {

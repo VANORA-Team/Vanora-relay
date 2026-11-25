@@ -363,10 +363,24 @@ func (s *Server) Status() Status {
 		status.Enabled = s.listening.ctx.Err() == nil
 		status.Address = s.listening.target.Address
 	}
+	seen := make(map[string]struct{}, len(s.state.Clients))
 	for id, client := range s.state.Clients {
+		seen[id] = struct{}{}
 		p := s.peers[id]
 		client.Connected = p != nil && p.ctx.Err() == nil
 		status.Clients = append(status.Clients, client)
+	}
+	if s.group != nil {
+		for _, member := range s.group.Snapshot().Members() {
+			if _, ok := seen[member.ID]; ok {
+				continue
+			}
+			if client, allowed := s.networkClient(member.ID); allowed {
+				p := s.peers[member.ID]
+				client.Connected = p != nil && p.ctx.Err() == nil
+				status.Clients = append(status.Clients, client)
+			}
+		}
 	}
 	s.pruneInvitations(time.Now())
 	for _, invite := range s.invitations {

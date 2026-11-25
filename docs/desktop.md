@@ -112,7 +112,7 @@ go build -ldflags "\
 ### 运行机制与通道隔离
 
 - **单活跃广域网热切换 + 并发局域网**：同一 Sidecar 进程内，广域网通道在 `cn` / `global` / `self` 中至多启用 1 条（也可关闭），同时可与 `lan` 局域网服务并发运行。发送 `access.relay.set` 热切换渠道时**无需重启 Sidecar**，不中断本地运行中的 Vanora 任务与局域网连接，也不会清除另一站已注册的设备密钥。
-- **结构化事件与优雅退出**：`stdout` 持续输出 JSONL 事件（`ready`、`online`、`offline`、`auth.ok`、`auth.error`、`auth.required`、`auth.logout.ok`、`access.status`、`peer.connected`、`session.created`、`ui.request`、`config.reloaded`、`shutdown` 等），父进程关闭 `stdin`（EOF）时自动优雅退出。
+- **结构化事件与优雅退出**：`stdout` 持续输出 JSONL 事件（`ready`、`online`、`offline`、`auth.ok`、`auth.error`、`auth.required`、`auth.logout.ok`、`access.status`、`peer.connected`、`session.created`、`session.presence`、`ui.request`、`config.reloaded`、`shutdown` 等），父进程关闭 `stdin`（EOF）时自动优雅退出。
 
 | 渠道 | 登录要求 | 鉴权与信任根 | TURN 权益 | 桌面资源暴露规则 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -137,7 +137,9 @@ go build -ldflags "\
 | `access.relay.set` | `enabled`, `channel?: "cn" \| "global" \| "self"`, `signal_url?`, `signal_token?` | 启停或热切换广域网中转；`cn`/`global` 校验对应站令牌，`self` 校验 `signal_url` 与 `signal_token` |
 | `access.lan.set` | `enabled`, `address?` | 启停局域网/Tailnet 监听（支持 RFC1918/RFC4193 私网及 `100.64.0.0/10` Tailnet 地址） |
 | `access.activity.set` | `enabled` | 运行时动态启停向当前中转节点发布零信任脱敏运行态势 |
-| `session.guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`) | 本机宿主直接批准或忽略只读访客提交的 `guest.request` 提问 |
+| `session.collaborators` | `session_id?` | 查询指定会话或全部会话的实时协作态势（当前运行 `active_run`、排队轮次 `queued_runs`、在线协作者 `participants`、待确认访客提问 `pending_guest`） |
+| `session.guest.list` | `session_id?` | 列出指定会话或全部会话中待宿主处理的 `guest.request` 队列 |
+| `session.guest.respond` | `session_id`, `guest_request_id`, `action` (`approve`\|`dismiss`), `text?`, `mode_limit?` | 本机宿主直接批准或忽略只读访客提交的 `guest.request` 提问（支持批准前改写 `text`、通过 `mode_limit` 收窄工具；会话忙碌时自动排队并返回 `queued`/`queue_position`） |
 | `reload` / `status` / `shutdown` | — | 热重载 `desktop.json`、查询简要状态、优雅退出 |
 
 ### 配对邀请与配对网管理
@@ -187,10 +189,11 @@ go build -ldflags "\
 | `remote.connect` / `disconnect` / `reconnect` / `wakeup` | `peer_id`, `channel?`, `long_resume?` | 连接已知电脑 / 断开 / 强制重连 / **先探活再重连**（并行检测静默半开死连接） |
 | `remote.route.add` / `remove` | `peer_id`, `address`, `channel?: "lan"` | 为已配对电脑注册或移除备用局域网 / Tailnet（`100.64.0.0/10`）路由，后台自动向高优路由回切 |
 | `remote.workspace.list` | `peer_id`, `channel?` | 查询远程电脑白名单工作区；返回 `remote.result` |
-| `remote.session.create` / `list` / `open` | `peer_id`, `workspace_id` 或 `session_id`, `title?`, `namespace?`, `link_origin?`, `mode_limit?` | 远程创建会话（支持幂等命名空间、`link_origin` 围栏与 `mode_limit` 单调收窄）/ 列出会话 / 拉取快照 |
+| `remote.session.create` / `list` / `open` / `close` | `peer_id`, `workspace_id` 或 `session_id`, `title?`, `watch_presence?`, `namespace?`, `link_origin?`, `mode_limit?` | 远程创建会话 / 列出会话 / 拉取快照并订阅（可选订阅协作者在线状态）/ 显式取消订阅并更新在线状态 |
+| `remote.session.presence` | `peer_id`, `session_id`, `watch?`, `channel?` | 查询远程会话当前在线协作者列表，并按需开关实时 `presence.updated` 推送 |
 | `remote.events.resume` / `ack` | `peer_id`, `session_id`, `after_seq` 或 `seq`, `channel?` | 补发断点事件 / 确认已消费序号以支持断线自动恢复 |
-| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` 或 `run_id`, `namespace?`, `link_origin?`, `mode_limit?` | 发起幂等对话/工具运行 / 取消指定运行（受控子进程内自动阻止 `A -> B -> C` 二次跳跃转发） |
-| `remote.guest.request` / `respond` | `peer_id`, `session_id`, `text` 或 `guest_request_id`+`action` | 只读提交待主人确认的提问 / 会话主人远程批准或忽略提问 |
+| `remote.run.start` / `cancel` | `peer_id`, `session_id`, `text` 或 `run_id`, `queue_policy?` (`enqueue`\|`reject`), `namespace?`, `link_origin?`, `mode_limit?` | 发起幂等对话/工具运行（默认支持会话 FIFO 排队，或传 `reject` 忙碌即拒）/ 取消运行中或排队中任务 |
+| `remote.guest.request` / `respond` | `peer_id`, `session_id`, `text` 或 `guest_request_id`+`action` (`approve`\|`dismiss`\|`cancel`), `text?`, `mode_limit?` | 只读提交待确认提问 / 主人或 `control` 协作者批准（可改写提示词或收窄工具）或忽略，提问者本人可 `cancel` 撤回 |
 | `remote.ui.respond` | `peer_id`, `session_id`, `run_id`, `ui_id`, `confirmed`/`value`/`answers`/`cancelled` | 响应远程审批或提问弹窗 |
 
 异步推送事件包括：`remote.connection.state`、`remote.event`（流式文本/思考/工具/审批/运行终态）、`remote.network.updated`、`remote.access.state`、`remote.auth.state`、`remote.subscription.error` 与 `remote.error`。
@@ -225,6 +228,7 @@ go build -ldflags "\
 ./vanora-desktop ctl workspaces -peer <peer_id>
 ./vanora-desktop ctl sessions -peer <peer_id>
 ./vanora-desktop ctl run -peer <peer_id> -session <session_id> -text "检查当前 git 状态"
+# 协作会话忙碌时若不想排队，可加 -queue-policy reject（直接返回 session_busy）
 ```
 
 > [!TIP]

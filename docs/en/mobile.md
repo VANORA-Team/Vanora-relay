@@ -173,7 +173,7 @@ NSString *savedTarget = [client selfRelayTarget];
 | **Pairing & Connect** | `Pair(input, sigURL, token, name)` / `Connect(devID, owner)` / `ConnectSelfRelay(link, name)` / `ConnectSelfRelayWithToken(link, token, name)` / `ConnectLAN(link, name)` | First-time pairing or reconnect with persisted targets |
 | **State & Lifecycle** | `ConnectionState()` / `Reconnect()` / `Disconnect()` / `Close()` / `Devices()` / `SelfRelayTarget()` / `LANAddress()` | Inspect link & transport path, handle handoffs, release resources |
 | **Pairing Network** | `PairingNetwork()` / `OpenNetworkDesktop(id)` / `RemoveNetworkDevice(id)` | Roster inspection and concurrent multi-desktop handles |
-| **Sessions & Runs** | `ListWorkspaces()` / `CreateSession(wsID, reqID, title)` / `ListSessions()` / `OpenSession(sessID)` / `Resume(sessID, afterSeq)` / `StartRun(sessID, reqID, text)` / `CancelRun(sessID, runID)` / `RespondUI(sessID, runID, uiID, payloadJSON)` | Uniform AI session control and remote tool approvals |
+| **Sessions, Runs & Collaboration** | `ListWorkspaces()` / `CreateSession(...)` / `ListSessions()` / `OpenSession(sessID)` / `CloseSession(sessID)` / `SessionPresence(sessID, watch)` / `Resume(sessID, afterSeq)` / `StartRun(...)` / `StartRunWithPolicy(sessID, reqID, text, policy)` / `CancelRun(...)` / `RespondUI(...)` / `SubmitGuestRequest(...)` / `RespondGuestRequest(...)` / `RespondGuestRequestWithOptions(...)` | Uniform AI session control, FIFO turn queueing, live collaborator presence, remote tool approvals, and guest prompt gating |
 | **Events** | `NextEvent(timeoutMillis)` / `Acknowledge(sessID, seq)` / `Mobile.NewRequestID()` | Single-consumer event pump and sequence acknowledgment |
 
 </details>
