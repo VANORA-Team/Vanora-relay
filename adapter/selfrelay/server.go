@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vanora-relay/adapter/transport"
@@ -75,6 +76,7 @@ type Server struct {
 	db          *pairnet.Database
 	group       *pairnet.Group
 	network     *transport.NetworkHandler
+	tunnelHooks atomic.Pointer[TunnelHooks]
 }
 
 // OpenServer opens or initializes persisted self-hosted pairing state in store.
@@ -265,6 +267,7 @@ func (s *Server) SetClientAccess(id, access string) error {
 	}
 	delete(s.clientLinks, id)
 	s.mu.Unlock()
+	s.revokeTunnelClient(id)
 	for _, l := range closed {
 		l.close(transport.ErrPeerClosed, true)
 	}
@@ -356,6 +359,9 @@ func (s *Server) SetPeerAccessFor(rawSignalURL, id, access string) error {
 		delete(s.clientLinks, id)
 	}
 	s.mu.Unlock()
+	if activeService {
+		s.revokeTunnelClient(id)
+	}
 	for _, l := range closed {
 		l.close(transport.ErrPeerClosed, true)
 	}
@@ -375,12 +381,14 @@ func (s *Server) RemoveDevice(id string) error {
 	if err := g.Remove(id); err != nil {
 		return err
 	}
+	s.revokeTunnelClient(id)
 	s.network.Broadcast()
 	return nil
 }
 
 func (s *Server) closeRemoved() {
 	s.mu.Lock()
+	var tunnelRevoked []string
 	if s.group != nil {
 		next := s.state
 		next.Clients = maps.Clone(next.Clients)
@@ -389,6 +397,13 @@ func (s *Server) closeRemoved() {
 		})
 		if len(next.Clients) < len(s.state.Clients) && saveState(s.store, next) == nil {
 			s.state = next
+		}
+		if s.tunnelHooks.Load() != nil {
+			for id := range s.group.Snapshot() {
+				if id != s.pin && !s.group.Allows(id) {
+					tunnelRevoked = append(tunnelRevoked, id)
+				}
+			}
 		}
 	}
 	// Roster changes can revoke vouches that never had a state entry, so
@@ -404,6 +419,9 @@ func (s *Server) closeRemoved() {
 	}
 	netObs := s.netObserver
 	s.mu.Unlock()
+	for _, id := range tunnelRevoked {
+		s.revokeTunnelClient(id)
+	}
 	for _, l := range closed {
 		l.close(ErrUnpaired, true)
 	}
@@ -526,6 +544,7 @@ func (s *Server) Stop() {
 	obs := s.observer
 	entry.cancel()
 	s.mu.Unlock()
+	s.revokeAllTunnelClients()
 
 	for _, l := range links {
 		l.close(transport.ErrClosed, true)
@@ -812,6 +831,11 @@ func (s *Server) RevokeClients(id string) error {
 	}
 	s.mu.Unlock()
 
+	if id == "" {
+		s.revokeAllTunnelClients()
+	} else {
+		s.revokeTunnelClient(id)
+	}
 	for _, l := range revoked {
 		l.close(ErrUnpaired, true)
 	}
@@ -872,7 +896,8 @@ func (s *Server) runLoop(entry *runningConn) {
 }
 
 func (s *Server) runOnce(entry *runningConn) error {
-	ws, err := dialSignal(entry.ctx, entry.signalURL, entry.relayToken, "desktop", s.priv, s.pub, s.deviceID)
+	var scope string
+	ws, err := dialSignalFor(entry.ctx, entry.signalURL, entry.relayToken, "desktop", s.priv, s.pub, s.deviceID, "", &scope)
 	if err != nil {
 		return err
 	}
@@ -920,8 +945,14 @@ func (s *Server) runOnce(entry *runningConn) error {
 	sessionCtx, sessionCancel := context.WithCancel(entry.ctx)
 	defer func() {
 		sessionCancel()
+		if scope != "" {
+			s.revokeAllTunnelClients()
+		}
 		s.closeAllLinks()
 	}()
+	if hooks := s.tunnelHooks.Load(); scope != "" && hooks != nil && hooks.OnSessionStart != nil {
+		hooks.OnSessionStart(sessionCtx, scope, entry.signalURL, entry.relayToken, send)
+	}
 
 	for {
 		select {
@@ -936,6 +967,10 @@ func (s *Server) runOnce(entry *runningConn) error {
 			return err
 		}
 		switch m.Type {
+		case "tunnel.host.ack", "tunnel.offer", "tunnel.access", "tunnel.close":
+			if hooks := s.tunnelHooks.Load(); scope != "" && hooks != nil && hooks.OnMessage != nil {
+				hooks.OnMessage(m)
+			}
 		case "connect.request":
 			go s.handleConnectRequest(sessionCtx, entry, send, m)
 		case "ice.config":

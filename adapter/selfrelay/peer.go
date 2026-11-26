@@ -412,11 +412,11 @@ func (l *peerLink) handleAccept(m protocol.Message) error {
 		return errors.New("selfrelay: duplicate connect.accept")
 	}
 	if m.Connection != l.session.connID || m.From != l.session.remoteID || m.To != l.session.localID || m.Round != 0 || m.Seq != 1 || m.Certificate != "" {
-		return errors.New("selfrelay: invalid connect.accept header")
+		return fmt.Errorf("selfrelay: invalid connect.accept header: %w", transport.ErrIdentityChanged)
 	}
 	body, err := m.Verify(l.session.remotePub)
 	if err != nil {
-		return fmt.Errorf("selfrelay: desktop accept signature invalid: %w", err)
+		return fmt.Errorf("selfrelay: desktop accept signature invalid: %w: %w", transport.ErrIdentityChanged, err)
 	}
 	var payload connectAcceptBody
 	if err := json.Unmarshal(body, &payload); err != nil || !protocol.ValidID(payload.Nonce) {
@@ -424,7 +424,7 @@ func (l *peerLink) handleAccept(m protocol.Message) error {
 	}
 	pub, err := parsePublicKeyB64(payload.PublicKey)
 	if err != nil || !pub.Equal(l.session.remotePub) {
-		return errors.New("selfrelay: desktop public key differs from pairing pin")
+		return fmt.Errorf("selfrelay: desktop public key differs from pairing pin: %w", transport.ErrIdentityChanged)
 	}
 	l.session.nonce = payload.Nonce
 	l.session.received = m.Seq
@@ -706,13 +706,18 @@ func (l *peerLink) close(err error, notifyRemote bool) {
 
 func (p *peer) start() {
 	p.once.Do(func() {
-		go p.run()
+		if !p.link.closed.Load() {
+			go p.run()
+		}
 	})
 }
 
 func (p *peer) run() {
 	l := p.link
 	h := l.handler
+	if l.deferStart && l.closed.Load() {
+		return
+	}
 	if !l.closed.Load() {
 		l.cbMu.Lock()
 		if !l.closed.Load() {
@@ -838,11 +843,7 @@ func toICEServers(servers []iceServer) []webrtc.ICEServer {
 	return out
 }
 
-func dialSignal(ctx context.Context, rawURL, relayToken, role string, priv ed25519.PrivateKey, pub ed25519.PublicKey, devID string) (*websocket.Conn, error) {
-	return dialSignalFor(ctx, rawURL, relayToken, role, priv, pub, devID, "")
-}
-
-func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed25519.PrivateKey, pub ed25519.PublicKey, devID, desktop string) (*websocket.Conn, error) {
+func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed25519.PrivateKey, pub ed25519.PublicKey, devID, desktop string, scope *string) (*websocket.Conn, error) {
 	signalURL, err := NormalizeSignalURL(rawURL)
 	if err != nil {
 		return nil, err
@@ -915,12 +916,16 @@ func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed
 		return nil, fmt.Errorf("selfrelay: expected auth.ok, got %s", okMsg.Type)
 	}
 	var accepted struct {
-		Device string `json:"device_id"`
-		Mode   string `json:"mode"`
+		Device      string `json:"device_id"`
+		Mode        string `json:"mode"`
+		TunnelScope string `json:"tunnel_scope"`
 	}
 	if json.Unmarshal(okMsg.Data, &accepted) != nil || accepted.Device != devID || accepted.Mode != "self" {
 		ws.CloseNow()
 		return nil, errors.New("selfrelay: relay is not running in self-hosted pairing mode")
+	}
+	if scope != nil {
+		*scope = accepted.TunnelScope
 	}
 	return ws, nil
 }

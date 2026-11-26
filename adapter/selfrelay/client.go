@@ -28,6 +28,11 @@ func Dial(ctx context.Context, target Target, seed, clientName string, handler t
 // DialWithRole connects a mobile or desktop peer to a target desktop through a
 // self-hosted relay using the caller's Ed25519 key seed.
 func DialWithRole(ctx context.Context, target Target, seed, clientName, role string, handler transport.Handler) (transport.Peer, func(), error) {
+	return DialWithRoleFor(ctx, ctx, target, seed, clientName, role, handler)
+}
+
+// DialWithRoleFor separates setup cancellation from the connected peer's lifetime.
+func DialWithRoleFor(ctx, lifetime context.Context, target Target, seed, clientName, role string, handler transport.Handler) (transport.Peer, func(), error) {
 	if role == "" {
 		role = "mobile"
 	}
@@ -59,12 +64,12 @@ func DialWithRole(ctx context.Context, target Target, seed, clientName, role str
 		return nil, nil, errors.New("selfrelay: cannot connect to self")
 	}
 
-	ws, err := dialSignalFor(ctx, target.SignalURL, target.Token, role, mobilePriv, mobilePub, mobileDevID, desktopDevID)
+	ws, err := dialSignalFor(ctx, target.SignalURL, target.Token, role, mobilePriv, mobilePub, mobileDevID, desktopDevID, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	linkCtx, linkCancel := context.WithCancel(ctx)
+	linkCtx, linkCancel := context.WithCancel(lifetime)
 	var writeMu sync.Mutex
 	send := func(m protocol.Message) error {
 		writeMu.Lock()

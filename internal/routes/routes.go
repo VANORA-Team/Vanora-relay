@@ -24,6 +24,7 @@ const (
 	KindTailnet  Kind = "tailnet"
 	KindDirect   Kind = "direct"
 	KindRelay    Kind = "relay"
+	KindCFTunnel Kind = "cf_tunnel"
 )
 
 const (
@@ -32,6 +33,7 @@ const (
 	BetterRouteCooldown      = 5 * time.Minute
 	NearbyDialTimeout        = 2500 * time.Millisecond
 	TailnetDialTimeout       = 8 * time.Second
+	CFTunnelHeadStart        = 4 * time.Second
 )
 
 var tailnetPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -56,8 +58,10 @@ func Rank(k Kind) int {
 		return 3
 	case KindRelay:
 		return 4
-	default:
+	case KindCFTunnel:
 		return 5
+	default:
+		return 6
 	}
 }
 
@@ -156,6 +160,7 @@ type silentState struct {
 type Tracker struct {
 	mu          sync.Mutex
 	silent      map[string]silentState
+	tunnels     map[string]silentState
 	cooldowns   map[string]time.Time
 	relayStalls int
 	lastRelayAt time.Time
@@ -164,6 +169,7 @@ type Tracker struct {
 func NewTracker() *Tracker {
 	return &Tracker{
 		silent:    make(map[string]silentState),
+		tunnels:   make(map[string]silentState),
 		cooldowns: make(map[string]time.Time),
 	}
 }
@@ -172,6 +178,7 @@ func NewTracker() *Tracker {
 func (t *Tracker) Reset() {
 	t.mu.Lock()
 	clear(t.silent)
+	clear(t.tunnels)
 	t.mu.Unlock()
 }
 
@@ -200,10 +207,31 @@ func (t *Tracker) InCooldown(addr string, now time.Time) bool {
 func (t *Tracker) RecordProbeMiss(addr string, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	failures := t.silent[addr].failures + 1
-	shift := min(failures, 10)
-	delay := min(SilentRouteBackoffMax, BetterRouteCheckInterval*time.Duration(1<<shift)/2)
-	t.silent[addr] = silentState{failures: failures, until: now.Add(delay)}
+	t.silent[addr] = nextBackoff(t.silent[addr], now)
+}
+
+func nextBackoff(previous silentState, now time.Time) silentState {
+	failures := min(previous.failures+1, 10)
+	delay := min(SilentRouteBackoffMax, BetterRouteCheckInterval*time.Duration(1<<(failures-1)))
+	return silentState{failures: failures, until: now.Add(delay)}
+}
+
+func (t *Tracker) ShouldAttemptTunnel(key string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !now.Before(t.tunnels[key].until)
+}
+
+func (t *Tracker) RecordTunnelUnavailable(key string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.tunnels[key] = nextBackoff(t.tunnels[key], now)
+}
+
+func (t *Tracker) RecordTunnelSuccess(key string) {
+	t.mu.Lock()
+	delete(t.tunnels, key)
+	t.mu.Unlock()
 }
 
 // RecordProbeSuccess clears silent-route backoff for addr.

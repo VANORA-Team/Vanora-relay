@@ -116,14 +116,17 @@ func (e *ClosedError) Error() string {
 // Closed; the host reconnects by calling Dial again with the same
 // IdentitySource.
 type Client struct {
-	role       string
-	desktop    string
-	source     IdentitySource
-	handler    Handler
-	pairedRole endpoint.PairRoleAuthorizer
-	network    *NetworkHandler
-	netHookMu  sync.Mutex
-	netHook    func()
+	role        string
+	desktop     string
+	source      IdentitySource
+	handler     Handler
+	pairedRole  endpoint.PairRoleAuthorizer
+	network     *NetworkHandler
+	netHookMu   sync.Mutex
+	netHook     func()
+	signalURL   string
+	tunnelScope string
+	tunnelHooks atomic.Pointer[TunnelHooks]
 
 	ws *websocket.Conn
 
@@ -137,20 +140,21 @@ type Client struct {
 	writeMu sync.Mutex
 	fetchMu sync.Mutex
 
-	mu         sync.Mutex
-	creds      *endpoint.Credentials
-	proof      endpoint.LeaseProof
-	proofUntil time.Time
-	fetchedAt  time.Time
-	refreshAt  time.Time
-	ca         ed25519.PublicKey
-	publicKey  ed25519.PublicKey
-	deviceID   string
-	userID     string
-	authority  bool
-	guests     map[string]bool
-	pairTicket string
-	links      map[string]*link
+	mu               sync.Mutex
+	creds            *endpoint.Credentials
+	proof            endpoint.LeaseProof
+	proofUntil       time.Time
+	fetchedAt        time.Time
+	refreshAt        time.Time
+	ca               ed25519.PublicKey
+	publicKey        ed25519.PublicKey
+	deviceID         string
+	userID           string
+	authority        bool
+	guests           map[string]bool
+	pairTicket       string
+	links            map[string]*link
+	tunnelPairedRole endpoint.PairRoleAuthorizer
 
 	authCbMu sync.Mutex
 
@@ -252,6 +256,7 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 
 	c := &Client{
 		role:        role,
+		signalURL:   url,
 		desktop:     desktop,
 		source:      source,
 		handler:     h,
@@ -291,25 +296,39 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 	}
 	ok, err := readSignal(dctx, ws)
 	if err != nil {
+		var closed websocket.CloseError
+		if errors.As(err, &closed) && closed.Code == websocket.StatusPolicyViolation {
+			switch closed.Reason {
+			case "invalid certificate", "issuer not allowed", "invalid proof", "invalid lease":
+				return fail(fmt.Errorf("transport: signaling authentication rejected: %w", ErrUnauthorized))
+			}
+		}
 		return fail(fmt.Errorf("transport: read auth result: %w", err))
 	}
 	if ok.Type != "auth.ok" {
 		return fail(fmt.Errorf("%w: expected auth.ok, got %s", ErrMalformedResponse, ok.Type))
 	}
 	var accepted struct {
-		Device string `json:"device_id"`
-		User   string `json:"remote_user_id"`
+		Device      string `json:"device_id"`
+		User        string `json:"remote_user_id"`
+		TunnelScope string `json:"tunnel_scope"`
 	}
 	if json.Unmarshal(ok.Data, &accepted) != nil || accepted.Device != c.deviceID || accepted.User != c.userID {
 		return fail(fmt.Errorf("%w: relay accepted a different endpoint identity", ErrMalformedResponse))
 	}
+	c.tunnelScope = accepted.TunnelScope
 
 	if provider, ok := source.(interface {
 		PairingIdentity(string, string) (*pairnet.Group, pairnet.Member)
 	}); ok && role == RoleDesktop && desktop == "" {
 		group, _ := provider.PairingIdentity(url, role)
 		if group != nil {
-			c.network = &NetworkHandler{Handler: h, Group: func() *pairnet.Group { return group }, Device: func(p Peer) string { return p.(*peer).link.remoteDevice }}
+			c.network = &NetworkHandler{Handler: h, Group: func() *pairnet.Group { return group }, Device: func(p Peer) string {
+				if device, ok := p.(interface{ DeviceID() string }); ok {
+					return device.DeviceID()
+				}
+				return p.(*peer).link.remoteDevice
+			}}
 			c.network.Changed = func() {
 				c.mu.Lock()
 				var closed []*link
@@ -322,6 +341,9 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 				c.mu.Unlock()
 				for _, l := range closed {
 					l.close(ErrUnauthorized, true)
+				}
+				if hooks := c.tunnelHooks.Load(); hooks != nil && hooks.OnNetworkChange != nil {
+					hooks.OnNetworkChange()
 				}
 				c.netHookMu.Lock()
 				hook := c.netHook
@@ -401,6 +423,7 @@ func (c *Client) Publish(ctx context.Context, name string, guests []string) erro
 	}
 
 	c.mu.Lock()
+	previous := c.guests
 	c.guests = allowed
 	owner := c.userID
 	links := make([]*link, 0, len(c.links))
@@ -408,6 +431,13 @@ func (c *Client) Publish(ctx context.Context, name string, guests []string) erro
 		links = append(links, l)
 	}
 	c.mu.Unlock()
+	if hooks := c.tunnelHooks.Load(); hooks != nil && hooks.OnRevokeUser != nil {
+		for user := range previous {
+			if !peerAllowed(owner, allowed, user) {
+				hooks.OnRevokeUser(user)
+			}
+		}
+	}
 
 	// Fail closed for revoked guests before the directory is updated.
 	for _, l := range links {
@@ -529,6 +559,19 @@ func (c *Client) ConnectPaired(ctx context.Context, deviceID, ownerID string, pi
 }
 
 func (c *Client) ConnectPairedWithOptions(ctx context.Context, deviceID, ownerID string, opts ConnectOptions) (Peer, error) {
+	return c.connectPaired(ctx, deviceID, ownerID, opts, false)
+}
+
+// ConnectPairedDeferred returns an authenticated peer before delivering callbacks.
+func (c *Client) ConnectPairedDeferred(ctx context.Context, deviceID, ownerID string, opts ConnectOptions) (Peer, func(), error) {
+	p, err := c.connectPaired(ctx, deviceID, ownerID, opts, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, sync.OnceFunc(func() { go p.(*peer).run() }), nil
+}
+
+func (c *Client) connectPaired(ctx context.Context, deviceID, ownerID string, opts ConnectOptions, deferStart bool) (Peer, error) {
 	if c.role != RoleMobile && c.role != RoleDesktop {
 		return nil, ErrNotMobile
 	}
@@ -560,6 +603,7 @@ func (c *Client) ConnectPairedWithOptions(ctx context.Context, deviceID, ownerID
 	l := newLink(c, session.ID(), session, false, false)
 	l.remoteDevice = deviceID
 	l.handler = opts.Handler
+	l.deferStart = deferStart
 	l.localProof = proof
 	c.addLink(l)
 	go l.run()
@@ -645,6 +689,7 @@ func (c *Client) RevokeDevice(device string) {
 		}
 	}
 	c.mu.Unlock()
+	c.RevokeTunnelDevice(device)
 	for _, l := range revoked {
 		l.close(ErrUnauthorized, true)
 	}
@@ -771,6 +816,9 @@ func (c *Client) applyProof(proof endpoint.LeaseProof, until time.Time) {
 		links = append(links, l)
 	}
 	c.mu.Unlock()
+	if hooks := c.tunnelHooks.Load(); hooks != nil && hooks.OnLeaseUpdated != nil {
+		hooks.OnLeaseUpdated(proof)
+	}
 	for _, l := range links {
 		l.updateLocal(proof, until)
 	}
@@ -793,6 +841,9 @@ func (c *Client) setAuthority(online bool) {
 		l.authorityLost()
 	}
 	if changed && !closed {
+		if !online {
+			c.tunnelAuthorityLost()
+		}
 		c.notifyAuthority(online)
 	}
 }
@@ -921,6 +972,10 @@ func (c *Client) dispatch(m protocol.Message) {
 	switch m.Type {
 	case "auth.ok", "auth.renewed":
 		return
+	case "tunnel.host.ack", "tunnel.offer", "tunnel.target", "tunnel.access", "tunnel.close":
+		if hooks := c.tunnelHooks.Load(); c.tunnelScope != "" && hooks != nil && hooks.OnMessage != nil {
+			hooks.OnMessage(m)
+		}
 	case "device.registered", "devices.list":
 		c.notifyWaiters(m)
 	case "error":
@@ -1052,6 +1107,7 @@ func (c *Client) shutdown(err error) {
 			links = append(links, l)
 		}
 		c.mu.Unlock()
+		c.tunnelAuthorityLost()
 		if wasAuthority {
 			c.notifyAuthority(false)
 		}

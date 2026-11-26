@@ -31,6 +31,7 @@ type link struct {
 	session      *endpoint.Session
 	remoteDevice string
 	handler      Handler
+	deferStart   bool
 
 	// stateMu serializes Session and Access. Both are documented as owned by a
 	// serial event loop because Access.Update replaces Session identity fields.
@@ -338,7 +339,7 @@ func (l *link) handleAccept(m protocol.Message) error {
 	}
 	l.stateMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("transport: accept rejected: %w", err)
+		return fmt.Errorf("transport: accept rejected: %w: %w", ErrIdentityChanged, err)
 	}
 	l.setRemoteUser(l.session.RemoteUserID())
 	if err := l.initAccess(); err != nil {
@@ -715,7 +716,11 @@ func (l *link) maybeOpen() error {
 	if !l.opened.CompareAndSwap(false, true) {
 		return nil
 	}
-	go l.peer.run()
+	if l.deferStart {
+		close(l.ready)
+	} else {
+		go l.peer.run()
+	}
 	return nil
 }
 
@@ -872,6 +877,9 @@ func toICEServers(servers []iceServer) []webrtc.ICEServer {
 
 func (p *peer) run() {
 	l := p.link
+	if l.deferStart && l.isClosed() {
+		return
+	}
 	h := l.handler
 	if h == nil {
 		h = l.c.handler
@@ -886,7 +894,9 @@ func (p *peer) run() {
 		}
 		l.cbMu.Unlock()
 	}
-	close(p.ready)
+	if !l.deferStart {
+		close(p.ready)
+	}
 
 	for {
 		select {

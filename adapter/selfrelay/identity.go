@@ -160,6 +160,11 @@ func ClientIdentity(seed string) (string, string) {
 	return fingerprint(pub), pin
 }
 
+func ClientPrivateKey(seed string) (ed25519.PrivateKey, error) {
+	key, _, _, _, err := parseKeySeed(seed)
+	return key, err
+}
+
 func validToken32(value string) bool {
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(value)
 	return err == nil && len(raw) == sha256.Size

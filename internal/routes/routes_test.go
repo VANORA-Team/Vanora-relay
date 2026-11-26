@@ -26,6 +26,9 @@ func TestClassifyAddressAndRank(t *testing.T) {
 		{raw: "8.8.8.8:9000", wantErr: true},
 		{raw: "0.0.0.0:9000", wantErr: true},
 		{raw: "192.168.1.42:0", wantErr: true},
+		{raw: "localhost:8443", wantErr: true},
+		{raw: "managed.edge.example:443", wantErr: true},
+		{raw: "wss://managed.edge.example/v1/tunnel/ws", wantErr: true},
 	}
 	for _, tc := range cases {
 		gotAddr, gotKind, err := ClassifyAddress(tc.raw)
@@ -43,8 +46,43 @@ func TestClassifyAddressAndRank(t *testing.T) {
 		}
 	}
 
-	if !(Rank(KindLoopback) < Rank(KindLAN) && Rank(KindLAN) < Rank(KindTailnet) && Rank(KindTailnet) < Rank(KindDirect) && Rank(KindDirect) < Rank(KindRelay)) {
-		t.Fatal("unexpected route rank order")
+	for rank, kind := range []Kind{KindLoopback, KindLAN, KindTailnet, KindDirect, KindRelay, KindCFTunnel, "unknown"} {
+		if got := Rank(kind); got != rank {
+			t.Fatalf("Rank(%q) = %d, want %d", kind, got, rank)
+		}
+	}
+}
+
+func TestTunnelBackoff(t *testing.T) {
+	tracker := NewTracker()
+	now := time.Now()
+	const key = "wss://signal.example/v1/signal"
+	for delay := BetterRouteCheckInterval; ; delay = min(delay*2, SilentRouteBackoffMax) {
+		if !tracker.ShouldAttemptTunnel(key, now) {
+			t.Fatal("tunnel stayed in backoff after expiry")
+		}
+		tracker.RecordTunnelUnavailable(key, now)
+		if tracker.ShouldAttemptTunnel(key, now.Add(delay-time.Nanosecond)) ||
+			!tracker.ShouldAttemptTunnel(key, now.Add(delay)) || !tracker.ShouldAttemptTunnel("other", now) {
+			t.Fatalf("incorrect tunnel backoff at %v", delay)
+		}
+		if !tracker.ShouldProbe(key, now) {
+			t.Fatal("tunnel backoff limits an unrelated route probe")
+		}
+		now = now.Add(delay)
+		if delay == SilentRouteBackoffMax {
+			break
+		}
+	}
+	tracker.RecordTunnelUnavailable(key, now)
+	tracker.RecordTunnelSuccess(key)
+	if !tracker.ShouldAttemptTunnel(key, now) {
+		t.Fatal("a successful tunnel did not clear backoff")
+	}
+	tracker.RecordTunnelUnavailable(key, now)
+	tracker.Reset()
+	if !tracker.ShouldAttemptTunnel(key, now) {
+		t.Fatal("Reset did not clear tunnel backoff")
 	}
 }
 
@@ -102,6 +140,10 @@ func TestTrackerBackoffCooldownAndTransportHint(t *testing.T) {
 	tr.RecordActivePath("relay", base.Add(45*time.Second))
 	if got := tr.TransportHint(base.Add(time.Minute)); got != "relay_preferred" {
 		t.Fatalf("hint after 3 relay fallbacks = %q, want relay_preferred", got)
+	}
+	tr.RecordActivePath(string(KindCFTunnel), base.Add(time.Minute))
+	if got := tr.TransportHint(base.Add(time.Minute)); got != "relay_preferred" {
+		t.Fatalf("hint after tunnel fallback = %q, want relay_preferred", got)
 	}
 	tr.RecordActivePath("direct", base.Add(2*time.Minute))
 	if got := tr.TransportHint(base.Add(2 * time.Minute)); got != "direct_preferred" {

@@ -311,6 +311,11 @@ func newAccount(baseURL, caHex string, store Store, now func() time.Time) (*Acco
 	return a, nil
 }
 
+// CA returns a copy of the pinned authority public key.
+func (a *Account) CA() ed25519.PublicKey {
+	return bytes.Clone(a.ca)
+}
+
 // UserID returns the stable remote user identifier bound by the current
 // certificate, or "" before enrollment.
 func (a *Account) UserID() string {
