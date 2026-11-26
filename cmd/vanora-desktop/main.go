@@ -75,6 +75,11 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+func envEnabled(key string) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		log.Print(err)
@@ -183,6 +188,9 @@ func run(args []string) error {
 	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	lanListen := fs.String("lan-listen", "", "listen for paired LAN clients on a private IP address and port")
 	relayEnabled := fs.Bool("relay", true, "enable the configured WAN relay channel")
+	tunnelEnabled := fs.Bool("cf-tunnel", envEnabled("VANORA_CF_TUNNEL"), "enable managed Cloudflare Tunnel on a supporting relay")
+	cloudflared := fs.String("cloudflared", envOrDefault("VANORA_CLOUDFLARED_BIN", "cloudflared"), "cloudflared executable")
+	tunnelPinned := fs.Bool("cf-tunnel-pinned", envEnabled("VANORA_CF_TUNNEL_PINNED"), "use a cloudflared build with restricted hostname and origin flags")
 	config := fs.String("config", "", "local Vanora session and permission config")
 	hostname, _ := os.Hostname()
 	name := fs.String("name", hostname, "published desktop name")
@@ -470,6 +478,9 @@ func run(args []string) error {
 			selfURL:       resolvedSelfSignal,
 			selfToken:     resolvedSelfToken,
 			tokens:        initialTokens,
+			tunnelEnabled: *tunnelEnabled,
+			tunnelPinned:  *tunnelPinned,
+			cloudflared:   *cloudflared,
 		})
 	default:
 		return errors.New("unknown subcommand")
@@ -630,6 +641,9 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		selfStore:        options.selfStore,
 		selfURL:          strings.TrimSpace(options.selfURL),
 		selfToken:        strings.TrimSpace(options.selfToken),
+		tunnelEnabled:    options.tunnelEnabled,
+		tunnelPinned:     options.tunnelPinned,
+		cloudflared:      options.cloudflared,
 	}
 	access.initRemote()
 	activityPub := desktop.NewActivityPublisher(ctx, access.activeRelayActivityTarget)
@@ -679,6 +693,7 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 			}
 			prev = b
 			currentConfig.Store(next)
+			access.reloadTunnelACL(next)
 			if emitter != nil {
 				emitter.Emit(map[string]any{"type": "config.reloaded"})
 			}
@@ -716,6 +731,7 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 				!strings.HasPrefix(cmd.Type, "access.relay.client") &&
 				!strings.HasPrefix(cmd.Type, "access.network.") &&
 				!strings.HasPrefix(cmd.Type, "access.invite.") &&
+				!strings.HasPrefix(cmd.Type, "access.tunnel.") &&
 				cmd.Type != "access.client.access.set" &&
 				cmd.Type != "access.activity.set" &&
 				cmd.Type != "session.guest.respond" &&

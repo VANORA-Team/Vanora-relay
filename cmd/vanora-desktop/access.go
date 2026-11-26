@@ -32,6 +32,9 @@ type accessOptions struct {
 	selfStore     selfrelay.Store
 	token         string
 	tokens        map[string]string
+	tunnelEnabled bool
+	tunnelPinned  bool
+	cloudflared   string
 }
 
 type accessCommand struct {
@@ -73,17 +76,18 @@ type accessCommand struct {
 }
 
 type officialSlot struct {
-	name        string
-	desktopName string
-	account     *account.Account
-	ca          ed25519.PublicKey
-	url         string
-	token       string
-	online      atomic.Bool
-	verified    atomic.Bool
-	socket      atomic.Pointer[transport.Client]
-	pairMu      sync.Mutex
-	invites     map[string]officialInvite
+	name         string
+	desktopName  string
+	account      *account.Account
+	ca           ed25519.PublicKey
+	url          string
+	token        string
+	online       atomic.Bool
+	verified     atomic.Bool
+	socket       atomic.Pointer[transport.Client]
+	pairMu       sync.Mutex
+	invites      map[string]officialInvite
+	tunnelGuests atomic.Pointer[map[string]bool]
 }
 
 type accessManager struct {
@@ -110,6 +114,11 @@ type accessManager struct {
 	relayDone       chan struct{}
 	remote          *remote.Manager
 	activityEnabled atomic.Bool
+	tunnelMu        sync.Mutex
+	tunnelEnabled   bool
+	tunnelPinned    bool
+	cloudflared     string
+	tunnelSession   atomic.Pointer[tunnelSession]
 }
 
 func (m *accessManager) activeRelayActivityTarget() (signalURL, deviceID, pairingTicket string) {
@@ -273,6 +282,7 @@ func (m *accessManager) statusLocked() map[string]any {
 		"relay_authorized":    relayAuthorized,
 		"relay_online":        relayOnline,
 		"activity_publishing": activityPublishing,
+		"tunnel":              m.tunnelStatus(),
 	}
 }
 
@@ -345,6 +355,7 @@ func (m *accessManager) loadSelfLocked() error {
 	srv.SetNetworkObserver(func() {
 		m.onNetworkChanged("self")
 	})
+	m.setSelfTunnelHooks(srv)
 	m.selfServer = srv
 	if m.service != nil {
 		m.service.SetSelfAuthority(srv.Allows)
@@ -415,6 +426,10 @@ func (m *accessManager) command(cmd accessCommand) {
 		}
 		result = m.statusLocked()
 		result["request_id"] = cmd.RequestID
+	case "access.tunnel.set", "access.tunnel.status", "access.tunnel.disconnect", "access.tunnel.resume", "access.tunnel.deprovision":
+		m.mu.Unlock()
+		err = m.tunnelCommand(cmd, result)
+		m.mu.Lock()
 	case "access.lan.set":
 		switch {
 		case cmd.Enabled == nil:
@@ -543,6 +558,7 @@ func (m *accessManager) command(cmd accessCommand) {
 					return err
 				}
 				if socket := slot.socket.Load(); socket != nil {
+					socket.RevokeTunnelDevice(id)
 					socket.NetworkChanged()
 				}
 				return nil
@@ -789,6 +805,10 @@ func (m *accessManager) close() {
 		}
 	}
 	m.stopAllWANLocked()
+	m.tunnelMu.Lock()
+	m.stopTunnelLocked()
+	m.tunnelSession.Store(nil)
+	m.tunnelMu.Unlock()
 	m.mu.Unlock()
 	if rm != nil {
 		rm.Close()
@@ -864,6 +884,7 @@ func (m *accessManager) startSelfLocked() error {
 
 func (m *accessManager) stopSelfLocked() {
 	if m.selfServer != nil {
+		m.stopTunnelChannel("self")
 		m.selfServer.Stop()
 		if m.service != nil {
 			m.service.RefreshSelfAccess()
@@ -916,6 +937,9 @@ func (m *accessManager) stopOfficialLocked() {
 	if m.stopRelay == nil {
 		return
 	}
+	if m.activeSlot != nil {
+		m.stopTunnelChannel(m.activeSlot.name)
+	}
 	m.stopRelay()
 	<-m.relayDone
 	m.stopRelay, m.relayDone, m.activeSlot = nil, nil, nil
@@ -937,6 +961,7 @@ func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot
 				slot.verified.Store(true)
 				delay = time.Second
 				m.setOnline(slot, true, "")
+				session := m.setOfficialTunnelHooks(ctx, slot, socket)
 			online:
 				for {
 					select {
@@ -950,6 +975,7 @@ func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot
 						}
 					}
 				}
+				m.endTunnelSession(session)
 			}
 			slot.socket.Store(nil)
 			socket.Close()

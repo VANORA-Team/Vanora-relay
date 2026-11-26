@@ -128,6 +128,24 @@ func (s *officialSlot) authorize(connection string, remote identity.Principal, r
 	return ok && bound == peer && self.Epoch <= 1 && group.Admit(local, member, false) == nil
 }
 
+func (s *officialSlot) authorizeTunnel(_ string, remote identity.Principal, role, _ string, proof []byte) bool {
+	if len(proof) != 0 || remote.DeviceID == s.account.DeviceID() {
+		return false
+	}
+	group, local := s.account.PairingIdentity(s.url, "desktop")
+	if group == nil {
+		return false
+	}
+	pin := base64.RawURLEncoding.EncodeToString(remote.PublicKey)
+	owner := remote.RemoteUserID()
+	if known, ok := group.Get(remote.DeviceID); ok {
+		return known.Pin == pin && known.Owner == owner && (role == "" || known.Role == role) && group.Allows(known.ID)
+	}
+	bound, ok := s.account.PairedPeer(remote.DeviceID)
+	self, _ := group.Get(local.ID)
+	return ok && bound.Pin == pin && bound.Owner == owner && self.Epoch <= 1 && (role == "" || role == "mobile")
+}
+
 func (s *officialSlot) revokeInvite(id string) error {
 	s.pairMu.Lock()
 	defer s.pairMu.Unlock()
