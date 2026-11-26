@@ -37,6 +37,8 @@ type options struct {
 	maxGrants              int
 	maxGrantsPerVisitor    int
 	maxAllocationsPerGrant int
+	maxTCPConns            int
+	maxTCPConnsPerIP       int
 	logLevel               logging.LogLevel
 
 	// allowUnsafePeers disables the public-peer filter. It exists only so
@@ -100,6 +102,14 @@ func FromEnv() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxTCPConns, err := envInt("TURN_TCP_MAX_CONNS", 512, 1, 65536)
+	if err != nil {
+		return nil, err
+	}
+	maxTCPConnsPerIP, err := envInt("TURN_TCP_MAX_CONNS_PER_IP", 16, 1, 1024)
+	if err != nil {
+		return nil, err
+	}
 
 	logLevel, err := envLogLevel()
 	if err != nil {
@@ -125,6 +135,8 @@ func FromEnv() (*Server, error) {
 		maxGrants:              maxGrants,
 		maxGrantsPerVisitor:    maxGrantsPerVisitor,
 		maxAllocationsPerGrant: maxAllocationsPerGrant,
+		maxTCPConns:            maxTCPConns,
+		maxTCPConnsPerIP:       maxTCPConnsPerIP,
 		logLevel:               logLevel,
 	})
 }
@@ -226,7 +238,7 @@ func newServer(opts options) (*Server, error) {
 
 				return nil, fmt.Errorf("ice: listen tcp %s:%d: %w", opts.bindIP, port, err)
 			}
-			listeners = append(listeners, ln)
+			listeners = append(listeners, newLimitedListener(ln, opts.maxTCPConns, opts.maxTCPConnsPerIP))
 			if port == 0 {
 				port = ln.Addr().(*net.TCPAddr).Port
 			}

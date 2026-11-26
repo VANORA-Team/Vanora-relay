@@ -385,6 +385,11 @@ func trimMap[V any](m map[string]V, max int, created func(V) int64) {
 	}
 }
 
+// maxPersistedStateBytes bounds state.json writes. It sits at half the
+// 64 MiB load-time ceiling, so no write path can push startup into the
+// "state.json is too large" refusal.
+const maxPersistedStateBytes = 32 << 20
+
 func saveState(dir string, st *persistedState) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("desktop: create state directory: %w", err)
@@ -392,6 +397,11 @@ func saveState(dir string, st *persistedState) error {
 	raw, err := json.Marshal(st)
 	if err != nil {
 		return fmt.Errorf("desktop: encode state: %w", err)
+	}
+	// Keep the persisted state far below the load-time ceiling so a
+	// runaway guest cannot brick startup with a giant state.json.
+	if len(raw) > maxPersistedStateBytes {
+		return fmt.Errorf("desktop: encoded state is %d bytes, over the %d byte persistence budget", len(raw), maxPersistedStateBytes)
 	}
 	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 
 	"vanora-relay/endpoint"
+	"vanora-relay/internal/dialretry"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/pairnet"
 	"vanora-relay/protocol"
@@ -228,7 +229,17 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
-	ws, resp, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: client})
+	var ws *websocket.Conn
+	var resp *http.Response
+	var err error
+	err = dialretry.Dial(dctx, func() error {
+		var derr error
+		ws, resp, derr = websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: client})
+		if derr != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return derr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial: %w", err)
 	}
@@ -645,6 +656,14 @@ func (c *Client) addLink(l *link) {
 		l.permitted.Store(true)
 	} else {
 		l.permitted.Store(false)
+	}
+	if _, dup := c.links[l.id]; dup {
+		// A duplicate connection id means a replayed or forked frame. Close
+		// the newcomer and keep the live link instead of silently orphaning
+		// its bookkeeping.
+		c.mu.Unlock()
+		l.close(ErrUnauthorized, true)
+		return
 	}
 	c.links[l.id] = l
 	c.mu.Unlock()

@@ -1,0 +1,6 @@
+=== RUN   TestRedSessionCreateStateBrick
+    session_create_state_brick_test.go:186: RED TEAM WIN (session.create state brick): 2400 attacker session.create requests all succeeded (state.json grew to 2220067 bytes across batches: [1110067 2220067], no cap; 2400 session files flooded into workspace dir). state.json inflated to 67109888 bytes (attacker titles ~600B/create + 4MiB/session event retention reach 64MiB organically) → desktop.New fails: "desktop: state.json is too large" — sidecar can never restart until owner deletes state.json.
+--- FAIL: TestRedSessionCreateStateBrick (63.24s)
+FAIL
+FAIL	vanora-relay/red_poc	64.589s
+FAIL

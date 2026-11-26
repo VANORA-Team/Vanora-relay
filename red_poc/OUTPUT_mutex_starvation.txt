@@ -1,0 +1,6 @@
+=== RUN   TestRedUnauthHubMutexStarvation
+    unauth_hmutex_contention_test.go:185: RED TEAM WIN (unauth hub-mutex starvation): p50 connect.request push delivery 0.0us -> 528.2us (x528) under 15188 unauthenticated pairing flood reqs from 32 goroutines, zero 429/503 ever issued; no token / no pairing knowledge used.
+--- FAIL: TestRedUnauthHubMutexStarvation (9.89s)
+FAIL
+FAIL	vanora-relay/red_poc	11.220s
+FAIL

@@ -1,0 +1,6 @@
+=== RUN   TestRedSelfTokenGuessingUnthrottled
+    auth_guess_no_throttle_test.go:75: RED TEAM WIN (token guessing unthrottled): 2000 wrong guesses in 458.2821ms (4364 req/s, avg 0.23 ms/req) all answered free 401, zero lockout/backoff, correct guess still distinguished by 204: statuses=map[401:2000]
+--- FAIL: TestRedSelfTokenGuessingUnthrottled (0.46s)
+FAIL
+FAIL	vanora-relay/red_poc	2.474s
+FAIL

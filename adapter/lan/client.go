@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/dialretry"
 	"vanora-relay/internal/pairing"
 )
 
@@ -124,7 +125,16 @@ func DialWithOptions(ctx context.Context, target Target, seed, name, role, local
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	socketURL := (&url.URL{Scheme: "wss", Host: address.String(), Path: path}).String()
-	socket, response, err := websocket.Dial(dialCtx, socketURL, &websocket.DialOptions{HTTPClient: client, HTTPHeader: header})
+	var socket *websocket.Conn
+	var response *http.Response
+	err = dialretry.Dial(dialCtx, func() error {
+		var derr error
+		socket, response, derr = websocket.Dial(dialCtx, socketURL, &websocket.DialOptions{HTTPClient: client, HTTPHeader: header})
+		if derr != nil && response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return derr
+	})
 	if err != nil {
 		if response != nil && response.StatusCode == http.StatusUnauthorized {
 			return nil, nil, ErrUnpaired
@@ -215,11 +225,18 @@ func ProbeTarget(ctx context.Context, target Target, seed string, timeout time.D
 	if err != nil {
 		return err
 	}
-	resp, err := client.Do(req)
+	var resp *http.Response
+	err = dialretry.Dial(pctx, func() error {
+		var derr error
+		resp, derr = client.Do(req)
+		if derr == nil {
+			_ = resp.Body.Close()
+		}
+		return derr
+	})
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		return ErrUnpaired
 	}

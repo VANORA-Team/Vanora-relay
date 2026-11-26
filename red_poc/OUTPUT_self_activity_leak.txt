@@ -1,0 +1,6 @@
+=== RUN   TestRedSelfActivityPollWithoutPairing
+    self_activity_leak_test.go:236: RED TEAM WIN (self-mode activity leak): attacker sdev_xlytbywaksec4kfkgpl3r2hjca never paired with desktop sdev_jieq3b3flxgpkydul7aoyfnogy, holds only node token; poll returned 1 activities of the desktop: {"activities":[{"device_id":"sdev_jieq3b3flxgpkydul7aoyfnogy","session_id":"sess-red","run_id":"run-red","phase":"running","ui_id":"ui-red","method":"run.start","updated_at":1795671476083}],"device_id":"sdev_jieq3b3flxgpkydul7aoyfnogy"}
+--- FAIL: TestRedSelfActivityPollWithoutPairing (0.28s)
+FAIL
+FAIL	vanora-relay/red_poc	0.383s
+FAIL

@@ -21,6 +21,7 @@ const (
 	codeInvalidRequest  = "invalid_request"
 	codeSessionBusy     = "session_busy"
 	codeGuestLimit      = "guest_request_limit"
+	codeSessionLimit    = "session_limit"
 	// maxReplayEvents bounds a single resume response well below the peer
 	// output queue. A larger backlog is served by a fresh snapshot instead of
 	// filling the queue and disconnecting the peer.
@@ -463,6 +464,21 @@ func (a *Adapter) handleSessionCreate(ps *peerState, req wireRequest) {
 			summary := a.sessionSummaryLocked(sr, user)
 			a.mu.Unlock()
 			a.sendResult(ps, req.RequestID, summary, prev.SessionID, true)
+			return
+		}
+	}
+	// Bound guest-driven session.create growth per workspace: state.json and
+	// the session directory cannot be flooded without bound.
+	if max := a.cfg.retention.MaxCreatedSessions; max > 0 {
+		used := 0
+		for _, rec := range a.state.CreatedSessions {
+			if rec.WorkspaceID == w.id {
+				used++
+			}
+		}
+		if used >= max {
+			a.mu.Unlock()
+			a.sendError(ps, req.RequestID, codeSessionLimit)
 			return
 		}
 	}

@@ -76,6 +76,32 @@ func (h *Hub) ensureActivityTracker() *activityTracker {
 	return h.activity
 }
 
+// refreshActivityGrants re-stamps the retained activity book for a desktop
+// that just republished its device.online allowlist, so a revoked guest
+// loses poll access immediately instead of after the retained-book TTL.
+// Callers hold h.mu.
+func (h *Hub) refreshActivityGrants(p *peer) {
+	if h.activity == nil {
+		return
+	}
+	tr := h.activity
+	owner := p.id.RemoteUserID()
+	if h.selfHosted {
+		owner = p.id.DeviceID
+	}
+	grants := make(map[string]bool, len(p.grants))
+	for id := range p.grants {
+		grants[id] = true
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	book := tr.devices[p.id.DeviceID]
+	if book == nil {
+		return
+	}
+	book.owner, book.grants, book.updatedAt = owner, grants, time.Now()
+}
+
 // ConfigurePushWebhook enables forwarding deduplicated, redacted ActivityState
 // transitions to an external push bridge (APNs/FCM/ntfy/Gotify webhook). By
 // default only HTTPS URLs (or loopback when allowLocal is true) are accepted,
@@ -209,6 +235,12 @@ func (tr *activityTracker) pruneLocked(now time.Time) {
 
 func (h *Hub) serveActivity(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	ip := remoteIPAddr(r.RemoteAddr)
+	now := time.Now()
+	if !h.gate.allowRequest(ip, now) {
+		limitResponse(w, 0)
+		return
+	}
 	if r.Method == http.MethodPost {
 		h.serveActivityPublish(w, r)
 		return
@@ -231,8 +263,15 @@ func (h *Hub) serveActivityPublish(w http.ResponseWriter, r *http.Request) {
 		subtle.ConstantTimeCompare([]byte(ticket), []byte(host.pairTicket)) == 1 && host.live(now)
 	var owner string
 	var grants map[string]bool
-	if authorized && !h.selfHosted {
-		owner = host.id.RemoteUserID()
+	if authorized {
+		if h.selfHosted {
+			// Self-hosted grants are the paired-guest device IDs attached to
+			// the desktop's device.online; the owner key never matches a
+			// caller (callers are guests), so lookups stay grant-only.
+			owner = host.id.DeviceID
+		} else {
+			owner = host.id.RemoteUserID()
+		}
 		grants = make(map[string]bool, len(host.grants))
 		for k, v := range host.grants {
 			grants[k] = v
@@ -312,9 +351,7 @@ func (h *Hub) serveActivityPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) serveActivityPoll(w http.ResponseWriter, r *http.Request) {
-	if h.requireToken && !h.authorized(r) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="vanora-relay"`)
-		http.Error(w, "invalid relay token", http.StatusUnauthorized)
+	if h.requireToken && !h.authorizedReq(w, r) {
 		return
 	}
 	targetDevice := strings.TrimSpace(r.URL.Query().Get("activity"))
@@ -338,10 +375,14 @@ func (h *Hub) serveActivityPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	var callerUser string
+	caller := ""
 	if h.selfHosted {
 		if m.Certificate != "" {
 			http.Error(w, "certificate not allowed", http.StatusUnauthorized)
+			return
+		}
+		if !identity.ValidSelfDeviceID(targetDevice) {
+			http.Error(w, "unauthorized", http.StatusForbidden)
 			return
 		}
 		pubRaw, err := base64.RawURLEncoding.Strict().DecodeString(r.Header.Get("X-Vanora-Public-Key"))
@@ -359,6 +400,7 @@ func (h *Hub) serveActivityPoll(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "expired or invalid signature", http.StatusUnauthorized)
 			return
 		}
+		caller = devID
 	} else {
 		p, err := identity.VerifyCertificate(m.Certificate, h.key, now)
 		if err != nil || (h.allowedIssuer != "" && p.Issuer != h.allowedIssuer) || m.From != p.DeviceID || p.DeviceID == targetDevice {
@@ -370,7 +412,7 @@ func (h *Hub) serveActivityPoll(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "expired or invalid signature", http.StatusUnauthorized)
 			return
 		}
-		callerUser = p.RemoteUserID()
+		caller = p.RemoteUserID()
 	}
 
 	tr := h.ensureActivityTracker()
@@ -378,20 +420,25 @@ func (h *Hub) serveActivityPoll(w http.ResponseWriter, r *http.Request) {
 	tr.pruneLocked(now)
 	book := tr.devices[targetDevice]
 	var items []ActivityState
-	allowed := true
-	if !h.selfHosted {
-		// Enforce single-site account / guest ACL before returning activity metadata.
-		h.mu.Lock()
-		liveHost := h.peers[targetDevice]
-		if liveHost != nil && liveHost.online && liveHost.live(now) {
-			allowed = liveHost.id.RemoteUserID() == callerUser || liveHost.grants[callerUser]
-		} else if book != nil {
-			allowed = book.owner != "" && (book.owner == callerUser || book.grants[callerUser])
+	allowed := false
+	// Enforce account / guest (official) and paired-device (self-hosted) ACL
+	// before returning activity metadata.
+	h.mu.Lock()
+	liveHost := h.peers[targetDevice]
+	if liveHost != nil && liveHost.online && liveHost.live(now) {
+		if h.selfHosted {
+			allowed = liveHost.grants[caller]
 		} else {
-			allowed = false
+			allowed = liveHost.id.RemoteUserID() == caller || liveHost.grants[caller]
 		}
-		h.mu.Unlock()
+	} else if book != nil {
+		if h.selfHosted {
+			allowed = book.grants[caller]
+		} else {
+			allowed = book.owner != "" && (book.owner == caller || book.grants[caller])
+		}
 	}
+	h.mu.Unlock()
 	if allowed && book != nil {
 		items = make([]ActivityState, 0, len(book.sessions))
 		for _, st := range book.sessions {

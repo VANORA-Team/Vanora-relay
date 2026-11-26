@@ -358,7 +358,9 @@ func (c *Client) Connect(deviceID, ownerID string) error {
 			return pairing.ErrInvalid
 		}
 	}
+	c.mu.Lock()
 	c.officialInvite = nil
+	c.mu.Unlock()
 	return c.selectDesktop(deviceID, ownerID, false)
 }
 
@@ -418,8 +420,10 @@ func (c *Client) Pair(input, signalURL, relayToken, clientName string) error {
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
+	c.mu.Lock()
 	c.deviceName = clientName
 	c.officialInvite = &target
+	c.mu.Unlock()
 	return c.selectDesktop(target.Device, target.Owner, true)
 }
 
@@ -437,7 +441,10 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
-	if c.lanTarget != nil && c.lanTarget.Address != target.Address && c.lanTarget.Pin == target.Pin {
+	c.mu.Lock()
+	samePinDifferentAddr := c.lanTarget != nil && c.lanTarget.Address != target.Address && c.lanTarget.Pin == target.Pin
+	c.mu.Unlock()
+	if samePinDifferentAddr {
 		c.mu.Lock()
 		old := c.peer
 		c.detachLocked()
@@ -446,12 +453,16 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 			old.Close()
 		}
 	}
+	c.mu.Lock()
 	c.lanTarget = &target
 	c.lanName = clientName
+	c.mu.Unlock()
 	if err := c.selectDesktop(target.Pin, "lan", target.Token != ""); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.lanTarget.Token = ""
+	c.mu.Unlock()
 	return nil
 }
 
@@ -459,10 +470,13 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 func (c *Client) LANAddress() string {
 	c.op.Lock()
 	defer c.op.Unlock()
-	if c.lanTarget == nil || c.lanTarget.Token != "" {
+	c.mu.Lock()
+	target := c.lanTarget
+	c.mu.Unlock()
+	if target == nil || target.Token != "" {
 		return ""
 	}
-	return c.lanTarget.Link()
+	return target.Link()
 }
 
 // ConnectSelfRelay pairs with a desktop through a self-hosted relay using a
@@ -505,7 +519,11 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 		c.group = nil
 		c.mu.Unlock()
 	}
-	if c.selfTarget != nil && (c.selfTarget.SignalURL != target.SignalURL || c.selfTarget.Token != target.Token) && c.selfTarget.Pin == target.Pin {
+	c.mu.Lock()
+	prev := c.selfTarget
+	switchedRelay := prev != nil && (prev.SignalURL != target.SignalURL || prev.Token != target.Token) && prev.Pin == target.Pin
+	c.mu.Unlock()
+	if switchedRelay {
 		c.mu.Lock()
 		old := c.peer
 		c.detachLocked()
@@ -514,12 +532,16 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 			old.Close()
 		}
 	}
+	c.mu.Lock()
 	c.selfTarget = &target
 	c.selfName = clientName
+	c.mu.Unlock()
 	if err := c.selectDesktop(target.Pin, "self", target.Pair != ""); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.selfTarget.Pair = ""
+	c.mu.Unlock()
 	return nil
 }
 
@@ -528,10 +550,13 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 func (c *Client) SelfRelayTarget() string {
 	c.op.Lock()
 	defer c.op.Unlock()
-	if c.selfTarget == nil || c.selfTarget.Pair != "" {
+	c.mu.Lock()
+	target := c.selfTarget
+	c.mu.Unlock()
+	if target == nil || target.Pair != "" {
 		return ""
 	}
-	return c.selfTarget.Link()
+	return target.Link()
 }
 
 func (c *Client) selectDesktop(deviceID, ownerID string, freshInvite bool) error {
@@ -671,13 +696,20 @@ func (c *Client) connectLocked() error {
 }
 
 func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) {
-	if c.lanTarget != nil {
+	c.mu.Lock()
+	lanT := c.lanTarget
+	selfT := c.selfTarget
+	selfName := c.selfName
+	c.mu.Unlock()
+	if lanT != nil {
 		return c.dialLANPeer()
 	}
-	if c.selfTarget != nil {
-		p, start, err := selfrelay.Dial(c.ctx, *c.selfTarget, c.selfKey, c.selfName, (*handler)(c))
+	if selfT != nil {
+		p, start, err := selfrelay.Dial(c.ctx, *selfT, c.selfKey, selfName, (*handler)(c))
 		if err == nil {
-			c.selfTarget.Pair = ""
+			c.mu.Lock()
+			selfT.Pair = ""
+			c.mu.Unlock()
 		}
 		return p, start, err
 	}
@@ -688,7 +720,10 @@ func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) 
 	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
 	defer stop()
 	var pin, token []byte
-	if target := c.officialInvite; target != nil {
+	c.mu.Lock()
+	target := c.officialInvite
+	c.mu.Unlock()
+	if target != nil {
 		pin, token = target.Pin, target.Token
 	} else if c.identity != nil {
 		bound, ok := c.desktopBinding(device)
@@ -701,14 +736,21 @@ func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) 
 		}
 	}
 	p, err := s.ConnectPaired(ctx, device, owner, pin, token)
-	if err == nil && c.officialInvite != nil {
-		bound := account.PeerBinding{Owner: owner, Pin: base64.RawURLEncoding.EncodeToString(pin)}
-		group, _ := c.identity.PairingIdentity(c.url, "mobile")
-		if err := c.identity.BindNetworkPeer(group, device, bound); err != nil {
-			p.Close()
-			return nil, nil, err
+	if err == nil {
+		c.mu.Lock()
+		official := c.officialInvite
+		c.mu.Unlock()
+		if official != nil {
+			bound := account.PeerBinding{Owner: owner, Pin: base64.RawURLEncoding.EncodeToString(pin)}
+			group, _ := c.identity.PairingIdentity(c.url, "mobile")
+			if err := c.identity.BindNetworkPeer(group, device, bound); err != nil {
+				p.Close()
+				return nil, nil, err
+			}
+			c.mu.Lock()
+			c.officialInvite = nil
+			c.mu.Unlock()
 		}
-		c.officialInvite = nil
 	}
 	return p, nil, err
 }
@@ -754,12 +796,12 @@ func (c *Client) disconnect() {
 	if c.mesh != nil && !c.child {
 		c.closeChildren()
 	}
+	c.mu.Lock()
 	c.lanTarget = nil
 	c.lanName = ""
 	c.selfTarget = nil
 	c.selfName = ""
 	c.officialInvite = nil
-	c.mu.Lock()
 	p := c.peer
 	c.device = ""
 	c.owner = ""

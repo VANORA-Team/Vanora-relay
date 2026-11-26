@@ -52,24 +52,28 @@ func (c *Client) networkBinding(id string) (*pairnet.Group, pairnet.Member, pair
 	var local pairnet.Member
 	remote := pairnet.Member{ID: id, Pin: id, Role: "desktop"}
 	invited := false
+	c.mu.Lock()
+	lanTarget, lanName := c.lanTarget, c.lanName
+	selfTarget, selfName := c.selfTarget, c.selfName
+	officialInvite, deviceName := c.officialInvite, c.deviceName
+	c.mu.Unlock()
 	switch {
-	case c.lanTarget != nil:
+	case lanTarget != nil:
 		key := lan.ClientID(c.lanKey)
-		local = pairnet.Member{ID: key, Pin: key, Role: "mobile", Name: c.lanName}
+		local = pairnet.Member{ID: key, Pin: key, Role: "mobile", Name: lanName}
 		group = c.book.Group("lan", key)
-		remote.Address = c.lanTarget.Address
-		invited = c.lanTarget.Token != ""
-	case c.selfTarget != nil:
+		remote.Address = lanTarget.Address
+		invited = lanTarget.Token != ""
+	case selfTarget != nil:
 		key, pin := selfrelay.ClientIdentity(c.selfKey)
-		local = pairnet.Member{ID: key, Pin: pin, Role: "mobile", Name: c.selfName}
-		group = c.book.Group(c.selfTarget.SignalURL, key)
-		invited = c.selfTarget.Pair != ""
+		local = pairnet.Member{ID: key, Pin: pin, Role: "mobile", Name: selfName}
+		group = c.book.Group(selfTarget.SignalURL, key)
+		invited = selfTarget.Pair != ""
 	case c.identity != nil:
 		group, local = c.identity.PairingIdentity(c.url, "mobile")
-		local.Name = c.deviceName
-		if c.officialInvite != nil {
-			remote.Owner, remote.Pin = c.officialInvite.Owner, base64.RawURLEncoding.EncodeToString(c.officialInvite.Pin)
-			invited = true
+		local.Name = deviceName
+		if officialInvite != nil {
+			remote.Owner, remote.Pin = officialInvite.Owner, base64.RawURLEncoding.EncodeToString(officialInvite.Pin)
 		} else {
 			peer, _ := c.desktopBinding(id)
 			remote.Owner, remote.Pin = peer.Owner, peer.Pin
@@ -152,7 +156,12 @@ func (c *Client) openDesktop(group *pairnet.Group, member pairnet.Member) (*Clie
 	child := newClient(c.url, c.source)
 	child.child, child.mesh, child.scopeTarget = true, c.mesh, member.ID
 	child.identity, child.book, child.lanKey, child.selfKey = c.identity, c.book, c.lanKey, c.selfKey
-	child.deviceName = c.deviceName
+	c.mu.Lock()
+	name := c.deviceName
+	c.mu.Unlock()
+	child.mu.Lock()
+	child.deviceName = name
+	child.mu.Unlock()
 	c.mesh.children[member.ID] = child
 	var err error
 	switch {

@@ -305,7 +305,9 @@ func TestActivitySelfHostedEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("self-hosted activity poll status = %d, want 200", resp.StatusCode)
+	// The polling key never paired with the target desktop, so the self-hosted
+	// read ACL must refuse metadata access.
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("self-hosted activity poll status = %d, want 403", resp.StatusCode)
 	}
 }

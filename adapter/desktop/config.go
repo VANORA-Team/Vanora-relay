@@ -77,6 +77,9 @@ type RetentionConfig struct {
 	MaxEvents   int   `json:"max_events,omitempty"`
 	MaxBytes    int64 `json:"max_bytes,omitempty"`
 	MaxRequests int   `json:"max_requests,omitempty"`
+	// MaxCreatedSessions caps concurrently open session.create sessions per
+	// workspace. Remote guests cannot grow state.json without bound.
+	MaxCreatedSessions int `json:"max_created_sessions,omitempty"`
 }
 
 const (
@@ -184,10 +187,14 @@ const (
 	defaultMaxEvents   = 4096
 	defaultMaxBytes    = int64(4 << 20)
 	defaultMaxRequests = 4096
-	defaultMaxText     = 64 << 10
-	maxMaxText         = 1 << 20
-	defaultMaxSnapshot = 16 << 20
-	maxMaxSnapshot     = 48 << 20
+	// defaultMaxCreatedSessions bounds guest-driven session.create growth per
+	// workspace; maxMaxCreatedSessions is the ceiling a config may raise it to.
+	defaultMaxCreatedSessions = 64
+	maxMaxCreatedSessions     = 1024
+	defaultMaxText            = 64 << 10
+	maxMaxText                = 1 << 20
+	defaultMaxSnapshot        = 16 << 20
+	maxMaxSnapshot            = 48 << 20
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
@@ -476,9 +483,10 @@ func normalizeConfig(cfg *Config) (*normalizedConfig, error) {
 	}
 	out := &normalizedConfig{
 		retention: RetentionConfig{
-			MaxEvents:   cfg.Retention.MaxEvents,
-			MaxBytes:    cfg.Retention.MaxBytes,
-			MaxRequests: cfg.Retention.MaxRequests,
+			MaxEvents:          cfg.Retention.MaxEvents,
+			MaxBytes:           cfg.Retention.MaxBytes,
+			MaxRequests:        cfg.Retention.MaxRequests,
+			MaxCreatedSessions: cfg.Retention.MaxCreatedSessions,
 		},
 		allowSlash:      cfg.AllowSlashCommands,
 		publishActivity: cfg.PublishActivity,
@@ -487,7 +495,7 @@ func normalizeConfig(cfg *Config) (*normalizedConfig, error) {
 		byID:            make(map[string]*normalizedSession),
 		workspacesByID:  make(map[string]*normalizedWorkspace),
 	}
-	if out.retention.MaxEvents < 0 || out.retention.MaxBytes < 0 || out.retention.MaxRequests < 0 {
+	if out.retention.MaxEvents < 0 || out.retention.MaxBytes < 0 || out.retention.MaxRequests < 0 || out.retention.MaxCreatedSessions < 0 {
 		return nil, errors.New("desktop: retention values must not be negative")
 	}
 	if out.retention.MaxEvents == 0 {
@@ -507,6 +515,12 @@ func normalizeConfig(cfg *Config) (*normalizedConfig, error) {
 	}
 	if out.retention.MaxRequests > 100_000 {
 		return nil, errors.New("desktop: retention.max_requests is too large")
+	}
+	if out.retention.MaxCreatedSessions == 0 {
+		out.retention.MaxCreatedSessions = defaultMaxCreatedSessions
+	}
+	if out.retention.MaxCreatedSessions > maxMaxCreatedSessions {
+		return nil, errors.New("desktop: retention.max_created_sessions is too large")
 	}
 	if out.maxText == 0 {
 		out.maxText = defaultMaxText

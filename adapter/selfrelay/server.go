@@ -20,6 +20,17 @@ import (
 	"vanora-relay/protocol"
 )
 
+// maxPeerLinksPerClient bounds concurrent live links one paired client may
+// open toward this desktop. Every link owns a WebRTC peer connection and
+// goroutines, so an otherwise idle authenticated peer must not be able to
+// pin unbounded resources.
+const maxPeerLinksPerClient = 8
+
+// maxSeenConns bounds the connect.request replay-dedup window per relay
+// session. Eviction is oldest-first; a wholesale clear would let a captured
+// connect.request replay once after every reset.
+const maxSeenConns = 4096
+
 type serverState struct {
 	Key     string                           `json:"key"`
 	Clients map[string]ClientInfo            `json:"clients"`
@@ -28,13 +39,15 @@ type serverState struct {
 }
 
 type runningConn struct {
-	signalURL  string
-	relayToken string
-	name       string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	seenConns  map[string]struct{}
+	signalURL     string
+	relayToken    string
+	name          string
+	ctx           context.Context
+	cancel        context.CancelFunc
+	done          chan struct{}
+	seenConns     map[string]struct{}
+	seenConnOrder []string
+	guestRefresh  chan struct{}
 }
 
 // Server owns the desktop's self-hosted Ed25519 key, one-time pairing
@@ -378,6 +391,9 @@ func (s *Server) closeRemoved() {
 			s.state = next
 		}
 	}
+	// Roster changes can revoke vouches that never had a state entry, so
+	// always refresh the published guest list.
+	s.requestGuestRefreshLocked()
 	var closed []*peerLink
 	for id, links := range s.clientLinks {
 		if s.group != nil && !s.group.Allows(id) {
@@ -469,13 +485,14 @@ func (s *Server) Connect(ctx context.Context, rawSignalURL, relayToken, desktopN
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	entry := &runningConn{
-		signalURL:  signalURL,
-		relayToken: relayToken,
-		name:       name,
-		ctx:        runCtx,
-		cancel:     cancel,
-		done:       make(chan struct{}),
-		seenConns:  make(map[string]struct{}),
+		signalURL:    signalURL,
+		relayToken:   relayToken,
+		name:         name,
+		ctx:          runCtx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		seenConns:    make(map[string]struct{}),
+		guestRefresh: make(chan struct{}, 1),
 	}
 	s.running = entry
 	s.group = s.db.Group(signalURL, s.pin)
@@ -547,6 +564,64 @@ func (s *Server) networkClient(id string) (ClientInfo, bool) {
 		return client, true
 	}
 	return ClientInfo{ID: id, PublicKey: member.Pin, Name: member.Name, Role: member.Role, Access: Read, Epoch: member.Epoch}, true
+}
+
+// guestDeviceIDs returns the sorted self-device IDs the desktop currently
+// authorizes. It is republished with device.online so the relay can enforce
+// the activity-poll read ACL for self-hosted nodes.
+func (s *Server) guestDeviceIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.guestDeviceIDsLocked()
+}
+
+func (s *Server) guestDeviceIDsLocked() []string {
+	ids := make([]string, 0, len(s.state.Clients)+4)
+	seen := make(map[string]struct{}, len(s.state.Clients)+4)
+	add := func(client ClientInfo, ok bool) {
+		if !ok {
+			return
+		}
+		pub, err := base64.RawURLEncoding.Strict().DecodeString(client.PublicKey)
+		if err != nil || len(pub) != ed25519.PublicKeySize {
+			return
+		}
+		devID, err := identity.SelfDeviceID(ed25519.PublicKey(pub))
+		if err != nil || devID == s.deviceID {
+			return
+		}
+		if _, dup := seen[devID]; !dup {
+			seen[devID] = struct{}{}
+			ids = append(ids, devID)
+		}
+	}
+	for id := range s.state.Clients {
+		add(s.networkClient(id))
+	}
+	if s.group != nil {
+		for _, member := range s.group.Snapshot().Members() {
+			add(s.networkClient(member.ID))
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// requestGuestRefresh asks the relay session to republish device.online with
+// the current guest list. Safe to call with or without s.mu held.
+func (s *Server) requestGuestRefreshLocked() {
+	if entry := s.running; entry != nil {
+		select {
+		case entry.guestRefresh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Server) requestGuestRefresh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requestGuestRefreshLocked()
 }
 
 // Status returns a snapshot of the self-hosted relay channel, paired clients,
@@ -810,16 +885,20 @@ func (s *Server) runOnce(entry *runningConn) error {
 		return writeSignal(entry.ctx, ws, m)
 	}
 
-	card := protocol.Message{Type: "device.card", From: s.deviceID, To: "self"}
-	if err := card.Sign(s.priv, []byte(entry.name)); err != nil {
-		return err
+	publishOnline := func() error {
+		card := protocol.Message{Type: "device.card", From: s.deviceID, To: "self"}
+		if err := card.Sign(s.priv, []byte(entry.name)); err != nil {
+			return err
+		}
+		return send(protocol.Message{
+			Type: "device.online",
+			Data: protocol.Encode(struct {
+				Card   protocol.Message `json:"card"`
+				Guests []string         `json:"guests"`
+			}{Card: card, Guests: s.guestDeviceIDs()}),
+		})
 	}
-	if err := send(protocol.Message{
-		Type: "device.online",
-		Data: protocol.Encode(struct {
-			Card protocol.Message `json:"card"`
-		}{Card: card}),
-	}); err != nil {
+	if err := publishOnline(); err != nil {
 		return err
 	}
 	reg, err := readSignal(entry.ctx, ws)
@@ -845,6 +924,13 @@ func (s *Server) runOnce(entry *runningConn) error {
 	}()
 
 	for {
+		select {
+		case <-entry.guestRefresh:
+			if err := publishOnline(); err != nil {
+				return err
+			}
+		default:
+		}
 		m, err := readSignal(sessionCtx, ws)
 		if err != nil {
 			return err
@@ -1001,6 +1087,18 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 
 	uid := userID(client)
 	clientID := client.ID
+
+	s.mu.Lock()
+	if s.running != entry || entry.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	if len(s.clientLinks[clientID]) >= maxPeerLinksPerClient {
+		s.mu.Unlock()
+		s.rejectRequest(send, m)
+		return
+	}
+	s.mu.Unlock()
 	l := newPeerLink(
 		ctx,
 		sess,
@@ -1027,13 +1125,20 @@ func (s *Server) handleConnectRequest(ctx context.Context, entry *runningConn, s
 		s.mu.Unlock()
 		return
 	}
-	if len(entry.seenConns) >= 4096 {
-		clear(entry.seenConns)
-		for activeID := range s.links {
-			entry.seenConns[activeID] = struct{}{}
+	if len(s.clientLinks[clientID]) >= maxPeerLinksPerClient {
+		s.mu.Unlock()
+		s.rejectRequest(send, m)
+		return
+	}
+	if len(entry.seenConns) >= maxSeenConns {
+		for len(entry.seenConnOrder) > 0 && len(entry.seenConns) >= maxSeenConns {
+			evict := entry.seenConnOrder[0]
+			entry.seenConnOrder = entry.seenConnOrder[1:]
+			delete(entry.seenConns, evict)
 		}
 	}
 	entry.seenConns[l.id] = struct{}{}
+	entry.seenConnOrder = append(entry.seenConnOrder, l.id)
 	s.links[l.id] = l
 	if s.clientLinks[clientID] == nil {
 		s.clientLinks[clientID] = make(map[*peerLink]struct{})
@@ -1076,6 +1181,7 @@ func (s *Server) authorizePeer(entry *runningConn, connID string, mobilePub ed25
 		local, _ := s.group.Get(s.pin)
 		if !known && local.Epoch <= 1 && admit(false) == nil {
 			existing, paired = s.networkClient(fp)
+			s.requestGuestRefreshLocked()
 		}
 	}
 	if paired && pairProofB64 == "" {
@@ -1145,5 +1251,6 @@ func (s *Server) authorizePeer(entry *runningConn, connID string, mobilePub ed25
 	}
 	delete(s.invitations, matchedToken)
 	s.retireLocked(matchedInv.ID)
+	s.requestGuestRefreshLocked()
 	return client, true
 }

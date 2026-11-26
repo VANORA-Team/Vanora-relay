@@ -248,11 +248,14 @@ func (c *Client) AddRoute(address string) error {
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
-	if c.lanKey == "" || c.lanTarget == nil {
+	c.mu.Lock()
+	hasLAN := c.lanKey != "" && c.lanTarget != nil
+	c.mu.Unlock()
+	if !hasLAN {
 		return errors.New("alternate IP routes require a paired LAN/tailnet desktop")
 	}
 	c.mu.Lock()
-	if c.lanTarget.Address != norm && !slices.Contains(c.altLANRoutes, norm) {
+	if c.lanTarget != nil && c.lanTarget.Address != norm && !slices.Contains(c.altLANRoutes, norm) {
 		c.altLANRoutes = append(c.altLANRoutes, norm)
 	}
 	c.mu.Unlock()
@@ -269,11 +272,11 @@ func (c *Client) RemoveRoute(address string) error {
 	}
 	c.op.Lock()
 	defer c.op.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.lanTarget == nil {
 		return errors.New("no paired LAN/tailnet desktop")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	all := c.lanCandidateEntriesLocked()
 	if len(all) <= 1 {
 		return errors.New("cannot remove the last route")
@@ -325,6 +328,7 @@ func (c *Client) lanCandidateEntriesLocked() []routes.Entry {
 func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
 	c.mu.Lock()
 	base := *c.lanTarget
+	lanName := c.lanName
 	entries := c.lanCandidateEntriesLocked()
 	c.mu.Unlock()
 	if len(entries) == 0 {
@@ -332,9 +336,11 @@ func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
 	}
 	// First-time pairing with a one-time token must only go to the exact invited address.
 	if base.Token != "" {
-		p, start, err := lan.Dial(c.ctx, base, c.lanKey, c.lanName, (*handler)(c))
+		p, start, err := lan.Dial(c.ctx, base, c.lanKey, lanName, (*handler)(c))
 		if err == nil {
+			c.mu.Lock()
 			c.lanTarget.Token = ""
+			c.mu.Unlock()
 		}
 		return p, start, err
 	}
@@ -365,7 +371,7 @@ func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
 				continue
 			}
 		}
-		p, start, err := lan.Dial(c.ctx, t, c.lanKey, c.lanName, (*handler)(c))
+		p, start, err := lan.Dial(c.ctx, t, c.lanKey, lanName, (*handler)(c))
 		if err == nil {
 			c.mu.Lock()
 			if c.lanTarget != nil && c.lanTarget.Pin == base.Pin {

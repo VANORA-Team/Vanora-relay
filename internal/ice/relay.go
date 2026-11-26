@@ -301,5 +301,5 @@ func (s *Server) allocationDeleted(srcAddr, dstAddr net.Addr, protocol, _, _ str
 }
 
 func allocationKey(protocol string, srcAddr, dstAddr net.Addr) string {
-	return protocol + "|" + srcAddr.String() + "|" + dstAddr.String()
+	return srcAddr.Network() + "|" + protocol + "|" + srcAddr.String() + "|" + dstAddr.String()
 }

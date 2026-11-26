@@ -62,6 +62,7 @@ type Hub struct {
 	links         map[string]*link
 	invites       map[string]*peer
 	activity      *activityTracker
+	gate          unauthGate
 }
 
 type peer struct {
@@ -105,6 +106,8 @@ func New(key ed25519.PublicKey, entitlement EntitlementVerifier, network iceServ
 		slots:        make(chan struct{}, maxAuthenticatedSlots),
 		peers:        make(map[string]*peer),
 		links:        make(map[string]*link),
+		invites:      make(map[string]*peer),
+		gate:         newUnauthGate(),
 	}
 }
 
@@ -121,6 +124,8 @@ func NewSelfHosted(accessToken string, network iceService) *Hub {
 		slots:        make(chan struct{}, maxAuthenticatedSlots),
 		peers:        make(map[string]*peer),
 		links:        make(map[string]*link),
+		invites:      make(map[string]*peer),
+		gate:         newUnauthGate(),
 	}
 	if accessToken != "" {
 		h.RequireAccessToken(accessToken)
@@ -297,14 +302,24 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			return errors.New("invalid_device")
 		}
 		if h.selfHosted {
-			if d.Card.Certificate != "" || len(d.Guests) != 0 || d.Card.Type != "device.card" || d.Card.From != p.id.DeviceID || d.Card.To != "self" || d.Card.Connection != "" || d.Card.Round != 0 || d.Card.Seq != 0 {
+			if d.Card.Certificate != "" || len(d.Guests) > 256 || d.Card.Type != "device.card" || d.Card.From != p.id.DeviceID || d.Card.To != "self" || d.Card.Connection != "" || d.Card.Round != 0 || d.Card.Seq != 0 {
 				return errors.New("invalid_device")
 			}
 			nameBytes, err := d.Card.Verify(p.id.PublicKey)
 			if err != nil || !validSelfName(string(nameBytes)) {
 				return errors.New("invalid_device")
 			}
-			p.card, p.online = d.Card, true
+			// Self-hosted guests are the paired device IDs the desktop currently
+			// authorizes; the activity poll uses them as the read ACL.
+			grants := make(map[string]bool, len(d.Guests))
+			for _, id := range d.Guests {
+				if id == p.id.DeviceID || !identity.ValidSelfDeviceID(id) {
+					return errors.New("invalid_guest")
+				}
+				grants[id] = true
+			}
+			p.card, p.grants, p.online = d.Card, grants, true
+			h.refreshActivityGrants(p)
 			p.registered()
 			return nil
 		}
@@ -322,6 +337,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			grants[id] = true
 		}
 		p.card, p.grants, p.online = d.Card, grants, true
+		h.refreshActivityGrants(p)
 		for _, l := range h.links {
 			if l.host == p && !p.allows(l.phone) {
 				h.drop(l, "access_revoked")

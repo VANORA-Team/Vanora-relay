@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/dialretry"
 	"vanora-relay/protocol"
 )
 
@@ -855,7 +856,16 @@ func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed
 		return http.ErrUseLastResponse
 	}}
 	header := http.Header{"Authorization": []string{"Bearer " + relayToken}}
-	ws, resp, err := websocket.Dial(dctx, signalURL, &websocket.DialOptions{HTTPClient: httpClient, HTTPHeader: header})
+	var ws *websocket.Conn
+	var resp *http.Response
+	err = dialretry.Dial(dctx, func() error {
+		var derr error
+		ws, resp, derr = websocket.Dial(dctx, signalURL, &websocket.DialOptions{HTTPClient: httpClient, HTTPHeader: header})
+		if derr != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return derr
+	})
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			return nil, ErrUnauthorized

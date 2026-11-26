@@ -59,6 +59,24 @@ func (h *Hub) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(h.accessToken[:], presented[:]) == 1
 }
 
+// authorizedReq performs the bearer check and, on failure, charges the
+// per-IP gate. Repeated failures lock the source IP out with 429s before
+// the token is hashed again, which throttles token guessing.
+func (h *Hub) authorizedReq(w http.ResponseWriter, r *http.Request) bool {
+	if h.authorized(r) {
+		return true
+	}
+	ip := remoteIPAddr(r.RemoteAddr)
+	now := time.Now()
+	if h.gate.recordTokenFailure(ip, now) {
+		limitResponse(w, h.gate.lockRemaining(ip, now))
+		return false
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="vanora-relay"`)
+	http.Error(w, "invalid relay token", http.StatusUnauthorized)
+	return false
+}
+
 func remoteIPAddr(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -107,9 +125,7 @@ func (h *Hub) acquirePreAuth(ip string) (func(), int) {
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Query().Get("probe") == "1" {
 		w.Header().Set("Cache-Control", "no-store")
-		if h.requireToken && !h.authorized(r) {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="vanora-relay"`)
-			http.Error(w, "invalid relay token", http.StatusUnauthorized)
+		if h.requireToken && !h.authorizedReq(w, r) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -127,9 +143,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.requireToken && !h.authorized(r) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="vanora-relay"`)
-		http.Error(w, "invalid relay token", http.StatusUnauthorized)
+	if h.requireToken && !h.authorizedReq(w, r) {
 		return
 	}
 	clientIP := remoteIPAddr(r.RemoteAddr)
@@ -362,11 +376,20 @@ func (p *peer) registered() {
 
 func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	ip := remoteIPAddr(r.RemoteAddr)
+	now := time.Now()
+	if !h.gate.allowRequest(ip, now) {
+		limitResponse(w, 0)
+		return
+	}
 	if r.Method == http.MethodGet {
-		h.mu.Lock()
 		locator := r.URL.Query().Get("pairing")
+		if !validPairingLocator(locator) {
+			http.NotFound(w, r)
+			return
+		}
+		h.mu.Lock()
 		host := h.invites[locator]
-		now := time.Now()
 		var box string
 		if host != nil && host.live(now) {
 			if invite := host.invites[locator]; now.Before(invite.Expires) {
@@ -400,8 +423,7 @@ func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	now := time.Now()
-	if h.peers[device] != host || !host.live(now) {
+	if h.peers[device] != host || host == nil || !host.live(now) {
 		http.Error(w, "offline", http.StatusConflict)
 		return
 	}
@@ -430,4 +452,15 @@ func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
 	h.invites[record.Locator] = host
 	host.invites[record.Locator] = record
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// validPairingLocator filters obviously malformed locators (43-char base64url
+// encoding of 32 bytes) before the hub lock is taken so garbage floods never
+// contend with signaling.
+func validPairingLocator(locator string) bool {
+	if len(locator) != 43 {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(locator)
+	return err == nil && len(raw) == 32
 }

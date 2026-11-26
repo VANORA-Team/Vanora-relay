@@ -309,7 +309,15 @@ func (g *Group) Merge(sender string, incoming Roster) (bool, error) {
 		if incoming[sender].Epoch < r[sender].Epoch {
 			return nil
 		}
-		rejoining := incoming[g.self].Active() && incoming[g.self].Epoch > r[g.self].Epoch
+		// Desktop members own the highest tier of roster authority: a
+		// rejoin wipe (clearing the whole roster on epoch bump) is only
+		// accepted from a desktop. Introducing members, name/address
+		// updates, and epoch advances (evictions) remain open to every
+		// member, matching the documented "every member manages the
+		// roster" pairing semantics that phone relayed pairing and
+		// removal rely on.
+		fromDesktop := r[sender].Role == "desktop"
+		rejoining := fromDesktop && incoming[g.self].Active() && incoming[g.self].Epoch > r[g.self].Epoch
 		if rejoining {
 			local, peer := r[g.self], r[sender]
 			clear(r)

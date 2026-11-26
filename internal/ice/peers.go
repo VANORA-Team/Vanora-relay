@@ -19,9 +19,12 @@ var blockedPeerPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
 	netip.MustParsePrefix("240.0.0.0/4"),     // reserved and broadcast
 	netip.MustParsePrefix("::/96"),           // deprecated IPv4-compatible IPv6
+	netip.MustParsePrefix("64:ff9b::/96"),    // well-known NAT64 prefix
 	netip.MustParsePrefix("64:ff9b:1::/48"),  // local-use NAT64
 	netip.MustParsePrefix("2001::/32"),       // Teredo
 	netip.MustParsePrefix("2001:10::/28"),    // ORCHID
+	netip.MustParsePrefix("2001:20::/28"),    // ORCHIDv2
+	netip.MustParsePrefix("2002::/16"),       // deprecated 6to4
 	netip.MustParsePrefix("2001:db8::/32"),   // documentation
 	netip.MustParsePrefix("fec0::/10"),       // deprecated site-local
 }
