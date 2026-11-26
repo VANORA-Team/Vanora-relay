@@ -1,7 +1,6 @@
 // Package membership talks to Vanora's internal membership service.
 //
-// The only operation exposed here is an entitlement check. The service
-// authenticates relay nodes with a high-entropy bearer token and resolves the
+// The service authenticates relay nodes with a high-entropy bearer token and resolves the
 // caller-supplied issuer/subject pair against an existing, verified OAuth
 // linkage. The check is intentionally fail-closed: configuration errors,
 // transport errors, non-200 responses, malformed payloads, and timestamps in
@@ -96,14 +95,31 @@ type entitlementRequest struct {
 }
 
 type entitlementData struct {
-	RelayAllowed bool  `json:"relay_allowed"`
-	ValidUntil   int64 `json:"valid_until"`
+	RelayAllowed         bool            `json:"relay_allowed"`
+	ValidUntil           int64           `json:"valid_until"`
+	TunnelAllowed        json.RawMessage `json:"tunnel_allowed"`
+	TunnelConnectAllowed json.RawMessage `json:"tunnel_connect_allowed"`
+	MaxTunnels           json.RawMessage `json:"max_tunnels"`
+	TunnelValidUntil     json.RawMessage `json:"tunnel_valid_until"`
 }
 
 type entitlementEnvelope struct {
 	Success bool             `json:"success"`
 	Message string           `json:"message"`
 	Data    *entitlementData `json:"data"`
+}
+
+// Entitlement is a successful membership lookup. A positive TunnelAllowed
+// or an active TURN grant establishes account eligibility. Legacy TURN
+// denials are also used for missing and disabled accounts.
+type Entitlement struct {
+	RelayAllowed         bool
+	ValidUntil           time.Time
+	TunnelAllowed        *bool
+	TunnelConnectAllowed *bool
+	MaxTunnels           *int
+	TunnelValidUntil     *int64
+	TunnelFieldsInvalid  bool
 }
 
 // Check returns the end of the caller's relay entitlement, or the zero time
@@ -114,7 +130,57 @@ type entitlementEnvelope struct {
 // error means the answer could not be established and the caller must treat
 // the identity as unentitled.
 func (c *Client) Check(ctx context.Context, issuer, subject string) (time.Time, error) {
-	var zero time.Time
+	data, err := c.lookup(ctx, issuer, subject)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if end := data.relayEnd(); data.RelayAllowed && end.After(time.Now()) {
+		return end, nil
+	}
+	return time.Time{}, nil
+}
+
+// Lookup retrieves the relay grant and optional tunnel-specific overrides.
+// Malformed tunnel overrides are flagged independently of the relay grant.
+func (c *Client) Lookup(ctx context.Context, issuer, subject string) (Entitlement, error) {
+	data, err := c.lookup(ctx, issuer, subject)
+	if err != nil {
+		return Entitlement{}, err
+	}
+	ent := Entitlement{RelayAllowed: data.RelayAllowed, ValidUntil: data.relayEnd()}
+	ent.TunnelAllowed = tunnelField[bool](data.TunnelAllowed, &ent.TunnelFieldsInvalid)
+	ent.TunnelConnectAllowed = tunnelField[bool](data.TunnelConnectAllowed, &ent.TunnelFieldsInvalid)
+	ent.MaxTunnels = tunnelField[int](data.MaxTunnels, &ent.TunnelFieldsInvalid)
+	ent.TunnelValidUntil = tunnelField[int64](data.TunnelValidUntil, &ent.TunnelFieldsInvalid)
+	if ent.MaxTunnels != nil && (*ent.MaxTunnels < 0 || *ent.MaxTunnels > 10000) {
+		ent.TunnelFieldsInvalid = true
+	}
+	if ent.TunnelAllowed != nil && *ent.TunnelAllowed && ent.TunnelValidUntil != nil && *ent.TunnelValidUntil <= 0 {
+		ent.TunnelFieldsInvalid = true
+	}
+	return ent, nil
+}
+
+func tunnelField[T any](raw json.RawMessage, invalid *bool) *T {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value *T
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+		*invalid = true
+	}
+	return value
+}
+
+func (d entitlementData) relayEnd() time.Time {
+	if d.ValidUntil <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(d.ValidUntil, 0).UTC()
+}
+
+func (c *Client) lookup(ctx context.Context, issuer, subject string) (entitlementData, error) {
+	var zero entitlementData
 	if c == nil {
 		return zero, ErrNotConfigured
 	}
@@ -182,9 +248,15 @@ func (c *Client) Check(ctx context.Context, issuer, subject string) (time.Time, 
 		return zero, fmt.Errorf("membership: entitlement request returned status %d", response.StatusCode)
 	}
 
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return zero, fmt.Errorf("%w: %w", ErrMalformedResponse, err)
+	}
+	if len(payload) > maxResponseBytes {
+		return zero, fmt.Errorf("%w: response exceeds %d bytes", ErrMalformedResponse, maxResponseBytes)
+	}
 	var envelope entitlementEnvelope
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes))
-	if err := decoder.Decode(&envelope); err != nil {
+	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return zero, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
 	}
 	if !envelope.Success {
@@ -197,20 +269,10 @@ func (c *Client) Check(ctx context.Context, issuer, subject string) (time.Time, 
 	if envelope.Data == nil {
 		return zero, fmt.Errorf("%w: missing data", ErrMalformedResponse)
 	}
-	if !envelope.Data.RelayAllowed {
-		return zero, nil
-	}
-	if envelope.Data.ValidUntil <= 0 {
+	if envelope.Data.RelayAllowed && envelope.Data.ValidUntil <= 0 {
 		return zero, fmt.Errorf("%w: relay allowed without an entitlement end", ErrMalformedResponse)
 	}
-
-	validUntil := time.Unix(envelope.Data.ValidUntil, 0).UTC()
-	if !validUntil.After(time.Now()) {
-		// The service should not grant an expired entitlement, but if it does
-		// the client still fails closed.
-		return zero, nil
-	}
-	return validUntil, nil
+	return *envelope.Data, nil
 }
 
 func (c *Client) endpoint() (string, error) {

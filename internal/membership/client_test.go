@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -219,6 +220,10 @@ func TestCheckDoesNotFollowRedirects(t *testing.T) {
 	if !strings.Contains(err.Error(), "status 307") {
 		t.Fatalf("Check() error = %v, want status 307", err)
 	}
+	client.HTTP = redirector.Client()
+	if _, err := client.Lookup(t.Context(), "issuer", "subject"); err == nil || !strings.Contains(err.Error(), "status 307") {
+		t.Fatalf("Lookup() error = %v, want status 307", err)
+	}
 	if hits := targetHits.Load(); hits != 0 {
 		t.Fatalf("redirect target received %d requests, want 0", hits)
 	}
@@ -273,6 +278,94 @@ func TestCheckRejectsInvalidConfiguration(t *testing.T) {
 	var nilClient *Client
 	if _, err := nilClient.Check(context.Background(), "issuer", "subject"); !errors.Is(err, ErrNotConfigured) {
 		t.Fatalf("nil client error = %v, want ErrNotConfigured", err)
+	}
+}
+
+func TestLookupTunnelFields(t *testing.T) {
+	end := time.Now().UTC().Truncate(time.Second).Add(time.Hour)
+	for _, test := range []struct {
+		name string
+		data map[string]any
+		want Entitlement
+	}{
+		{"legacy grant", map[string]any{"relay_allowed": true, "valid_until": end.Unix()}, Entitlement{RelayAllowed: true, ValidUntil: end}},
+		{"legacy denial", map[string]any{"relay_allowed": false, "valid_until": 0}, Entitlement{}},
+		{"verified free account", map[string]any{"relay_allowed": false, "tunnel_allowed": true}, Entitlement{TunnelAllowed: new(true)}},
+		{"additional slots", map[string]any{"relay_allowed": true, "valid_until": end.Unix(), "tunnel_connect_allowed": true, "max_tunnels": 7, "tunnel_valid_until": end.Unix()},
+			Entitlement{RelayAllowed: true, ValidUntil: end, TunnelConnectAllowed: new(true), MaxTunnels: new(7), TunnelValidUntil: new(end.Unix())}},
+		{"explicit denial", map[string]any{"tunnel_allowed": false, "tunnel_connect_allowed": false, "max_tunnels": 0, "tunnel_valid_until": 0},
+			Entitlement{TunnelAllowed: new(false), TunnelConnectAllowed: new(false), MaxTunnels: new(0), TunnelValidUntil: new(int64(0))}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeEntitlement(t, w, http.StatusOK, map[string]any{"success": true, "data": test.data})
+			}))
+			defer server.Close()
+			client := &Client{URL: server.URL, Token: testServiceToken}
+			got, err := client.Lookup(t.Context(), "issuer", "subject")
+			if err != nil || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("Lookup() = %+v, %v; want %+v", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestLookupMalformedTunnelFieldsDoNotAffectTURN(t *testing.T) {
+	end := time.Now().UTC().Truncate(time.Second).Add(time.Hour)
+	for name, data := range map[string]map[string]any{
+		"negative slots":     {"max_tunnels": -1},
+		"excessive slots":    {"max_tunnels": 10001},
+		"string slots":       {"max_tunnels": "3"},
+		"fractional slots":   {"max_tunnels": 2.5},
+		"invalid time":       {"tunnel_allowed": true, "tunnel_valid_until": -1},
+		"string time":        {"tunnel_valid_until": "tomorrow"},
+		"time overflow":      {"tunnel_valid_until": json.Number("9223372036854775808")},
+		"null gate":          {"tunnel_allowed": nil},
+		"invalid connection": {"tunnel_connect_allowed": "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data["relay_allowed"], data["valid_until"] = true, end.Unix()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeEntitlement(t, w, http.StatusOK, map[string]any{"success": true, "data": data})
+			}))
+			defer server.Close()
+			client := &Client{URL: server.URL, Token: testServiceToken}
+			ent, err := client.Lookup(t.Context(), "issuer", "subject")
+			if err != nil || !ent.TunnelFieldsInvalid || !ent.RelayAllowed || !ent.ValidUntil.Equal(end) {
+				t.Fatalf("Lookup() = %+v, %v", ent, err)
+			}
+			if until, err := client.Check(t.Context(), "issuer", "subject"); err != nil || !until.Equal(end) {
+				t.Fatalf("Check() = %s, %v", until, err)
+			}
+		})
+	}
+}
+
+func TestLookupFailureReturnsNoEntitlement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/large") {
+			_, _ = w.Write([]byte(`{"success":true,"data":{"tunnel_allowed":true}}` + strings.Repeat(" ", maxResponseBytes)))
+			return
+		}
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	client := &Client{URL: server.URL, Token: testServiceToken}
+	if ent, err := client.Lookup(t.Context(), "issuer", "subject"); err == nil || ent != (Entitlement{}) {
+		t.Fatalf("unavailable lookup = %+v, %v", ent, err)
+	}
+	client.URL = server.URL + "/large"
+	if ent, err := client.Lookup(t.Context(), "issuer", "subject"); !errors.Is(err, ErrMalformedResponse) || ent != (Entitlement{}) {
+		t.Fatalf("oversized lookup = %+v, %v", ent, err)
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if ent, err := client.Lookup(ctx, "issuer", "subject"); !errors.Is(err, context.DeadlineExceeded) || ent != (Entitlement{}) {
+		t.Fatalf("timed-out lookup = %+v, %v", ent, err)
+	}
+	server.Close()
+	if ent, err := client.Lookup(t.Context(), "issuer", "subject"); err == nil || ent != (Entitlement{}) {
+		t.Fatalf("unreachable lookup = %+v, %v", ent, err)
 	}
 }
 
