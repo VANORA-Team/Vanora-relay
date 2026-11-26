@@ -4,7 +4,6 @@ package mobile
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +40,7 @@ type Client struct {
 	deviceName     string
 	synced         chan struct{}
 	identity       *account.Account
+	channel        string
 	source         transport.IdentitySource
 	url            string
 	lanKey         string
@@ -71,6 +71,7 @@ type Client struct {
 	betterWake     chan struct{}
 	altLANRoutes   []string
 	routeTracker   *routes.Tracker
+	tunnel         tunnelDialOptions
 }
 
 type reply struct {
@@ -103,6 +104,44 @@ func NewClient(identityURL, signalURL, publicKeyHex string, store Store) (*Clien
 	c.identity = a
 	c.startNetwork()
 	return c, nil
+}
+
+// NewChannelClient configures an official site and enables its paired tunnel route.
+func NewChannelClient(channel, identityURL, signalURL, publicKeyHex string, store Store) (*Client, error) {
+	if !officialChannel(channel) {
+		return nil, errors.New("mobile: expected cn or global channel")
+	}
+	client, err := NewClient(identityURL, signalURL, publicKeyHex, store)
+	if err != nil {
+		return nil, err
+	}
+	return client, client.SetChannel(channel)
+}
+
+// SetChannel binds an official client to the site selected by the native app.
+func (c *Client) SetChannel(channel string) error {
+	if c.identity == nil || !officialChannel(channel) {
+		return errors.New("mobile: an official client and cn or global channel are required")
+	}
+	c.op.Lock()
+	defer c.op.Unlock()
+	c.mu.Lock()
+	c.channel = channel
+	c.mu.Unlock()
+	c.routeTracker.Reset()
+	if c.mesh != nil {
+		for _, child := range c.mesh.children {
+			child.mu.Lock()
+			child.channel = channel
+			child.mu.Unlock()
+			child.routeTracker.Reset()
+		}
+	}
+	return nil
+}
+
+func officialChannel(channel string) bool {
+	return channel == "cn" || channel == "global"
 }
 
 // NewLANClient creates an account-free client. Use a secure store dedicated to LAN pairing.
@@ -223,7 +262,7 @@ func (c *Client) Reset() error {
 }
 
 // ConnectionState returns a JSON snapshot of the client's current connection
-// state, active WebRTC transport path ("direct", "relay", or "unknown"), and
+// state, active transport path (such as "direct", "relay", or "cf_tunnel"), and
 // enrolled identity identifiers.
 func (c *Client) ConnectionState() string {
 	c.mu.Lock()
@@ -288,27 +327,30 @@ func (c *Client) Reconnect() error {
 }
 
 func (c *Client) dial() (*transport.Client, error) {
-	if err := c.ctx.Err(); err != nil {
+	socket, err := c.dialOfficialSocket(c.ctx, c.socket)
+	c.socket = socket
+	return socket, err
+}
+
+func (c *Client) dialOfficialSocket(ctx context.Context, existing *transport.Client) (*transport.Client, error) {
+	if err := ctx.Err(); err != nil {
+		if existing != nil {
+			existing.Close()
+		}
 		return nil, err
 	}
 	if c.source == nil {
 		return nil, errors.New("official relay requires an account client")
 	}
-	if c.socket != nil {
+	if existing != nil {
 		select {
-		case <-c.socket.Done():
-			c.socket.Close()
-			c.socket = nil
+		case <-existing.Done():
+			existing.Close()
 		default:
-			return c.socket, nil
+			return existing, nil
 		}
 	}
-	s, err := transport.DialMobileFor(c.ctx, c.url, c.scopeTarget, c.source, (*handler)(c))
-	if err != nil {
-		return nil, err
-	}
-	c.socket = s
-	return s, nil
+	return transport.DialMobileFor(ctx, c.url, c.scopeTarget, c.source, (*handler)(c))
 }
 
 // Devices returns a verified JSON directory with device_id, owner, name, issuer and subject.
@@ -421,6 +463,10 @@ func (c *Client) Pair(input, signalURL, relayToken, clientName string) error {
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.mu.Lock()
+	if c.channel != "" && target.Channel != c.channel {
+		c.mu.Unlock()
+		return pairing.ErrInvalid
+	}
 	c.deviceName = clientName
 	c.officialInvite = &target
 	c.mu.Unlock()
@@ -659,6 +705,11 @@ func (c *Client) connectLocked() error {
 	if start != nil {
 		start()
 	}
+	if !p.Allows(false) {
+		p.Close()
+		(*handler)(c).Closed(p)
+		return transport.ErrPeerClosed
+	}
 	if group != nil {
 		if err := c.syncPeer(p, group); err != nil {
 			p.Close()
@@ -676,6 +727,12 @@ func (c *Client) connectLocked() error {
 			}
 		}
 	}
+	c.mu.Lock()
+	if c.selfTarget != nil {
+		c.selfTarget.Pair = ""
+	}
+	c.officialInvite = nil
+	c.mu.Unlock()
 	for id, seq := range resume {
 		if _, err := c.subscribe(p, id, seq); err != nil {
 			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) || p.Allows(false) {
@@ -693,66 +750,6 @@ func (c *Client) connectLocked() error {
 		}
 	}
 	return nil
-}
-
-func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) {
-	c.mu.Lock()
-	lanT := c.lanTarget
-	selfT := c.selfTarget
-	selfName := c.selfName
-	c.mu.Unlock()
-	if lanT != nil {
-		return c.dialLANPeer()
-	}
-	if selfT != nil {
-		p, start, err := selfrelay.Dial(c.ctx, *selfT, c.selfKey, selfName, (*handler)(c))
-		if err == nil {
-			c.mu.Lock()
-			selfT.Pair = ""
-			c.mu.Unlock()
-		}
-		return p, start, err
-	}
-	s, err := c.dial()
-	if err != nil {
-		return nil, nil, err
-	}
-	ctx, stop := context.WithTimeout(c.ctx, 30*time.Second)
-	defer stop()
-	var pin, token []byte
-	c.mu.Lock()
-	target := c.officialInvite
-	c.mu.Unlock()
-	if target != nil {
-		pin, token = target.Pin, target.Token
-	} else if c.identity != nil {
-		bound, ok := c.desktopBinding(device)
-		if !ok || bound.Owner != owner {
-			return nil, nil, pairing.ErrInvalid
-		}
-		pin, err = base64.RawURLEncoding.Strict().DecodeString(bound.Pin)
-		if err != nil || len(pin) != 32 {
-			return nil, nil, pairing.ErrInvalid
-		}
-	}
-	p, err := s.ConnectPaired(ctx, device, owner, pin, token)
-	if err == nil {
-		c.mu.Lock()
-		official := c.officialInvite
-		c.mu.Unlock()
-		if official != nil {
-			bound := account.PeerBinding{Owner: owner, Pin: base64.RawURLEncoding.EncodeToString(pin)}
-			group, _ := c.identity.PairingIdentity(c.url, "mobile")
-			if err := c.identity.BindNetworkPeer(group, device, bound); err != nil {
-				p.Close()
-				return nil, nil, err
-			}
-			c.mu.Lock()
-			c.officialInvite = nil
-			c.mu.Unlock()
-		}
-	}
-	return p, nil, err
 }
 
 func (c *Client) recoverConnection() {
@@ -857,9 +854,10 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 func (c *Client) handleAuthError(err error) bool {
 	var closed *transport.ClosedError
 	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired) || errors.Is(err, pairing.ErrInvalid) ||
-		(errors.As(err, &closed) && closed.Reason == "access_denied")
+		errors.Is(err, pairnet.ErrRemoved) || errors.Is(err, transport.ErrUnauthorized) ||
+		(errors.As(err, &closed) && (closed.Reason == "access_denied" || closed.Reason == "access_revoked"))
 	relayTokenInvalid := errors.Is(err, selfrelay.ErrUnauthorized)
-	if !pairingRequired && !relayTokenInvalid && !isLoginRequiredError(err) {
+	if !pairingRequired && !relayTokenInvalid && !isLoginRequiredError(err) && !errors.Is(err, transport.ErrIdentityChanged) {
 		return false
 	}
 	c.mu.Lock()
@@ -887,7 +885,8 @@ func isLoginRequiredError(err error) bool {
 		errors.Is(err, account.ErrExpired) ||
 		errors.Is(err, account.ErrCredential) ||
 		errors.Is(err, account.ErrStateInvalid) ||
-		errors.Is(err, account.ErrAuthorityChanged)
+		errors.Is(err, account.ErrAuthorityChanged) ||
+		errors.Is(err, account.ErrAlreadyEnrolled)
 }
 
 func peerPath(p transport.Peer) string {

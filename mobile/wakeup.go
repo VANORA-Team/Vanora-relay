@@ -302,8 +302,14 @@ func (c *Client) Routes() string {
 		list = c.lanCandidateEntriesLocked()
 	case c.selfTarget != nil:
 		list = []routes.Entry{{Address: c.selfTarget.SignalURL, Kind: routes.KindRelay}}
+		if c.selfTarget.Pair == "" {
+			list = append(list, routes.Entry{Address: c.selfTarget.SignalURL, Kind: routes.KindCFTunnel})
+		}
 	case c.device != "" && c.url != "":
 		list = []routes.Entry{{Address: c.url, Kind: routes.KindRelay}}
+		if c.identity != nil && c.officialInvite == nil && officialChannel(c.channel) {
+			list = append(list, routes.Entry{Address: c.url, Kind: routes.KindCFTunnel})
+		}
 	default:
 		list = []routes.Entry{}
 	}

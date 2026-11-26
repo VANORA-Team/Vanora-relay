@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"vanora-relay/adapter/account"
+	"vanora-relay/adapter/cftunnel"
 	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
@@ -37,6 +39,12 @@ type sessionCursor struct {
 	applied       int64
 	delivered     int64
 	watchPresence bool
+}
+
+type tunnelDialOptions struct {
+	url        string
+	headStart  time.Duration
+	httpClient *http.Client
 }
 
 // RemotePeer maintains one authenticated outbound control connection to a
@@ -290,7 +298,11 @@ func (rp *RemotePeer) dropLinkLocked() {
 }
 
 func (rp *RemotePeer) connectLocked(ctx context.Context) error {
-	p, start, group, err := rp.dialPeer(ctx)
+	dialCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(rp.ctx, cancel)
+	p, start, group, err := rp.dialPeer(dialCtx)
+	stop()
+	cancel()
 	if err != nil {
 		rp.mu.Lock()
 		if rp.wantReconnect {
@@ -322,6 +334,11 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 
 	if start != nil {
 		start()
+	}
+	if !p.Allows(false) {
+		p.Close()
+		(*peerHandler)(rp).Closed(p)
+		return transport.ErrPeerClosed
 	}
 	if group != nil {
 		if err := rp.syncPeer(p, group); err != nil {
@@ -529,14 +546,40 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 	}
 
 	localName := rp.manager.desktopName()
-	p, start, err := selfrelay.DialWithRole(rp.ctx, target, selfCh.Server.Seed(), localName, "desktop", (*peerHandler)(rp))
+	seed := selfCh.Server.Seed()
+	options := rp.manager.tunnel
+	dialTarget := target
+	webRTC := func(ctx context.Context) (cftunnel.Candidate, error) {
+		peer, start, err := selfrelay.DialWithRoleFor(ctx, rp.ctx, dialTarget, seed, localName, "desktop", (*peerHandler)(rp))
+		return cftunnel.Candidate{Peer: peer, Start: start}, err
+	}
+	var tunnel cftunnel.CandidateDial
+	if target.Pair == "" {
+		tunnel = func(ctx context.Context) (cftunnel.Candidate, error) {
+			key, err := selfrelay.ClientPrivateKey(seed)
+			if err != nil {
+				return cftunnel.Candidate{}, err
+			}
+			pin, err := decodePin32(dialTarget.Pin)
+			if err != nil {
+				return cftunnel.Candidate{}, err
+			}
+			peer, start, err := cftunnel.ConnectSelfDeferred(ctx, cftunnel.SelfConnectOptions{
+				SignalURL: dialTarget.SignalURL, SelfToken: dialTarget.Token, PrivateKey: key, HostPublicKey: pin,
+				Role: "desktop", Handler: (*peerHandler)(rp), DialURL: options.url, HTTPClient: options.httpClient,
+				Allows: func() bool { return rp.ctx.Err() == nil && group.Allows(rp.peerID) },
+			})
+			return cftunnel.Candidate{Peer: peer, Start: start}, err
+		}
+	}
+	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, target.SignalURL, options.headStart, webRTC, tunnel)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	invited := target.Pair != ""
 	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop"}
 	if err := group.Admit(localMem, remoteMem, invited); err != nil {
-		p.Close()
+		winner.Close()
 		return nil, nil, nil, err
 	}
 	_ = selfCh.Server.SetProfile(pairnet.Profile{Service: target.SignalURL, Token: target.Token, Name: localName})
@@ -549,7 +592,7 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 		rp.name = mem.Name
 	}
 	rp.mu.Unlock()
-	return p, start, group, nil
+	return winner.Peer, winner.Start, group, nil
 }
 
 func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
@@ -597,23 +640,60 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		}
 	}
 
-	sock, owns, err := rp.acquireOfficialSocket(ctx, occ)
-	if err != nil {
-		return nil, nil, nil, err
+	rp.mu.Lock()
+	existing, ownsExisting := rp.socket, rp.ownsSocket
+	rp.socket, rp.ownsSocket = nil, false
+	rp.mu.Unlock()
+	source := occ.Source
+	if source == nil {
+		source = occ.Account
 	}
-	dialCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-	defer stop()
-	p, err := sock.ConnectPairedWithOptions(dialCtx, rp.peerID, owner, transport.ConnectOptions{
-		Pin:     pin,
-		Token:   token,
-		Role:    transport.RoleDesktop,
-		Name:    localMem.Name,
-		Handler: (*peerHandler)(rp),
-	})
-	if err != nil {
-		if owns {
-			sock.Close()
+	name := localMem.Name
+	webRTC := func(ctx context.Context) (cftunnel.Candidate, error) {
+		socket, owns, err := rp.acquireOfficialSocket(ctx, occ, source, existing, ownsExisting)
+		if err != nil {
+			return cftunnel.Candidate{}, err
 		}
+		dialCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+		defer stop()
+		peer, start, err := socket.ConnectPairedDeferred(dialCtx, rp.peerID, owner, transport.ConnectOptions{
+			Pin: pin, Token: token, Role: transport.RoleDesktop, Name: name, Handler: (*peerHandler)(rp),
+		})
+		return cftunnel.Candidate{Peer: peer, Start: start, Socket: socket, OwnsSocket: owns}, err
+	}
+	options := rp.manager.tunnel
+	pinB64 := base64.RawURLEncoding.EncodeToString(pin)
+	bound := account.PeerBinding{Owner: owner, Pin: pinB64}
+	var tunnel cftunnel.CandidateDial
+	if invite == nil {
+		pairedGroup := group
+		tunnel = func(ctx context.Context) (cftunnel.Candidate, error) {
+			peer, start, err := cftunnel.ConnectOfficialDeferred(ctx, cftunnel.OfficialConnectOptions{
+				SignalURL: occ.SignalURL, Channel: rp.channel, HostDeviceID: rp.peerID, HostPublicKey: pin, OwnerID: owner,
+				Role: "desktop", CA: occ.Account.CA(), LeaseSource: source,
+				Handler: (*peerHandler)(rp), DialURL: options.url, HTTPClient: options.httpClient,
+				Allows: func() bool {
+					if rp.ctx.Err() != nil {
+						return false
+					}
+					if pairedGroup != nil {
+						if member, known := pairedGroup.Get(rp.peerID); known {
+							return pairedGroup.Allows(rp.peerID) && member.Role == "desktop" &&
+								member.Owner == bound.Owner && member.Pin == bound.Pin
+						}
+						if local, known := pairedGroup.Get(pairedGroup.Self()); known && !local.Active() {
+							return false
+						}
+					}
+					current, ok := occ.Account.PairedPeer(rp.peerID)
+					return ok && current == bound
+				},
+			})
+			return cftunnel.Candidate{Peer: peer, Start: start}, err
+		}
+	}
+	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, occ.SignalURL, options.headStart, webRTC, tunnel)
+	if err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -622,28 +702,21 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		group, localMem = occ.Account.PairingIdentity(occ.SignalURL, "desktop")
 		localMem.Name = rp.manager.desktopName()
 	}
-	pinB64 := base64.RawURLEncoding.EncodeToString(pin)
 	if group != nil {
 		remoteMem := pairnet.Member{ID: rp.peerID, Pin: pinB64, Owner: owner, Role: "desktop"}
 		if err := group.Admit(localMem, remoteMem, invite != nil); err != nil {
-			p.Close()
-			if owns {
-				sock.Close()
-			}
+			winner.Close()
 			return nil, nil, nil, err
 		}
 	}
-	if err := occ.Account.BindNetworkPeer(group, rp.peerID, account.PeerBinding{Owner: owner, Pin: pinB64}); err != nil {
-		p.Close()
-		if owns {
-			sock.Close()
-		}
+	if err := occ.Account.BindNetworkPeer(group, rp.peerID, bound); err != nil {
+		winner.Close()
 		return nil, nil, nil, err
 	}
 
 	rp.mu.Lock()
-	rp.socket = sock
-	rp.ownsSocket = owns
+	rp.socket = winner.Socket
+	rp.ownsSocket = winner.OwnsSocket
 	rp.owner = owner
 	rp.signalURL = occ.SignalURL
 	rp.officialInvite = nil
@@ -653,23 +726,22 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		}
 	}
 	rp.mu.Unlock()
-	return p, nil, group, nil
+	return winner.Peer, winner.Start, group, nil
 }
 
-func (rp *RemotePeer) acquireOfficialSocket(ctx context.Context, occ *OfficialChannel) (*transport.Client, bool, error) {
+func (rp *RemotePeer) acquireOfficialSocket(ctx context.Context, occ *OfficialChannel, source transport.IdentitySource, existing *transport.Client, owns bool) (*transport.Client, bool, error) {
 	if occ.LiveSocket != nil {
 		if live := occ.LiveSocket(); live != nil {
 			select {
 			case <-live.Done():
 			default:
+				if existing != nil && existing != live && owns {
+					existing.Close()
+				}
 				return live, false, nil
 			}
 		}
 	}
-	rp.mu.Lock()
-	existing := rp.socket
-	owns := rp.ownsSocket
-	rp.mu.Unlock()
 	if owns && existing != nil {
 		select {
 		case <-existing.Done():
@@ -677,10 +749,6 @@ func (rp *RemotePeer) acquireOfficialSocket(ctx context.Context, occ *OfficialCh
 		default:
 			return existing, true, nil
 		}
-	}
-	source := occ.Source
-	if source == nil {
-		source = occ.Account
 	}
 	sock, err := transport.DialDesktopControllerFor(ctx, occ.SignalURL, rp.peerID, source, (*peerHandler)(rp))
 	if err != nil {
@@ -808,9 +876,10 @@ func (rp *RemotePeer) handleAuthError(err error) bool {
 	var closed *transport.ClosedError
 	pairingRequired := errors.Is(err, lan.ErrUnpaired) || errors.Is(err, selfrelay.ErrUnpaired) ||
 		errors.Is(err, pairing.ErrInvalid) || errors.Is(err, pairnet.ErrRemoved) ||
+		errors.Is(err, transport.ErrUnauthorized) ||
 		(errors.As(err, &closed) && (closed.Reason == "access_denied" || closed.Reason == "access_revoked"))
 	relayTokenInvalid := errors.Is(err, selfrelay.ErrUnauthorized)
-	loginRequired := isLoginRequiredError(err)
+	loginRequired := isLoginRequiredError(err) || errors.Is(err, transport.ErrIdentityChanged)
 	if !pairingRequired && !relayTokenInvalid && !loginRequired {
 		return false
 	}
@@ -839,7 +908,8 @@ func isLoginRequiredError(err error) bool {
 		errors.Is(err, account.ErrExpired) ||
 		errors.Is(err, account.ErrCredential) ||
 		errors.Is(err, account.ErrStateInvalid) ||
-		errors.Is(err, account.ErrAuthorityChanged)
+		errors.Is(err, account.ErrAuthorityChanged) ||
+		errors.Is(err, account.ErrAlreadyEnrolled)
 }
 
 func (rp *RemotePeer) emitSubError(sessionID, code string) {

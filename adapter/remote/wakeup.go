@@ -246,7 +246,12 @@ func (rp *RemotePeer) routesLocked() []routes.Entry {
 		return routes.MergeOrdered(primary, rp.altRoutes, learned)
 	case ChannelSelf, ChannelCN, ChannelGlobal:
 		if rp.signalURL != "" {
-			return []routes.Entry{{Address: rp.signalURL, Kind: routes.KindRelay}}
+			entries := []routes.Entry{{Address: rp.signalURL, Kind: routes.KindRelay}}
+			if (rp.channel == ChannelSelf && rp.selfTarget != nil && rp.selfTarget.Pair == "") ||
+				(rp.channel != ChannelSelf && rp.officialInvite == nil) {
+				entries = append(entries, routes.Entry{Address: rp.signalURL, Kind: routes.KindCFTunnel})
+			}
+			return entries
 		}
 	}
 	return nil

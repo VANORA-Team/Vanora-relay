@@ -157,10 +157,12 @@ func (c *Client) openDesktop(group *pairnet.Group, member pairnet.Member) (*Clie
 	child.child, child.mesh, child.scopeTarget = true, c.mesh, member.ID
 	child.identity, child.book, child.lanKey, child.selfKey = c.identity, c.book, c.lanKey, c.selfKey
 	c.mu.Lock()
-	name := c.deviceName
+	name, channel := c.deviceName, c.channel
 	c.mu.Unlock()
 	child.mu.Lock()
 	child.deviceName = name
+	child.channel = channel
+	child.tunnel = c.tunnel
 	child.mu.Unlock()
 	c.mesh.children[member.ID] = child
 	var err error

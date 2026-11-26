@@ -160,6 +160,7 @@ type Manager struct {
 	cancel   context.CancelFunc
 	provider Provider
 	observer func(map[string]any)
+	tunnel   tunnelDialOptions
 
 	mu          sync.Mutex
 	peers       map[peerKey]*RemotePeer
