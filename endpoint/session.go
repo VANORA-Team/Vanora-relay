@@ -42,6 +42,10 @@ func (c *Credentials) DeviceID() string             { return c.principal.DeviceI
 func (c *Credentials) UserID() string               { return c.principal.RemoteUserID() }
 func (c *Credentials) PublicKey() ed25519.PublicKey { return c.key.Public().(ed25519.PublicKey) }
 
+func (c *Credentials) PrivateKey() ed25519.PrivateKey {
+	return append(ed25519.PrivateKey(nil), c.key...)
+}
+
 // Certificate returns the signed certificate string this endpoint presents.
 func (c *Credentials) Certificate() string { return c.cert }
 
@@ -52,13 +56,27 @@ func (c *Credentials) Login(challenge protocol.Message, role, lease string) (pro
 }
 
 func (c *Credentials) LoginFor(challenge protocol.Message, role, lease, desktop string) (protocol.Message, error) {
+	return c.loginFor(challenge, role, lease, desktop, false)
+}
+
+func (c *Credentials) LoginTunnelFor(challenge protocol.Message, role, lease, desktop string) (protocol.Message, error) {
+	if desktop == "" {
+		return protocol.Message{}, errors.New("missing tunnel target")
+	}
+	return c.loginFor(challenge, role, lease, desktop, true)
+}
+
+func (c *Credentials) loginFor(challenge protocol.Message, role, lease, desktop string, tunnel bool) (protocol.Message, error) {
 	if challenge.Type != "auth.challenge" || !protocol.ValidID(challenge.Connection) || (role != "desktop" && role != "mobile") {
 		return protocol.Message{}, errors.New("invalid login challenge or role")
 	}
 	m := protocol.Message{Type: "auth.login", Connection: challenge.Connection, From: c.DeviceID(), To: "signal", Certificate: c.cert}
-	fields := map[string]string{"role": role, "lease": lease}
+	fields := map[string]any{"role": role, "lease": lease}
 	if desktop != "" {
 		fields["desktop"] = desktop
+	}
+	if tunnel {
+		fields["tunnel"] = true
 	}
 	err := m.Sign(c.key, protocol.Encode(fields))
 	return m, err

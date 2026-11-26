@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"vanora-relay/internal/ice"
+	"vanora-relay/internal/cftunnel"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/membership"
 	relay "vanora-relay/internal/signal"
@@ -22,6 +22,10 @@ import (
 
 func run() error {
 	channel, err := relay.ParseChannel(os.Getenv("RELAY_CHANNEL"))
+	if err != nil {
+		return err
+	}
+	tunnelCfg, err := cftunnel.ConfigFromEnv(cftunnel.Channel(channel), os.Getenv)
 	if err != nil {
 		return err
 	}
@@ -77,37 +81,18 @@ func run() error {
 	if cert == "" && !net.ParseIP(host).IsLoopback() && !strings.EqualFold(host, "localhost") {
 		return errors.New("use TLS on public listeners or a TLS reverse proxy to loopback")
 	}
-	network, err := ice.FromEnv()
-	if err != nil {
-		return fmt.Errorf("start STUN/TURN: %w", err)
-	}
-	defer network.Close()
-	var hub *relay.Hub
-	if channel.IsSelfHosted() {
-		hub = relay.NewSelfHosted(selfToken, network)
-	} else {
-		hub = relay.New(key, entitlement, network)
-		if allowedIssuer != "" {
-			hub.RequireIssuer(allowedIssuer)
-		}
-	}
-	if pushURL := strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_URL")); pushURL != "" {
-		pushToken := strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_TOKEN"))
-		if err := hub.ConfigurePushWebhook(pushURL, pushToken, false); err != nil {
-			return err
-		}
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go hub.Run(ctx)
-	mux := http.NewServeMux()
-	mux.Handle("GET /v1/signal", hub)
-	mux.Handle("POST /v1/signal", hub)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintln(w, "ok")
+	member, _ := entitlement.(*membership.Client)
+	handler, closeServer, err := buildServer(ctx, tunnelCfg, relayStartup{
+		key: key, allowedIssuer: allowedIssuer, selfToken: selfToken, membership: member,
+		pushURL: strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_URL")), pushToken: strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_TOKEN")),
 	})
-	server := http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	if err != nil {
+		return err
+	}
+	defer closeServer()
+	server := http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)

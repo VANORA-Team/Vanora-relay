@@ -44,6 +44,7 @@ type loginBody struct {
 	Role      string `json:"role"`
 	Lease     string `json:"lease,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
+	Tunnel    bool   `json:"tunnel,omitempty"`
 }
 
 // authorized accepts "Authorization: Bearer <token>" with the configured
@@ -147,6 +148,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientIP := remoteIPAddr(r.RemoteAddr)
+	tunnelIP := clientIP
+	if h.tunnelClientIP != nil {
+		tunnelIP = h.tunnelClientIP(r)
+	}
 	releasePreAuth, status := h.acquirePreAuth(clientIP)
 	if status != 0 {
 		http.Error(w, "busy", status)
@@ -229,6 +234,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		cert = m.Certificate
 	}
+	if auth.Tunnel && auth.Desktop == "" {
+		ws.Close(websocket.StatusPolicyViolation, "tunnel target required")
+		return
+	}
 	select {
 	case h.slots <- struct{}{}:
 		defer func() { <-h.slots }()
@@ -242,8 +251,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cert:       cert,
 		role:       auth.Role,
 		desktop:    auth.Desktop,
+		tunnelOnly: auth.Tunnel,
 		selfHosted: h.selfHosted,
 		remoteIP:   clientIP,
+		tunnelIP:   tunnelIP,
 		lease:      until,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -260,11 +271,17 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	for _, other := range h.peers {
 		if other.id.DeviceID == id.DeviceID {
-			count++
+			if other.tunnelOnly == p.tunnelOnly {
+				count++
+			}
 			exists = exists || other.role != p.role
 		}
 	}
-	exists = exists || count >= maxPhoneLinks+1
+	limit := maxPhoneLinks + 1
+	if p.tunnelOnly {
+		limit = maxPhoneLinks
+	}
+	exists = exists || count >= limit
 	if !exists {
 		h.peers[p.slotKey()] = p
 	} else if existing != nil && existing.role == p.role && existing.id.PublicKey.Equal(id.PublicKey) {
@@ -281,6 +298,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	tunnel := h.tunnel
 	h.mu.Unlock()
 	if exists {
 		ws.Close(websocket.StatusPolicyViolation, "endpoint already connected")
@@ -288,17 +306,23 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.remove(p)
 	stop()
+	var tunnelScope string
+	if tunnel != nil {
+		tunnelScope = tunnel.ScopeID()
+	}
 	var okData any
 	if h.selfHosted {
 		okData = struct {
-			Device string `json:"device_id"`
-			Mode   string `json:"mode"`
-		}{id.DeviceID, "self"}
+			Device      string `json:"device_id"`
+			Mode        string `json:"mode"`
+			TunnelScope string `json:"tunnel_scope,omitempty"`
+		}{id.DeviceID, "self", tunnelScope}
 	} else {
 		okData = struct {
-			Device string `json:"device_id"`
-			User   string `json:"remote_user_id"`
-		}{id.DeviceID, id.RemoteUserID()}
+			Device      string `json:"device_id"`
+			User        string `json:"remote_user_id"`
+			TunnelScope string `json:"tunnel_scope,omitempty"`
+		}{id.DeviceID, id.RemoteUserID(), tunnelScope}
 	}
 	if writeMessage(ctx, ws, protocol.Message{Type: "auth.ok", Data: protocol.Encode(okData)}) != nil {
 		return

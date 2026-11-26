@@ -1,0 +1,12 @@
+name = "vanora-tunnel-edge"
+main = "worker.js"
+compatibility_date = "2026-11-26"
+workers_dev = false
+preview_urls = false
+
+# Replace with a dedicated proxied suffix and the owning Cloudflare zone.
+# Route all paths so the Worker can reject non-canonical upgrade URLs.
+# routes = [{ pattern = "*.edge.example/*", zone_name = "edge.example" }]
+#
+# Set secrets with `wrangler secret put EDGE_KEY` and optionally
+# `wrangler secret put EDGE_PREV_KEY`.

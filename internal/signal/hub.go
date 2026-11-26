@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -46,29 +47,33 @@ type iceService interface {
 }
 
 type Hub struct {
-	key           ed25519.PublicKey
-	allowedIssuer string
-	selfHosted    bool
-	entitlement   EntitlementVerifier
-	ice           iceService
-	accessToken   [sha256.Size]byte
-	requireToken  bool
-	preAuthSlots  chan struct{}
-	preAuthMu     sync.Mutex
-	preAuthByIP   map[string]int
-	slots         chan struct{}
-	mu            sync.Mutex
-	peers         map[string]*peer
-	links         map[string]*link
-	invites       map[string]*peer
-	activity      *activityTracker
-	gate          unauthGate
+	key            ed25519.PublicKey
+	allowedIssuer  string
+	selfHosted     bool
+	entitlement    EntitlementVerifier
+	ice            iceService
+	accessToken    [sha256.Size]byte
+	requireToken   bool
+	preAuthSlots   chan struct{}
+	preAuthMu      sync.Mutex
+	preAuthByIP    map[string]int
+	slots          chan struct{}
+	mu             sync.Mutex
+	peers          map[string]*peer
+	links          map[string]*link
+	invites        map[string]*peer
+	activity       *activityTracker
+	gate           unauthGate
+	tunnel         TunnelController
+	tunnelSessions map[string]*tunnelSession
+	tunnelClientIP func(*http.Request) string
 }
 
 type peer struct {
 	id         identity.Principal
 	cert, role string
 	desktop    string
+	tunnelOnly bool
 	selfHosted bool
 	remoteIP   string
 	card       protocol.Message
@@ -82,6 +87,8 @@ type peer struct {
 	cancel     context.CancelFunc
 	pairTicket string
 	invites    map[string]pairing.Record
+	tunnelHost tunnelHostState
+	tunnelIP   string
 }
 
 type link struct {
@@ -190,6 +197,9 @@ func (h *Hub) drop(l *link, reason string) {
 }
 
 func (p *peer) slotKey() string {
+	if p.tunnelOnly {
+		return p.id.DeviceID + "\x00" + p.desktop + "\x00tunnel"
+	}
 	if p.desktop != "" {
 		return p.id.DeviceID + "\x00" + p.desktop
 	}
@@ -211,6 +221,7 @@ func (h *Hub) remove(p *peer) {
 			h.drop(l, "endpoint_offline")
 		}
 	}
+	h.dropPeerTunnels(p, "endpoint_offline")
 }
 
 func (h *Hub) expire(now time.Time) {
@@ -232,6 +243,7 @@ func (h *Hub) expire(now time.Time) {
 			h.drop(l, "request_timeout")
 		}
 	}
+	h.expireTunnels(now)
 }
 
 func (h *Hub) Run(ctx context.Context) {
@@ -254,6 +266,20 @@ func (h *Hub) Run(ctx context.Context) {
 }
 
 func (h *Hub) handle(p *peer, m protocol.Message) error {
+	if strings.HasPrefix(m.Type, "tunnel.") {
+		h.mu.Lock()
+		ctrl := h.tunnel
+		h.mu.Unlock()
+		if ctrl != nil {
+			return h.handleTunnel(p, m, ctrl)
+		}
+		if p.tunnelOnly {
+			return errors.New("tunnel_unavailable")
+		}
+	}
+	if p.tunnelOnly && m.Type != "auth.lease" {
+		return errors.New("tunnel_only")
+	}
 	if m.Type == "connect.accept" || m.Type == "ice.refresh" {
 		return h.configure(p, m)
 	}
@@ -319,6 +345,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 				grants[id] = true
 			}
 			p.card, p.grants, p.online = d.Card, grants, true
+			h.revokeTunnelGrants(p)
 			h.refreshActivityGrants(p)
 			p.registered()
 			return nil
@@ -337,6 +364,7 @@ func (h *Hub) handle(p *peer, m protocol.Message) error {
 			grants[id] = true
 		}
 		p.card, p.grants, p.online = d.Card, grants, true
+		h.revokeTunnelGrants(p)
 		h.refreshActivityGrants(p)
 		for _, l := range h.links {
 			if l.host == p && !p.allows(l.phone) {
