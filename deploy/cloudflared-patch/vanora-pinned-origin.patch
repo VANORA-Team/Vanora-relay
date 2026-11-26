@@ -1,0 +1,1694 @@
+diff --git a/cmd/cloudflared/tunnel/cmd.go b/cmd/cloudflared/tunnel/cmd.go
+index 8896c8d..8ba0ed1 100644
+--- a/cmd/cloudflared/tunnel/cmd.go
++++ b/cmd/cloudflared/tunnel/cmd.go
+@@ -224,6 +224,9 @@ See https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/in
+ }
+ 
+ func TunnelCommand(c *cli.Context) error {
++	if _, err := readVanoraPin(c, false); err != nil {
++		return err
++	}
+ 	sc, err := newSubcommandContext(c)
+ 	if err != nil {
+ 		return err
+@@ -325,6 +328,25 @@ func StartServer(
+ 	namedTunnel *connection.TunnelProperties,
+ 	log *zerolog.Logger,
+ ) error {
++	if _, err := readVanoraPin(c, false); err != nil {
++		return err
++	}
++	return startServer(c, info, namedTunnel, log, orchestration.VanoraPin{})
++}
++
++func startServer(
++	c *cli.Context,
++	info *cliutil.BuildInfo,
++	namedTunnel *connection.TunnelProperties,
++	log *zerolog.Logger,
++	pin orchestration.VanoraPin,
++) error {
++	if namedTunnel == nil {
++		return fmt.Errorf("namedTunnel is nil")
++	}
++	if pin.Active() && namedTunnel.QuickTunnelUrl != "" {
++		return errVanoraPinTokenRun
++	}
+ 	err := sentry.Init(sentry.ClientOptions{
+ 		Dsn:     sentryDSN,
+ 		Release: c.App.Version,
+@@ -400,10 +422,6 @@ func StartServer(
+ 		errC <- autoupdater.Run(ctx)
+ 	}()
+ 
+-	if namedTunnel == nil {
+-		return fmt.Errorf("namedTunnel is nil")
+-	}
+-
+ 	observer := connection.NewObserver(log)
+ 
+ 	// Send Quick Tunnel URL to UI if applicable
+@@ -412,7 +430,7 @@ func StartServer(
+ 		observer.SendURL(quickTunnelURL)
+ 	}
+ 
+-	tunnelConfig, orchestratorConfig, err := prepareTunnelConfig(ctx, c, info, log, observer, namedTunnel)
++	tunnelConfig, orchestratorConfig, err := prepareTunnelConfig(ctx, c, info, log, observer, namedTunnel, pin)
+ 	if err != nil {
+ 		log.Err(err).Msg("Couldn't start tunnel")
+ 		return err
+@@ -459,7 +477,7 @@ func StartServer(
+ 		logger.ManagementLogger.Log,
+ 		logger.ManagementLogger,
+ 	)
+-	internalRules := []ingress.Rule{ingress.NewManagementRule(mgmt)}
++	internalRules := managementIngressRules(orchestratorConfig.VanoraPin, mgmt)
+ 	orchestrator, err := orchestration.NewOrchestratorWithHTTPRequestAuthorizer(
+ 		ctx,
+ 		orchestratorConfig,
+@@ -533,6 +551,13 @@ func StartServer(
+ 
+ // runPrechecks executes connectivity pre-checks and logs the results.
+ // Pre-checks are diagnostic only and do not gate tunnel startup.
++func managementIngressRules(pin orchestration.VanoraPin, mgmt *management.ManagementService) []ingress.Rule {
++	if pin.Active() {
++		return nil
++	}
++	return []ingress.Rule{ingress.NewManagementRule(mgmt)}
++}
++
+ func runPrechecks(c *cli.Context, log *zerolog.Logger, tunnelConfig *supervisor.TunnelConfig) prechecks.Report {
+ 	cfg := prechecks.Config{
+ 		Region:           tunnelConfig.Region,
+@@ -659,6 +684,16 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
+ 	flags = append(flags, proxydns.ConfigureProxyDNSFlags(shouldHide)...) // removed feature, only kept to not break any script that might be setting these flags
+ 	flags = append(flags, []cli.Flag{
+ 		credentialsFileFlag,
++		&cli.StringFlag{
++			Name:   vanoraPinHostnameFlag,
++			Usage:  "Restrict a token-authenticated tunnel to this literal DNS hostname",
++			Hidden: shouldHide,
++		},
++		&cli.StringFlag{
++			Name:   vanoraPinOriginFlag,
++			Usage:  "Restrict the HTTP origin to this canonical loopback address and port",
++			Hidden: shouldHide,
++		},
+ 		altsrc.NewBoolFlag(&cli.BoolFlag{
+ 			Name:   cfdflags.IsAutoUpdated,
+ 			Usage:  "Signal the new process that Cloudflare Tunnel connector has been autoupdated",
+diff --git a/cmd/cloudflared/tunnel/configuration.go b/cmd/cloudflared/tunnel/configuration.go
+index e9c5a25..c18a0e5 100644
+--- a/cmd/cloudflared/tunnel/configuration.go
++++ b/cmd/cloudflared/tunnel/configuration.go
+@@ -42,6 +42,7 @@ var (
+ 		credentialsContentsFlag.Name,
+ 		tunnelTokenFlag.Name,
+ 		flags.AllowedMail,
++		vanoraPinOriginFlag,
+ 	}
+ 	secretEnvFlags = [...](*altsrc.StringFlag){credentialsContentsFlag, tunnelTokenFlag}
+ 
+@@ -121,6 +122,7 @@ func prepareTunnelConfig(
+ 	log *zerolog.Logger,
+ 	observer *connection.Observer,
+ 	namedTunnel *connection.TunnelProperties,
++	pin orchestration.VanoraPin,
+ ) (*supervisor.TunnelConfig, *orchestration.Config, error) {
+ 	transportProtocol := c.String(flags.Protocol)
+ 	isPostQuantumEnforced := c.Bool(flags.PostQuantum)
+@@ -144,7 +146,22 @@ func prepareTunnelConfig(
+ 	tags = append(tags, pogs.Tag{Name: "ID", Value: clientConfig.ConnectorID.String()})
+ 
+ 	cfg := config.GetConfiguration()
+-	ingressRules, err := ingress.ParseIngressFromConfigAndCLI(cfg, c, log)
++	var ingressRules ingress.Ingress
++	if pin.Active() {
++		cfg = &config.Configuration{
++			Ingress: []config.UnvalidatedIngressRule{
++				{Hostname: pin.Hostname, Service: pin.Service(), OriginRequest: config.OriginRequestConfig{HTTPHostHeader: &pin.Hostname}},
++				{Service: "http_status:404"},
++			},
++			WarpRouting: config.WarpRoutingConfig{},
++		}
++		ingressRules, err = ingress.ParseIngress(cfg)
++		if err == nil {
++			err = ingressRules.PinLoopbackHTTPOrigin(pin.Origin)
++		}
++	} else {
++		ingressRules, err = ingress.ParseIngressFromConfigAndCLI(cfg, c, log)
++	}
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+@@ -210,22 +227,26 @@ func prepareTunnelConfig(
+ 
+ 	// Setup origin dialer service and virtual services
+ 	originDialerService := ingress.NewOriginDialer(ingress.OriginConfig{
+-		DefaultDialer:   ingress.NewDialer(warpRoutingConfig),
+-		TCPWriteTimeout: c.Duration(flags.WriteStreamTimeout),
++		DefaultDialer:       ingress.NewDialer(warpRoutingConfig),
++		TCPWriteTimeout:     c.Duration(flags.WriteStreamTimeout),
++		BlockPrivateNetwork: pin.Active(),
+ 	}, log)
+ 
+ 	// Setup DNS Resolver Service
+-	originMetrics := origins.NewMetrics(prometheus.DefaultRegisterer)
+-	dnsResolverAddrs := c.StringSlice(flags.VirtualDNSServiceResolverAddresses)
+-	dnsService := origins.NewDNSResolverService(origins.NewDNSDialer(), log, originMetrics)
+-	if len(dnsResolverAddrs) > 0 {
+-		addrs, err := parseResolverAddrPorts(dnsResolverAddrs)
+-		if err != nil {
+-			return nil, nil, fmt.Errorf("invalid %s provided: %w", flags.VirtualDNSServiceResolverAddresses, err)
++	var dnsService *origins.DNSResolverService
++	if !pin.Active() {
++		originMetrics := origins.NewMetrics(prometheus.DefaultRegisterer)
++		dnsResolverAddrs := c.StringSlice(flags.VirtualDNSServiceResolverAddresses)
++		dnsService = origins.NewDNSResolverService(origins.NewDNSDialer(), log, originMetrics)
++		if len(dnsResolverAddrs) > 0 {
++			addrs, err := parseResolverAddrPorts(dnsResolverAddrs)
++			if err != nil {
++				return nil, nil, fmt.Errorf("invalid %s provided: %w", flags.VirtualDNSServiceResolverAddresses, err)
++			}
++			dnsService = origins.NewStaticDNSResolverService(addrs, origins.NewDNSDialer(), log, originMetrics)
+ 		}
+-		dnsService = origins.NewStaticDNSResolverService(addrs, origins.NewDNSDialer(), log, originMetrics)
++		originDialerService.AddReservedService(dnsService, []netip.AddrPort{origins.VirtualDNSServiceAddr})
+ 	}
+-	originDialerService.AddReservedService(dnsService, []netip.AddrPort{origins.VirtualDNSServiceAddr})
+ 
+ 	tunnelConfig := &supervisor.TunnelConfig{
+ 		ClientConfig:    clientConfig,
+@@ -257,14 +278,17 @@ func prepareTunnelConfig(
+ 		OriginDNSService:                    dnsService,
+ 		OriginDialerService:                 originDialerService,
+ 	}
+-	icmpRouter, err := newICMPRouter(c, log)
+-	if err != nil {
+-		log.Warn().Err(err).Msg("ICMP proxy feature is disabled")
+-	} else {
+-		tunnelConfig.ICMPRouterServer = icmpRouter
++	if !pin.Active() {
++		icmpRouter, err := newICMPRouter(c, log)
++		if err != nil {
++			log.Warn().Err(err).Msg("ICMP proxy feature is disabled")
++		} else {
++			tunnelConfig.ICMPRouterServer = icmpRouter
++		}
+ 	}
+ 	orchestratorConfig := &orchestration.Config{
+ 		Ingress:                  &ingressRules,
++		VanoraPin:                pin,
+ 		WarpRouting:              warpRoutingConfig,
+ 		OriginDialerService:      originDialerService,
+ 		DisablePathNormalization: c.Bool(flags.DisablePathNormalization),
+diff --git a/cmd/cloudflared/tunnel/subcommand_context.go b/cmd/cloudflared/tunnel/subcommand_context.go
+index c1eb880..dbfd49c 100644
+--- a/cmd/cloudflared/tunnel/subcommand_context.go
++++ b/cmd/cloudflared/tunnel/subcommand_context.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/cloudflare/cloudflared/connection"
+ 	"github.com/cloudflare/cloudflared/credentials"
+ 	"github.com/cloudflare/cloudflared/logger"
++	"github.com/cloudflare/cloudflared/orchestration"
+ )
+ 
+ const fedRampBaseApiURL = "https://api.fed.cloudflare.com/client/v4"
+@@ -272,17 +273,18 @@ func (sc *subcommandContext) run(tunnelID uuid.UUID) error {
+ 		return err
+ 	}
+ 
+-	return sc.runWithCredentials(credentials)
++	return sc.runWithCredentials(credentials, orchestration.VanoraPin{})
+ }
+ 
+-func (sc *subcommandContext) runWithCredentials(credentials connection.Credentials) error {
++func (sc *subcommandContext) runWithCredentials(credentials connection.Credentials, pin orchestration.VanoraPin) error {
+ 	sc.log.Info().Str(LogFieldTunnelID, credentials.TunnelID.String()).Msg("Starting tunnel")
+ 
+-	return StartServer(
++	return startServer(
+ 		sc.c,
+ 		buildInfo,
+ 		&connection.TunnelProperties{Credentials: credentials},
+ 		sc.log,
++		pin,
+ 	)
+ }
+ 
+diff --git a/cmd/cloudflared/tunnel/subcommands.go b/cmd/cloudflared/tunnel/subcommands.go
+index 0cef7b0..386101d 100644
+--- a/cmd/cloudflared/tunnel/subcommands.go
++++ b/cmd/cloudflared/tunnel/subcommands.go
+@@ -747,6 +747,11 @@ func buildRunCommand() *cli.Command {
+ }
+ 
+ func runCommand(c *cli.Context) error {
++	tokenStr := c.String(TunnelTokenFlag)
++	pin, err := readVanoraPin(c, tokenStr != "")
++	if err != nil {
++		return err
++	}
+ 	if err := rejectAllowedMailForNamedTunnel(c); err != nil {
+ 		return err
+ 	}
+@@ -766,7 +771,6 @@ func runCommand(c *cli.Context) error {
+ 			"your origin will not be reachable. You should remove the `hostname` property to avoid this warning.")
+ 	}
+ 
+-	tokenStr := c.String(TunnelTokenFlag)
+ 	// Check if tokenStr is blank before checking for tokenFile
+ 	if tokenStr == "" {
+ 		if tokenFile := c.String(TunnelTokenFileFlag); tokenFile != "" {
+@@ -781,7 +785,7 @@ func runCommand(c *cli.Context) error {
+ 	// Check if token is provided and if not use default tunnelID flag method
+ 	if tokenStr != "" {
+ 		if token, err := ParseToken(tokenStr); err == nil {
+-			return sc.runWithCredentials(token.Credentials())
++			return sc.runWithCredentials(token.Credentials(), pin)
+ 		}
+ 		return cliutil.UsageError("Provided Tunnel token is not valid.")
+ 	} else {
+diff --git a/cmd/cloudflared/tunnel/vanora_pin.go b/cmd/cloudflared/tunnel/vanora_pin.go
+new file mode 100644
+index 0000000..dd6056f
+--- /dev/null
++++ b/cmd/cloudflared/tunnel/vanora_pin.go
+@@ -0,0 +1,64 @@
++package tunnel
++
++import (
++	"errors"
++	"net/netip"
++	"strings"
++
++	"github.com/urfave/cli/v2"
++
++	"github.com/cloudflare/cloudflared/orchestration"
++)
++
++const (
++	vanoraPinHostnameFlag = "vanora-pin-hostname"
++	vanoraPinOriginFlag   = "vanora-pin-origin"
++)
++
++var errVanoraPinTokenRun = errors.New("Vanora pins require a Named Tunnel started with tunnel run and --token or TUNNEL_TOKEN")
++
++func readVanoraPin(c *cli.Context, tokenRun bool) (orchestration.VanoraPin, error) {
++	var pin orchestration.VanoraPin
++	hostSet, originSet := c.IsSet(vanoraPinHostnameFlag), c.IsSet(vanoraPinOriginFlag)
++	if !hostSet && !originSet {
++		return pin, nil
++	}
++	if !hostSet || !originSet {
++		return pin, errors.New("--vanora-pin-hostname and --vanora-pin-origin must be set together")
++	}
++	if !tokenRun {
++		return pin, errVanoraPinTokenRun
++	}
++
++	hostname := c.String(vanoraPinHostnameFlag)
++	if !validVanoraHostname(hostname) {
++		return pin, errors.New("--vanora-pin-hostname must be a literal DNS name")
++	}
++	rawOrigin := c.String(vanoraPinOriginFlag)
++	origin, err := netip.ParseAddrPort(rawOrigin)
++	if err != nil || origin.Port() == 0 || origin.String() != rawOrigin ||
++		(origin.Addr() != netip.AddrFrom4([4]byte{127, 0, 0, 1}) && origin.Addr() != netip.IPv6Loopback()) {
++		return pin, errors.New("--vanora-pin-origin must be canonical 127.0.0.1:<port> or [::1]:<port> with a nonzero port")
++	}
++	return orchestration.VanoraPin{Hostname: hostname, Origin: origin}, nil
++}
++
++func validVanoraHostname(hostname string) bool {
++	if len(hostname) > 253 {
++		return false
++	}
++	if _, err := netip.ParseAddr(hostname); err == nil {
++		return false
++	}
++	for label := range strings.SplitSeq(hostname, ".") {
++		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
++			return false
++		}
++		for _, char := range label {
++			if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-') {
++				return false
++			}
++		}
++	}
++	return true
++}
+diff --git a/cmd/cloudflared/tunnel/vanora_pin_test.go b/cmd/cloudflared/tunnel/vanora_pin_test.go
+new file mode 100644
+index 0000000..85971fe
+--- /dev/null
++++ b/cmd/cloudflared/tunnel/vanora_pin_test.go
+@@ -0,0 +1,188 @@
++package tunnel
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/netip"
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++	"github.com/urfave/cli/v2"
++
++	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
++	"github.com/cloudflare/cloudflared/config"
++	"github.com/cloudflare/cloudflared/connection"
++	"github.com/cloudflare/cloudflared/ingress/origins"
++)
++
++func vanoraCLI(runAction cli.ActionFunc) *cli.App {
++	run := buildRunCommand()
++	if runAction == nil {
++		runAction = runCommand
++	}
++	run.Action = runAction
++	tunnel := buildTunnelCommand([]*cli.Command{run})
++	tunnel.Action = TunnelCommand
++	return &cli.App{
++		Commands:       []*cli.Command{tunnel},
++		Writer:         io.Discard,
++		ErrWriter:      io.Discard,
++		ExitErrHandler: func(*cli.Context, error) {},
++	}
++}
++
++func TestVanoraCLIRejectsIncompletePinsAndOtherTunnelModes(t *testing.T) {
++	t.Setenv("TUNNEL_TOKEN", "")
++	t.Setenv("TUNNEL_TOKEN_FILE", "")
++	pins := []string{"--vanora-pin-hostname", "relay.example", "--vanora-pin-origin", "127.0.0.1:32123"}
++	for _, test := range []struct {
++		name string
++		args []string
++		want string
++	}{
++		{"hostname only", append(pins[:2:2], "run"), "must be set together"},
++		{"origin only", append(pins[2:4:4], "run"), "must be set together"},
++		{"missing token", append(pins[:4:4], "run"), errVanoraPinTokenRun.Error()},
++		{"credentials file", append(pins[:4:4], "run", "--credentials-file", "not-read.json", "example"), errVanoraPinTokenRun.Error()},
++		{"token file only", append(pins[:4:4], "run", "--token-file", "not-read.txt"), errVanoraPinTokenRun.Error()},
++		{"quick tunnel", append(pins[:4:4], "--url", "http://localhost"), errVanoraPinTokenRun.Error()},
++		{"adhoc tunnel", append(pins[:4:4], "--name", "adhoc", "--hello-world"), errVanoraPinTokenRun.Error()},
++		{"explicitly empty hostname", []string{"--vanora-pin-hostname=", pins[2], pins[3], "run", "--token", "token"}, "literal DNS name"},
++		{"explicitly empty origin", []string{pins[0], pins[1], "--vanora-pin-origin=", "run", "--token", "token"}, "canonical 127.0.0.1"},
++		{"invalid token", append(pins[:4:4], "run", "--token", "not-a-token"), "Provided Tunnel token is not valid"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			err := vanoraCLI(nil).Run(append([]string{"cloudflared", "tunnel"}, test.args...))
++			require.ErrorContains(t, err, test.want)
++			require.NotContains(t, err.Error(), pins[3])
++		})
++	}
++}
++
++func TestVanoraCLIValidatesPins(t *testing.T) {
++	t.Setenv("TUNNEL_TOKEN", "fixture-token")
++	for _, test := range []struct{ hostname, origin, want string }{
++		{"relay.example", "127.0.0.1:65535", ""},
++		{"Vanora-1.Example", "[::1]:1", ""},
++		{"single-label", "127.0.0.1:32123", ""},
++		{strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 61), "127.0.0.1:32123", ""},
++		{"*.relay.example", "127.0.0.1:32123", "literal DNS name"},
++		{"relay.*.example", "127.0.0.1:32123", "literal DNS name"},
++		{"relay.example:80", "127.0.0.1:32123", "literal DNS name"},
++		{".relay.example", "127.0.0.1:32123", "literal DNS name"},
++		{"relay.example.", "127.0.0.1:32123", "literal DNS name"},
++		{"relay..example", "127.0.0.1:32123", "literal DNS name"},
++		{"https://relay.example", "127.0.0.1:32123", "literal DNS name"},
++		{"relay.example/path", "127.0.0.1:32123", "literal DNS name"},
++		{" relay.example", "127.0.0.1:32123", "literal DNS name"},
++		{"relay.\texample", "127.0.0.1:32123", "literal DNS name"},
++		{"relay_example", "127.0.0.1:32123", "literal DNS name"},
++		{"-edge.example", "127.0.0.1:32123", "literal DNS name"},
++		{"edge-.example", "127.0.0.1:32123", "literal DNS name"},
++		{"rélais.example", "127.0.0.1:32123", "literal DNS name"},
++		{"127.0.0.1", "127.0.0.1:32123", "literal DNS name"},
++		{"::1", "127.0.0.1:32123", "literal DNS name"},
++		{strings.Repeat("a", 64) + ".example", "127.0.0.1:32123", "literal DNS name"},
++		{strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 62), "127.0.0.1:32123", "literal DNS name"},
++		{"relay.example", "127.0.0.1:0", "canonical 127.0.0.1"},
++		{"relay.example", "[::1]:0", "canonical 127.0.0.1"},
++		{"relay.example", "127.0.0.2:32123", "canonical 127.0.0.1"},
++		{"relay.example", "192.168.1.1:32123", "canonical 127.0.0.1"},
++		{"relay.example", "8.8.8.8:32123", "canonical 127.0.0.1"},
++		{"relay.example", "localhost:32123", "canonical 127.0.0.1"},
++		{"relay.example", "127.0.0.1:032123", "canonical 127.0.0.1"},
++		{"relay.example", "[::1%zone]:32123", "canonical 127.0.0.1"},
++		{"relay.example", "[0:0:0:0:0:0:0:1]:32123", "canonical 127.0.0.1"},
++		{"relay.example", "[::ffff:127.0.0.1]:32123", "canonical 127.0.0.1"},
++		{"relay.example", "http://127.0.0.1:32123", "canonical 127.0.0.1"},
++		{"relay.example", "127.0.0.1:65536", "canonical 127.0.0.1"},
++	} {
++		t.Run(test.hostname+" "+test.origin, func(t *testing.T) {
++			app := vanoraCLI(func(c *cli.Context) error {
++				pin, err := readVanoraPin(c, c.String(TunnelTokenFlag) != "")
++				if err == nil {
++					require.True(t, pin.Active())
++					require.Equal(t, test.hostname, pin.Hostname)
++					require.Equal(t, test.origin, pin.Origin.String())
++				}
++				return err
++			})
++			err := app.Run([]string{"cloudflared", "tunnel", "--no-autoupdate", "--protocol", "quic",
++				"--vanora-pin-hostname", test.hostname, "--vanora-pin-origin", test.origin, "run"})
++			if test.want == "" {
++				require.NoError(t, err)
++			} else {
++				require.ErrorContains(t, err, test.want)
++			}
++		})
++	}
++}
++
++func TestVanoraPrepareTunnelConfig(t *testing.T) {
++	t.Setenv("TUNNEL_TOKEN", "fixture-token")
++	localConfig := config.GetConfiguration()
++	original := *localConfig
++	t.Cleanup(func() { *localConfig = original })
++	*localConfig = config.Configuration{
++		Ingress:     []config.UnvalidatedIngressRule{{Hostname: "*", Service: "bastion"}},
++		WarpRouting: config.WarpRoutingConfig{MaxActiveFlows: new(uint64(17))},
++		OriginRequest: config.OriginRequestConfig{
++			HTTPHostHeader: new("ignored.example"),
++		},
++	}
++	for _, protocol := range []connection.Protocol{connection.QUIC, connection.HTTP2} {
++		t.Run(protocol.String(), func(t *testing.T) {
++			const origin = "127.0.0.1:32123"
++			const hostname = "relay.example"
++			app := vanoraCLI(func(c *cli.Context) error {
++				pin, err := readVanoraPin(c, c.String(TunnelTokenFlag) != "")
++				require.NoError(t, err)
++				ctx, cancel := context.WithCancel(t.Context())
++				cancel()
++				var output bytes.Buffer
++				log := zerolog.New(&output)
++				named := &connection.TunnelProperties{}
++				tunnelConfig, orchestratorConfig, err := prepareTunnelConfig(ctx, c, &cliutil.BuildInfo{}, &log, nil, named, pin)
++				require.NoError(t, err)
++				require.Equal(t, protocol, tunnelConfig.ProtocolSelector.Current())
++				require.Equal(t, pin, orchestratorConfig.VanoraPin)
++				rules := orchestratorConfig.Ingress.Rules
++				require.Len(t, rules, 2)
++				require.Equal(t, hostname, rules[0].Hostname)
++				require.Equal(t, "http://"+origin, rules[0].Service.String())
++				require.Equal(t, hostname, rules[0].Config.HTTPHostHeader)
++				require.Nil(t, rules[0].Path)
++				require.Equal(t, "http_status:404", rules[1].Service.String())
++				require.Empty(t, rules[1].Hostname)
++				require.Nil(t, rules[1].Path)
++				require.Empty(t, orchestratorConfig.Ingress.Defaults.HTTPHostHeader)
++				require.Equal(t, config.WarpRoutingConfig{}, orchestratorConfig.WarpRouting.RawConfig())
++				require.Nil(t, tunnelConfig.OriginDNSService)
++				require.Nil(t, tunnelConfig.ICMPRouterServer)
++				require.Nil(t, managementIngressRules(pin, nil))
++				require.Same(t, tunnelConfig.OriginDialerService, orchestratorConfig.OriginDialerService)
++				_, err = tunnelConfig.OriginDialerService.DialTCP(t.Context(), netip.MustParseAddrPort(origin))
++				require.ErrorContains(t, err, "private network origin dialing is disabled")
++				_, err = tunnelConfig.OriginDialerService.DialUDP(origins.VirtualDNSServiceAddr)
++				require.ErrorContains(t, err, "private network origin dialing is disabled")
++				require.True(t, isSecretFlag(vanoraPinOriginFlag))
++				require.NotContains(t, nonSecretFlagsList, vanoraPinOriginFlag)
++				require.NotContains(t, nonSecretCliFlags(&log, c, nonSecretFlagsList), vanoraPinOriginFlag)
++				logClientOptions(c, &log)
++				require.Contains(t, output.String(), "vanora-pin-origin:"+secretValue)
++				require.NotContains(t, output.String(), origin)
++
++				named.QuickTunnelUrl = "https://quick.example"
++				require.ErrorIs(t, startServer(c, nil, named, nil, pin), errVanoraPinTokenRun)
++				require.ErrorIs(t, StartServer(c, nil, named, nil), errVanoraPinTokenRun)
++				return nil
++			})
++			require.NoError(t, app.Run([]string{"cloudflared", "tunnel", "--no-autoupdate", "--protocol", protocol.String(),
++				"--url", "http://127.0.0.1:32124", "--vanora-pin-hostname", hostname, "--vanora-pin-origin", origin,
++				"run", "--dns-resolver-addrs", "invalid-resolver"}))
++		})
++	}
++}
+diff --git a/ingress/ingress.go b/ingress/ingress.go
+index f5758fc..1d1b528 100644
+--- a/ingress/ingress.go
++++ b/ingress/ingress.go
+@@ -3,6 +3,7 @@ package ingress
+ import (
+ 	"fmt"
+ 	"net"
++	"net/netip"
+ 	"net/url"
+ 	"path"
+ 	"regexp"
+@@ -206,6 +207,26 @@ func ParseIngress(conf *config.Configuration) (Ingress, error) {
+ 	return validateIngress(conf.Ingress, originRequestFromConfig(conf.OriginRequest))
+ }
+ 
++// PinLoopbackHTTPOrigin locks the first ingress rule's HTTP dialer before origins start.
++func (ing *Ingress) PinLoopbackHTTPOrigin(origin netip.AddrPort) error {
++	if origin.Port() == 0 ||
++		(origin.Addr() != netip.AddrFrom4([4]byte{127, 0, 0, 1}) && origin.Addr() != netip.IPv6Loopback()) {
++		return errors.New("pinned HTTP origin must be a loopback address with a nonzero port")
++	}
++	if len(ing.Rules) == 0 {
++		return errors.New("pinned HTTP origin requires an ingress rule")
++	}
++	service, ok := ing.Rules[0].Service.(*httpService)
++	if !ok || service == nil || service.url == nil || service.url.Scheme != "http" || service.url.Host != origin.String() {
++		return errors.New("first ingress rule must use the pinned loopback HTTP origin")
++	}
++	if service.transport != nil || service.pinnedOrigin.IsValid() {
++		return errors.New("HTTP origin must be pinned once before it starts")
++	}
++	service.pinnedOrigin = origin
++	return nil
++}
++
+ // ParseIngressFromConfigAndCLI will parse the configuration rules from config files for ingress
+ // rules and then attempt to parse CLI for ingress rules.
+ // Will always return at least one valid ingress rule. If none are provided by the user, the default
+@@ -321,7 +342,7 @@ func (ing Ingress) StartOrigins(
+ ) error {
+ 	for _, rule := range ing.Rules {
+ 		if err := rule.Service.start(log, shutdownC, rule.Config); err != nil {
+-			return errors.Wrapf(err, "Error starting local service %s", rule.Service)
++			return errors.Wrapf(err, "Error starting local service %s", rule.ServiceForLogging())
+ 		}
+ 	}
+ 	return nil
+diff --git a/ingress/origin_dialer.go b/ingress/origin_dialer.go
+index 9860077..d7f4cf6 100644
+--- a/ingress/origin_dialer.go
++++ b/ingress/origin_dialer.go
+@@ -2,6 +2,7 @@ package ingress
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -13,6 +14,8 @@ import (
+ 
+ const writeDeadlineUDP = 200 * time.Millisecond
+ 
++var errPrivateNetworkBlocked = errors.New("private network origin dialing is disabled in Vanora pinned mode")
++
+ // OriginTCPDialer provides a TCP dial operation to a requested address.
+ type OriginTCPDialer interface {
+ 	DialTCP(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+@@ -33,7 +36,8 @@ type OriginConfig struct {
+ 	// The default Dialer used if no reserved services are found for an origin request.
+ 	DefaultDialer OriginDialer
+ 	// Timeout on write operations for TCP connections to the origin.
+-	TCPWriteTimeout time.Duration
++	TCPWriteTimeout     time.Duration
++	BlockPrivateNetwork bool
+ }
+ 
+ // OriginDialerService provides a proxy TCP and UDP dialer to origin services while allowing reserved
+@@ -49,6 +53,7 @@ type OriginDialerService struct {
+ 	defaultDialerM sync.RWMutex
+ 	// Write timeout for TCP connections
+ 	writeTimeout time.Duration
++	blockPrivate bool
+ 
+ 	logger *zerolog.Logger
+ }
+@@ -59,6 +64,7 @@ func NewOriginDialer(config OriginConfig, logger *zerolog.Logger) *OriginDialerS
+ 		reservedUDPServices: map[netip.AddrPort]OriginUDPDialer{},
+ 		defaultDialer:       config.DefaultDialer,
+ 		writeTimeout:        config.TCPWriteTimeout,
++		blockPrivate:        config.BlockPrivateNetwork,
+ 		logger:              logger,
+ 	}
+ }
+@@ -81,6 +87,9 @@ func (d *OriginDialerService) UpdateDefaultDialer(dialer *Dialer) {
+ 
+ // DialTCP will perform a dial TCP to the requested addr.
+ func (d *OriginDialerService) DialTCP(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
++	if d.blockPrivate {
++		return nil, errPrivateNetworkBlocked
++	}
+ 	conn, err := d.dialTCP(ctx, addr)
+ 	if err != nil {
+ 		return nil, err
+@@ -106,6 +115,9 @@ func (d *OriginDialerService) dialTCP(ctx context.Context, addr netip.AddrPort)
+ 
+ // DialUDP will perform a dial UDP to the requested addr.
+ func (d *OriginDialerService) DialUDP(addr netip.AddrPort) (net.Conn, error) {
++	if d.blockPrivate {
++		return nil, errPrivateNetworkBlocked
++	}
+ 	// Check to see if any reserved services are available for this addr and call their dialer instead.
+ 	if dialer, ok := d.reservedUDPServices[addr]; ok {
+ 		return dialer.DialUDP(addr)
+diff --git a/ingress/origin_icmp_proxy_test.go b/ingress/origin_icmp_proxy_test.go
+index b85013b..9c3e727 100644
+--- a/ingress/origin_icmp_proxy_test.go
++++ b/ingress/origin_icmp_proxy_test.go
+@@ -1,3 +1,5 @@
++//go:build darwin || linux || (windows && cgo)
++
+ package ingress
+ 
+ import (
+@@ -13,7 +15,6 @@ import (
+ 
+ 	"github.com/fortytw2/leaktest"
+ 	"github.com/google/gopacket/layers"
+-	"github.com/rs/zerolog"
+ 	"github.com/stretchr/testify/require"
+ 	"golang.org/x/net/icmp"
+ 	"golang.org/x/net/ipv4"
+@@ -25,7 +26,6 @@ import (
+ )
+ 
+ var (
+-	noopLogger            = zerolog.Nop()
+ 	localhostIP           = netip.MustParseAddr("127.0.0.1")
+ 	localhostIPv6         = netip.MustParseAddr("::1")
+ 	testFunnelIdleTimeout = time.Millisecond * 10
+diff --git a/ingress/origin_service.go b/ingress/origin_service.go
+index e13204c..d95ae30 100644
+--- a/ingress/origin_service.go
++++ b/ingress/origin_service.go
+@@ -8,6 +8,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/http"
++	"net/netip"
+ 	"net/url"
+ 	"strconv"
+ 	"time"
+@@ -72,6 +73,7 @@ type httpService struct {
+ 	hostHeader     string
+ 	transport      *http.Transport
+ 	matchSNIToHost bool
++	pinnedOrigin   netip.AddrPort
+ }
+ 
+ func (o *httpService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
+@@ -81,7 +83,7 @@ func (o *httpService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRe
+ 	}
+ 	o.hostHeader = cfg.HTTPHostHeader
+ 	o.transport = transport
+-	o.matchSNIToHost = cfg.MatchSNIToHost
++	o.matchSNIToHost = cfg.MatchSNIToHost && !o.pinnedOrigin.IsValid()
+ 	return nil
+ }
+ 
+@@ -344,23 +346,12 @@ func (nrc *NopReadCloser) Close() error {
+ }
+ 
+ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerolog.Logger) (*http.Transport, error) {
+-	originCertPool, err := tlsconfig.LoadOriginCA(cfg.CAPool, log)
+-	if err != nil {
+-		return nil, errors.Wrap(err, "Error loading cert pool")
+-	}
+-
+ 	httpTransport := http.Transport{
+-		Proxy:                 http.ProxyFromEnvironment,
+ 		MaxIdleConns:          cfg.KeepAliveConnections,
+ 		MaxIdleConnsPerHost:   cfg.KeepAliveConnections,
+ 		IdleConnTimeout:       cfg.KeepAliveTimeout.Duration,
+ 		TLSHandshakeTimeout:   cfg.TLSTimeout.Duration,
+ 		ExpectContinueTimeout: 1 * time.Second,
+-		TLSClientConfig:       &tls.Config{RootCAs: originCertPool, InsecureSkipVerify: cfg.NoTLSVerify},
+-		ForceAttemptHTTP2:     cfg.Http2Origin,
+-	}
+-	if _, isHelloWorld := service.(*helloWorld); !isHelloWorld && cfg.OriginServerName != "" {
+-		httpTransport.TLSClientConfig.ServerName = cfg.OriginServerName
+ 	}
+ 
+ 	dialer := &net.Dialer{
+@@ -371,6 +362,44 @@ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerol
+ 		dialer.FallbackDelay = -1 // As of Golang 1.12, a negative delay disables "happy eyeballs"
+ 	}
+ 
++	if service, ok := service.(*httpService); ok && service.pinnedOrigin.IsValid() {
++		if service.url == nil || service.url.Scheme != "http" {
++			return nil, errors.New("pinned origin requires HTTP")
++		}
++		pinned := service.pinnedOrigin
++		httpTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++			switch network {
++			case "tcp", "tcp4", "tcp6":
++			default:
++				return nil, errors.New("pinned origin supports only TCP dials")
++			}
++			target, err := netip.ParseAddrPort(addr)
++			if err != nil || target != pinned {
++				return nil, errors.New("origin dial does not match the pinned loopback address")
++			}
++			conn, err := dialer.DialContext(ctx, network, pinned.String())
++			if err != nil {
++				return nil, redactPinnedNetworkError(err)
++			}
++			return pinnedHTTPConn{Conn: conn}, nil
++		}
++		httpTransport.DialTLSContext = func(context.Context, string, string) (net.Conn, error) {
++			return nil, errors.New("TLS origin dials are disabled for a pinned origin")
++		}
++		return &httpTransport, nil
++	}
++
++	originCertPool, err := tlsconfig.LoadOriginCA(cfg.CAPool, log)
++	if err != nil {
++		return nil, errors.Wrap(err, "Error loading cert pool")
++	}
++	httpTransport.Proxy = http.ProxyFromEnvironment
++	httpTransport.TLSClientConfig = &tls.Config{RootCAs: originCertPool, InsecureSkipVerify: cfg.NoTLSVerify}
++	httpTransport.ForceAttemptHTTP2 = cfg.Http2Origin
++	if _, isHelloWorld := service.(*helloWorld); !isHelloWorld && cfg.OriginServerName != "" {
++		httpTransport.TLSClientConfig.ServerName = cfg.OriginServerName
++	}
++
+ 	// DialContext depends on which kind of origin is being used.
+ 	dialContext := dialer.DialContext
+ 	switch service := service.(type) {
+@@ -389,6 +418,31 @@ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerol
+ 	return &httpTransport, nil
+ }
+ 
++type pinnedHTTPConn struct {
++	net.Conn
++}
++
++func (conn pinnedHTTPConn) Read(data []byte) (int, error) {
++	count, err := conn.Conn.Read(data)
++	return count, redactPinnedNetworkError(err)
++}
++
++func (conn pinnedHTTPConn) Write(data []byte) (int, error) {
++	count, err := conn.Conn.Write(data)
++	return count, redactPinnedNetworkError(err)
++}
++
++func redactPinnedNetworkError(err error) error {
++	var opErr *net.OpError
++	if err != nil && errors.As(err, &opErr) {
++		redacted := *opErr
++		redacted.Addr = nil
++		redacted.Source = nil
++		return &redacted
++	}
++	return err
++}
++
+ // MockOriginHTTPService should only be used by other packages to mock OriginService. Set Transport to configure desired RoundTripper behavior.
+ type MockOriginHTTPService struct {
+ 	Transport http.RoundTripper
+diff --git a/ingress/packet_router_test.go b/ingress/packet_router_test.go
+index 77ab5e8..a90df6c 100644
+--- a/ingress/packet_router_test.go
++++ b/ingress/packet_router_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/google/gopacket/layers"
++	"github.com/rs/zerolog"
+ 	"github.com/stretchr/testify/require"
+ 	"golang.org/x/net/icmp"
+ 	"golang.org/x/net/ipv4"
+@@ -19,6 +20,7 @@ import (
+ )
+ 
+ var (
++	noopLogger    = zerolog.Nop()
+ 	defaultRouter = &icmpRouter{
+ 		ipv4Proxy: nil,
+ 		ipv4Src:   netip.MustParseAddr("172.16.0.1"),
+diff --git a/ingress/rule.go b/ingress/rule.go
+index de6ae40..17bfebf 100644
+--- a/ingress/rule.go
++++ b/ingress/rule.go
+@@ -51,9 +51,20 @@ func (r Rule) MultiLineString() string {
+ 	return out.String()
+ }
+ 
++// ServiceForLogging returns a description safe to include in diagnostic logs.
++func (r *Rule) ServiceForLogging() string {
++	if service, ok := r.Service.(*httpService); ok && service.pinnedOrigin.IsValid() {
++		return "pinned HTTP origin"
++	}
++	return r.Service.String()
++}
++
+ // Matches checks if the rule matches a given hostname/path combination.
+ func (r *Rule) Matches(hostname, path string) bool {
+ 	hostMatch := r.Hostname == "" || r.Hostname == "*" || matchHost(r.Hostname, hostname)
++	if service, ok := r.Service.(*httpService); ok && service.pinnedOrigin.IsValid() {
++		hostMatch = len(hostname) == len(r.Hostname) && strings.EqualFold(r.Hostname, hostname)
++	}
+ 	punycodeHostMatch := false
+ 	if r.punycodeHostname != "" {
+ 		punycodeHostMatch = matchHost(r.punycodeHostname, hostname)
+diff --git a/ingress/vanora_pin_test.go b/ingress/vanora_pin_test.go
+new file mode 100644
+index 0000000..409b929
+--- /dev/null
++++ b/ingress/vanora_pin_test.go
+@@ -0,0 +1,166 @@
++package ingress
++
++import (
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++
++	"github.com/cloudflare/cloudflared/config"
++)
++
++func TestVanoraPinnedHTTPTransport(t *testing.T) {
++	var otherHits atomic.Int32
++	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(serverA.Close)
++	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		otherHits.Add(1)
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(serverB.Close)
++	t.Setenv("HTTP_PROXY", serverB.URL)
++	t.Setenv("HTTPS_PROXY", serverB.URL)
++	t.Setenv("NO_PROXY", "")
++
++	pinned := netip.MustParseAddrPort(strings.TrimPrefix(serverA.URL, "http://"))
++	other := netip.MustParseAddrPort(strings.TrimPrefix(serverB.URL, "http://"))
++	port := strconv.Itoa(int(pinned.Port()))
++	rules, err := ParseIngress(&config.Configuration{Ingress: []config.UnvalidatedIngressRule{
++		{Hostname: "relay.example", Service: serverA.URL},
++		{Service: "http_status:404"},
++	}})
++	require.NoError(t, err)
++	log := zerolog.Nop()
++	require.Error(t, rules.PinLoopbackHTTPOrigin(other))
++	require.NoError(t, rules.PinLoopbackHTTPOrigin(pinned))
++	require.Error(t, rules.PinLoopbackHTTPOrigin(pinned))
++	rules.Rules[0].Config.MatchSNIToHost = true
++	require.NoError(t, rules.StartOrigins(&log, t.Context().Done()))
++	service := rules.Rules[0].Service.(*httpService)
++	transport := service.transport
++	t.Cleanup(transport.CloseIdleConnections)
++	require.Nil(t, transport.Proxy)
++	require.Nil(t, transport.TLSClientConfig)
++	require.False(t, service.matchSNIToHost)
++	require.False(t, transport.ForceAttemptHTTP2)
++
++	for _, test := range []struct{ network, address, reason string }{
++		{"tcp", other.String(), "does not match"},
++		{"tcp", "localhost:" + port, "does not match"},
++		{"tcp", "[::ffff:127.0.0.1]:" + port, "does not match"},
++		{"unix", pinned.String(), "only TCP"},
++		{"udp", pinned.String(), "only TCP"},
++	} {
++		conn, err := transport.DialContext(t.Context(), test.network, test.address)
++		require.Nil(t, conn)
++		require.ErrorContains(t, err, test.reason)
++		require.NotContains(t, err.Error(), test.address)
++	}
++	conn, err := transport.DialTLSContext(t.Context(), "tcp", pinned.String())
++	require.Nil(t, conn)
++	require.ErrorContains(t, err, "TLS origin dials are disabled")
++	for _, network := range []string{"tcp", "tcp4"} {
++		conn, err := transport.DialContext(t.Context(), network, pinned.String())
++		require.NoError(t, err)
++		require.NoError(t, conn.Close())
++	}
++	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://relay.example", nil)
++	require.NoError(t, err)
++	resp, err := service.RoundTrip(req)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusNoContent, resp.StatusCode)
++	require.NoError(t, resp.Body.Close())
++	require.Zero(t, otherHits.Load())
++}
++
++func TestVanoraPinLoopbackHTTPOriginRejectsInvalidRules(t *testing.T) {
++	t.Parallel()
++	pinned := netip.MustParseAddrPort("127.0.0.1:12345")
++	rules := Ingress{}
++	require.Error(t, rules.PinLoopbackHTTPOrigin(pinned))
++	rules.Rules = []Rule{{Service: &httpService{}}}
++	require.Error(t, rules.PinLoopbackHTTPOrigin(pinned))
++	log := zerolog.Nop()
++	_, err := newHTTPTransport(&httpService{pinnedOrigin: pinned}, OriginRequestConfig{}, &log)
++	require.ErrorContains(t, err, "requires HTTP")
++
++	for _, service := range []string{"https://" + pinned.String(), "unix:/origin.sock", "http_status:404"} {
++		rules, err := ParseIngress(&config.Configuration{Ingress: []config.UnvalidatedIngressRule{{Service: service}}})
++		require.NoError(t, err)
++		require.Error(t, rules.PinLoopbackHTTPOrigin(pinned))
++	}
++	configured, err := ParseIngress(&config.Configuration{Ingress: []config.UnvalidatedIngressRule{{Service: "http://" + pinned.String()}}})
++	require.NoError(t, err)
++	for _, address := range []string{"127.0.0.1:0", "127.0.0.2:12345", "[::1%test]:12345"} {
++		require.Error(t, configured.PinLoopbackHTTPOrigin(netip.MustParseAddrPort(address)))
++	}
++	require.NoError(t, configured.StartOrigins(&log, t.Context().Done()))
++	require.ErrorContains(t, configured.PinLoopbackHTTPOrigin(pinned), "before it starts")
++}
++
++func TestVanoraPinnedIPv6HTTPDial(t *testing.T) {
++	t.Parallel()
++	listener, err := net.Listen("tcp6", "[::1]:0")
++	if err != nil {
++		t.Skipf("IPv6 loopback unavailable: %v", err)
++	}
++	t.Cleanup(func() { _ = listener.Close() })
++
++	pinned := listener.Addr().(*net.TCPAddr).AddrPort()
++	rules, err := ParseIngress(&config.Configuration{Ingress: []config.UnvalidatedIngressRule{{Service: "http://" + pinned.String()}}})
++	require.NoError(t, err)
++	require.NoError(t, rules.PinLoopbackHTTPOrigin(pinned))
++	log := zerolog.Nop()
++	require.NoError(t, rules.StartOrigins(&log, t.Context().Done()))
++	transport := rules.Rules[0].Service.(*httpService).transport
++	conn, err := transport.DialContext(t.Context(), "tcp6", pinned.String())
++	require.NoError(t, err)
++	require.NoError(t, conn.Close())
++}
++
++func TestVanoraBlocksPrivateAndReservedDials(t *testing.T) {
++	t.Parallel()
++	log := zerolog.Nop()
++	dialer := NewOriginDialer(OriginConfig{BlockPrivateNetwork: true}, &log)
++	virtualDNS := netip.MustParseAddrPort("[2606:4700:cf1:2000::1]:53")
++	dialer.AddReservedService(nil, []netip.AddrPort{virtualDNS})
++	addresses := []netip.AddrPort{
++		netip.MustParseAddrPort("192.168.1.1:80"),
++		netip.MustParseAddrPort("127.0.0.1:12345"),
++		netip.MustParseAddrPort("1.1.1.1:443"),
++		virtualDNS,
++	}
++	assertBlocked := func() {
++		for _, address := range addresses {
++			conn, err := dialer.DialTCP(t.Context(), address)
++			require.Nil(t, conn)
++			require.ErrorIs(t, err, errPrivateNetworkBlocked)
++			conn, err = dialer.DialUDP(address)
++			require.Nil(t, conn)
++			require.ErrorIs(t, err, errPrivateNetworkBlocked)
++		}
++	}
++	assertBlocked()
++	dialer.UpdateDefaultDialer(NewDialer(WarpRoutingConfig{}))
++	assertBlocked()
++}
++
++func TestVanoraPinnedNetworkErrorOmitsAddresses(t *testing.T) {
++	t.Parallel()
++	source := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 54213}
++	target := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 65123}
++	err := redactPinnedNetworkError(&net.OpError{Op: "read", Net: "tcp", Source: source, Addr: target, Err: io.ErrUnexpectedEOF})
++	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
++	require.NotContains(t, err.Error(), source.String())
++	require.NotContains(t, err.Error(), target.String())
++}
+diff --git a/orchestration/config.go b/orchestration/config.go
+index d454b3c..b2845fe 100644
+--- a/orchestration/config.go
++++ b/orchestration/config.go
+@@ -22,6 +22,7 @@ type Config struct {
+ 	Ingress             *ingress.Ingress
+ 	WarpRouting         ingress.WarpRoutingConfig
+ 	OriginDialerService *ingress.OriginDialerService
++	VanoraPin           VanoraPin
+ 	// DisablePathNormalization is a process-local override for ingress matching.
+ 	DisablePathNormalization bool
+ 
+diff --git a/orchestration/orchestrator.go b/orchestration/orchestrator.go
+index ca63061..cd035d0 100644
+--- a/orchestration/orchestrator.go
++++ b/orchestration/orchestrator.go
+@@ -34,8 +34,9 @@ type Orchestrator struct {
+ 	// Set of internal ingress rules defined at cloudflared startup (separate from user-defined ingress rules)
+ 	internalRules []ingress.Rule
+ 	// cloudflared Configuration
+-	config *Config
+-	tags   []pogs.Tag
++	config    *Config
++	vanoraPin VanoraPin
++	tags      []pogs.Tag
+ 	// flowLimiter tracks active sessions across the tunnel and limits new sessions if they are above the limit.
+ 	flowLimiter cfdflow.Limiter
+ 	// Origin dialer service to manage egress socket dialing.
+@@ -86,6 +87,7 @@ func newOrchestrator(
+ 		currentVersion:        -1,
+ 		internalRules:         internalRules,
+ 		config:                config,
++		vanoraPin:             config.VanoraPin,
+ 		tags:                  tags,
+ 		flowLimiter:           cfdflow.NewLimiter(config.WarpRouting.MaxActiveFlows),
+ 		originDialerService:   config.OriginDialerService,
+@@ -114,6 +116,16 @@ func (o *Orchestrator) UpdateConfig(version int32, config []byte) *pogs.UpdateCo
+ 			LastAppliedVersion: o.currentVersion,
+ 		}
+ 	}
++	if o.vanoraPin.Active() {
++		if err := o.vanoraPin.validateRemoteConfig(config); err != nil {
++			o.log.Warn().Int32("version", version).Err(err).Msg("Rejected pinned configuration update")
++			return &pogs.UpdateConfigurationResponse{LastAppliedVersion: o.currentVersion, Err: err}
++		}
++		o.currentVersion = version
++		configVersion.Set(float64(version))
++		o.log.Info().Int32("version", version).Msg("Acknowledged pinned configuration update")
++		return &pogs.UpdateConfigurationResponse{LastAppliedVersion: o.currentVersion}
++	}
+ 	var newConf newRemoteConfig
+ 	if err := json.Unmarshal(config, &newConf); err != nil {
+ 		o.log.Err(err).
+@@ -256,6 +268,12 @@ func (o *Orchestrator) GetConfigJSON() ([]byte, error) {
+ func (o *Orchestrator) GetVersionedConfigJSON() ([]byte, error) {
+ 	o.lock.RLock()
+ 	defer o.lock.RUnlock()
++	if o.vanoraPin.Active() {
++		return json.Marshal(struct {
++			Version int32           `json:"version"`
++			Config  json.RawMessage `json:"config"`
++		}{Version: o.currentVersion, Config: json.RawMessage(`{"redacted":true}`)})
++	}
+ 	var currentConfiguration = struct {
+ 		Version int32 `json:"version"`
+ 		Config  struct {
+diff --git a/orchestration/vanora_pin.go b/orchestration/vanora_pin.go
+new file mode 100644
+index 0000000..68ab18d
+--- /dev/null
++++ b/orchestration/vanora_pin.go
+@@ -0,0 +1,128 @@
++package orchestration
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/netip"
++	"slices"
++	"strings"
++	"unicode/utf8"
++)
++
++const maxPinnedConfigSize = 64 * 1024
++
++// VanoraPin specifies the process-local hostname and origin of a restricted tunnel.
++type VanoraPin struct {
++	Hostname string
++	Origin   netip.AddrPort
++}
++
++// Active reports whether this tunnel started with a pin.
++func (pin VanoraPin) Active() bool {
++	return pin.Origin.IsValid()
++}
++
++// Service returns the canonical HTTP service URL for the pinned origin.
++func (pin VanoraPin) Service() string {
++	return "http://" + pin.Origin.String()
++}
++
++func (pin VanoraPin) validateRemoteConfig(raw []byte) error {
++	if len(raw) > maxPinnedConfigSize {
++		return errors.New("pinned configuration exceeds size limit")
++	}
++	top, ok := pinnedObject(raw, "ingress", "warp-routing", "originRequest")
++	if !ok || !utf8.Valid(raw) {
++		return errors.New("invalid pinned configuration object")
++	}
++	if !emptyPinnedObject(top["originRequest"]) {
++		return errors.New("global originRequest must be empty")
++	}
++	if warp := top["warp-routing"]; !omittedOrNull(warp) {
++		warpFields, ok := pinnedObject(warp, "enabled")
++		if !ok || (len(warpFields) != 0 && !bytes.Equal(warpFields["enabled"], []byte("false"))) {
++			return errors.New("warp-routing must be disabled")
++		}
++	}
++
++	var rules []json.RawMessage
++	if err := json.Unmarshal(top["ingress"], &rules); err != nil || len(rules) != 2 {
++		return errors.New("pinned configuration requires exactly two ingress rules")
++	}
++	first, ok := pinnedObject(rules[0], "hostname", "service", "path", "originRequest")
++	if !ok || !pin.matchesHostname(first["hostname"]) ||
++		!matchesPinnedString(first["service"], pin.Service()) || !emptyPinnedString(first["path"]) {
++		return errors.New("first ingress rule must match the pinned hostname and service with no path")
++	}
++	if options := first["originRequest"]; !omittedOrNull(options) {
++		fields, ok := pinnedObject(options, "httpHostHeader")
++		if !ok || (len(fields) != 0 && !pin.matchesHostname(fields["httpHostHeader"])) {
++			return errors.New("first ingress rule may only set the pinned HTTP host header")
++		}
++	}
++	catchAll, ok := pinnedObject(rules[1], "hostname", "service", "path", "originRequest")
++	if !ok || !matchesPinnedString(catchAll["service"], "http_status:404") ||
++		!emptyPinnedString(catchAll["hostname"]) || !emptyPinnedString(catchAll["path"]) ||
++		!emptyPinnedObject(catchAll["originRequest"]) {
++		return errors.New("second ingress rule must be an unconditional HTTP 404")
++	}
++	return nil
++}
++
++func pinnedObject(raw json.RawMessage, allowed ...string) (map[string]json.RawMessage, bool) {
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	first, err := decoder.Token()
++	if err != nil || first != json.Delim('{') {
++		return nil, false
++	}
++	fields := make(map[string]json.RawMessage, len(allowed))
++	for decoder.More() {
++		token, err := decoder.Token()
++		key, ok := token.(string)
++		if err != nil || !ok || !slices.Contains(allowed, key) {
++			return nil, false
++		}
++		if _, duplicate := fields[key]; duplicate {
++			return nil, false
++		}
++		var value json.RawMessage
++		if err := decoder.Decode(&value); err != nil {
++			return nil, false
++		}
++		fields[key] = value
++	}
++	last, err := decoder.Token()
++	if err != nil || last != json.Delim('}') {
++		return nil, false
++	}
++	_, err = decoder.Token()
++	return fields, err == io.EOF
++}
++
++func omittedOrNull(raw json.RawMessage) bool {
++	return len(raw) == 0 || bytes.Equal(raw, []byte("null"))
++}
++
++func emptyPinnedObject(raw json.RawMessage) bool {
++	if omittedOrNull(raw) {
++		return true
++	}
++	_, ok := pinnedObject(raw)
++	return ok
++}
++
++func emptyPinnedString(raw json.RawMessage) bool {
++	return len(raw) == 0 || bytes.Equal(raw, []byte(`""`))
++}
++
++func matchesPinnedString(raw json.RawMessage, expected string) bool {
++	var value string
++	return len(raw) != 0 && raw[0] == '"' && json.Unmarshal(raw, &value) == nil && value == expected
++}
++
++func (pin VanoraPin) matchesHostname(raw json.RawMessage) bool {
++	var value string
++	return json.Unmarshal(raw, &value) == nil && len(value) == len(pin.Hostname) && strings.EqualFold(value, pin.Hostname)
++}
+diff --git a/orchestration/vanora_pin_test.go b/orchestration/vanora_pin_test.go
+new file mode 100644
+index 0000000..85c3dea
+--- /dev/null
++++ b/orchestration/vanora_pin_test.go
+@@ -0,0 +1,436 @@
++package orchestration
++
++import (
++	"bytes"
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/gobwas/ws/wsutil"
++	"github.com/google/gopacket/layers"
++	"github.com/google/uuid"
++	gows "github.com/gorilla/websocket"
++	prometheusmodel "github.com/prometheus/client_model/go"
++	"github.com/quic-go/quic-go"
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/net/icmp"
++	"golang.org/x/net/ipv4"
++
++	"github.com/cloudflare/cloudflared/client"
++	"github.com/cloudflare/cloudflared/config"
++	"github.com/cloudflare/cloudflared/connection"
++	"github.com/cloudflare/cloudflared/connection/dialopts"
++	"github.com/cloudflare/cloudflared/ingress"
++	"github.com/cloudflare/cloudflared/ingress/origins"
++	"github.com/cloudflare/cloudflared/packet"
++	cfdquic "github.com/cloudflare/cloudflared/quic"
++	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
++	rpcquic "github.com/cloudflare/cloudflared/tunnelrpc/quic"
++)
++
++func TestVanoraPinnedOriginIntegration(t *testing.T) {
++	const hostname = "relay.example"
++	var hitsA, hitsB atomic.Int32
++	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		hitsA.Add(1)
++		w.Header().Set("X-Observed-Host", r.Host)
++		if r.Host != hostname {
++			w.WriteHeader(http.StatusMisdirectedRequest)
++			return
++		}
++		if !gows.IsWebSocketUpgrade(r) {
++			w.WriteHeader(http.StatusNoContent)
++			return
++		}
++		upgrader := gows.Upgrader{}
++		conn, err := upgrader.Upgrade(w, r, w.Header())
++		if err != nil {
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		messageType, message, err := conn.ReadMessage()
++		if err == nil {
++			_ = conn.WriteMessage(messageType, message)
++		}
++	}))
++	t.Cleanup(serverA.Close)
++	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		hitsB.Add(1)
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(serverB.Close)
++
++	var output bytes.Buffer
++	log := zerolog.New(zerolog.SyncWriter(&output)).Level(zerolog.DebugLevel)
++	pin := VanoraPin{Hostname: hostname, Origin: netip.MustParseAddrPort(serverA.Listener.Addr().String())}
++	orch, initialConfig := newVanoraTestOrchestrator(t, pin, &log)
++	initialProxy, err := orch.GetOriginProxy()
++	require.NoError(t, err)
++	initialShutdown := orch.proxyShutdownC
++	edge := connection.NewHTTP2Connection(nil, orch, nil, connection.NewObserver(&log), 0, nil, &log)
++	http2Edge := httptest.NewUnstartedServer(edge)
++	http2Edge.EnableHTTP2 = true
++	http2Edge.StartTLS()
++	t.Cleanup(http2Edge.Close)
++
++	request := func(host string, status int) {
++		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, http2Edge.URL+"/unfiltered/path", nil)
++		require.NoError(t, err)
++		req.Host = host
++		response, err := http2Edge.Client().Do(req)
++		require.NoError(t, err)
++		require.NoError(t, response.Body.Close())
++		require.Equal(t, 2, response.ProtoMajor)
++		require.Equal(t, status, response.StatusCode)
++		if status == http.StatusNoContent {
++			checkVanoraHostHeader(t, response.Header, hostname)
++		}
++	}
++	require.Equal(t, int32(-1), orch.currentVersion)
++	request(strings.ToUpper(hostname), http.StatusNoContent)
++	request("unmatched.example", http.StatusNotFound)
++	request("management.argotunnel.com", http.StatusNotFound)
++	require.EqualValues(t, 1, hitsA.Load())
++	require.Zero(t, hitsB.Load())
++
++	for _, addr := range []netip.AddrPort{pin.Origin, origins.VirtualDNSServiceAddr} {
++		_, err := initialConfig.OriginDialerService.DialTCP(t.Context(), addr)
++		require.ErrorContains(t, err, "private network origin dialing is disabled")
++		_, err = initialConfig.OriginDialerService.DialUDP(addr)
++		require.ErrorContains(t, err, "private network origin dialing is disabled")
++	}
++	initialConfig.VanoraPin = VanoraPin{}
++	named := fmt.Sprintf(`{"hostname":"%s","service":"%s"}`, hostname, pin.Service())
++	catchAll := `{"service":"http_status:404"}`
++	withOptions := strings.TrimSuffix(named, "}")
++	minimal := `{"ingress":[` + named + `,` + catchAll + `]}`
++	relayPayload := `{"ingress":[` + named + `,` + catchAll + `],"warp-routing":{"enabled":false}}`
++	rejected := orch.UpdateConfig(0, []byte(`{"ingress":[]}`))
++	require.Error(t, rejected.Err)
++	require.Equal(t, int32(-1), rejected.LastAppliedVersion)
++	for version, payload := range []string{
++		relayPayload,
++		minimal,
++		`{"originRequest":{}, "warp-routing":{}, "ingress":[` + withOptions + `,"originRequest":{}},` + catchAll + `]}`,
++		`{"originRequest":null, "warp-routing":null, "ingress":[` + withOptions + `,"originRequest":null},` +
++			`{"service":"http_status:404","path":"","hostname":"","originRequest":null}]}`,
++		`{"ingress":[` + strings.Replace(withOptions, hostname, strings.ToUpper(hostname), 1) +
++			`,"path":"","originRequest":{"httpHostHeader":"RELAY.EXAMPLE"}},{"service":"http_status:404","originRequest":{}}]}`,
++	} {
++		response := orch.UpdateConfig(int32(version), []byte(payload))
++		require.NoError(t, response.Err)
++		require.Equal(t, int32(version), response.LastAppliedVersion)
++		request(hostname, http.StatusNoContent)
++	}
++	lastApplied := orch.currentVersion
++	require.EqualValues(t, 4, lastApplied)
++	var metric prometheusmodel.Metric
++	require.NoError(t, configVersion.Write(&metric))
++	require.EqualValues(t, lastApplied, metric.GetGauge().GetValue())
++
++	drifts := []struct{ name, payload string }{
++		{"other loopback port", strings.ReplaceAll(minimal, pin.Service(), serverB.URL)},
++		{"private LAN", strings.ReplaceAll(minimal, pin.Service(), "http://192.168.1.20:4444")},
++		{"external", strings.ReplaceAll(minimal, pin.Service(), "http://upstream.example:4444")},
++		{"https", strings.ReplaceAll(minimal, "http://", "https://")},
++		{"noncanonical URL", strings.ReplaceAll(minimal, pin.Service(), pin.Service()+"/")},
++		{"wildcard", strings.ReplaceAll(minimal, hostname, "*.example")},
++		{"hostname suffix", strings.ReplaceAll(minimal, hostname, hostname+".")},
++		{"extra rule", `{"ingress":[` + named + `,` + named + `,` + catchAll + `]}`},
++		{"reordered rules", `{"ingress":[` + catchAll + `,` + named + `]}`},
++		{"missing ingress", `{}`},
++		{"nonarray ingress", `{"ingress":{}}`},
++		{"null ingress rule", `{"ingress":[null,` + catchAll + `]}`},
++		{"path filter", `{"ingress":[` + withOptions + `,"path":"^/relay"},` + catchAll + `]}`},
++		{"null path", `{"ingress":[` + withOptions + `,"path":null},` + catchAll + `]}`},
++		{"warp enabled", strings.ReplaceAll(relayPayload, "false", "true")},
++		{"warp null enabled", strings.ReplaceAll(relayPayload, "false", "null")},
++		{"warp extra key", strings.ReplaceAll(relayPayload, `"enabled":false`, `"enabled":false,"connectTimeout":30`)},
++		{"warp wrong type", strings.ReplaceAll(relayPayload, `{"enabled":false}`, `false`)},
++		{"global override", `{"originRequest":{"connectTimeout":30},"ingress":[` + named + `,` + catchAll + `]}`},
++		{"per-rule override", `{"ingress":[` + withOptions + `,"originRequest":{"noTLSVerify":true}},` + catchAll + `]}`},
++		{"wrong host header", `{"ingress":[` + withOptions + `,"originRequest":{"httpHostHeader":"other.example"}},` + catchAll + `]}`},
++		{"null host header", `{"ingress":[` + withOptions + `,"originRequest":{"httpHostHeader":null}},` + catchAll + `]}`},
++		{"extra named rule key", `{"ingress":[` + withOptions + `,"unknown":true},` + catchAll + `]}`},
++		{"catch-all hostname", strings.ReplaceAll(minimal, catchAll, `{"service":"http_status:404","hostname":"*"}`)},
++		{"catch-all null hostname", strings.ReplaceAll(minimal, catchAll, `{"service":"http_status:404","hostname":null}`)},
++		{"catch-all path", strings.ReplaceAll(minimal, catchAll, `{"service":"http_status:404","path":"^/"}`)},
++		{"catch-all service", strings.ReplaceAll(minimal, "http_status:404", "http_status:503")},
++		{"catch-all override", strings.ReplaceAll(minimal, catchAll, `{"service":"http_status:404","originRequest":{"httpHostHeader":"relay.example"}}`)},
++		{"catch-all extra key", strings.ReplaceAll(minimal, catchAll, `{"service":"http_status:404","unknown":0}`)},
++		{"duplicate ingress", `{"ingress":[],` + minimal[1:]},
++		{"escaped duplicate ingress", `{"\u0069ngress":[],` + minimal[1:]},
++		{"duplicate service", `{"ingress":[` + withOptions + `,"service":"` + pin.Service() + `"},` + catchAll + `]}`},
++		{"duplicate warp key", strings.ReplaceAll(relayPayload, `"enabled":false`, `"enabled":false,"enabled":false`)},
++		{"duplicate origin key", `{"ingress":[` + withOptions + `,"originRequest":{"httpHostHeader":"relay.example","httpHostHeader":"relay.example"}},` + catchAll + `]}`},
++		{"trailing object", minimal + `{}`},
++		{"trailing scalar", minimal + ` null`},
++		{"truncated config", minimal[:len(minimal)-1]},
++		{"unknown top-level key", `{"probe":"raw-config-must-not-log",` + minimal[1:]},
++		{"case-variant top-level key", strings.ReplaceAll(minimal, "ingress", "Ingress")},
++		{"oversize", strings.Repeat(" ", maxPinnedConfigSize) + minimal},
++	}
++	for _, drift := range drifts {
++		t.Run(drift.name, func(t *testing.T) {
++			response := orch.UpdateConfig(lastApplied+1, []byte(drift.payload))
++			require.Error(t, response.Err)
++			require.Equal(t, lastApplied, response.LastAppliedVersion)
++			request(hostname, http.StatusNoContent)
++			require.Zero(t, hitsB.Load())
++		})
++	}
++	stale := orch.UpdateConfig(lastApplied, []byte("unused"))
++	require.NoError(t, stale.Err)
++	require.Equal(t, lastApplied, stale.LastAppliedVersion)
++	require.NoError(t, configVersion.Write(&metric))
++	require.EqualValues(t, lastApplied, metric.GetGauge().GetValue())
++	currentProxy, err := orch.GetOriginProxy()
++	require.NoError(t, err)
++	require.Same(t, initialProxy, currentProxy)
++	require.Equal(t, initialShutdown, orch.proxyShutdownC)
++	diagnostic, err := orch.GetVersionedConfigJSON()
++	require.NoError(t, err)
++	require.JSONEq(t, `{"version":4,"config":{"redacted":true}}`, string(diagnostic))
++	require.Contains(t, output.String(), `"message":"Acknowledged pinned configuration update"`)
++	require.Contains(t, output.String(), `"message":"Rejected pinned configuration update"`)
++	require.NotContains(t, output.String(), pin.Origin.String())
++	require.NotContains(t, output.String(), serverB.Listener.Addr().String())
++	require.NotContains(t, output.String(), "raw-config-must-not-log")
++	require.NotContains(t, output.String(), `"config":`)
++
++	testVanoraWebsocket(t, edge, hostname)
++	require.EqualValues(t, 1+5+len(drifts)+1, hitsA.Load())
++	require.Zero(t, hitsB.Load())
++
++	testVanoraQUICEdge(t, orch, initialConfig.OriginDialerService, http2Edge.TLS.Certificates, http2Edge.Certificate(),
++		hostname, relayPayload, drifts[0].payload)
++	require.EqualValues(t, 1+5+len(drifts)+3, hitsA.Load())
++	require.Zero(t, hitsB.Load())
++
++	restartPin := VanoraPin{Hostname: hostname, Origin: netip.MustParseAddrPort(serverB.Listener.Addr().String())}
++	restarted, _ := newVanoraTestOrchestrator(t, restartPin, &testLogger)
++	response := restarted.UpdateConfig(0, []byte(relayPayload))
++	require.Error(t, response.Err)
++	require.EqualValues(t, -1, response.LastAppliedVersion)
++	restartedProxy, err := restarted.GetOriginProxy()
++	require.NoError(t, err)
++	resp, err := proxyHTTP(restartedProxy, hostname)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusNoContent, resp.StatusCode)
++	require.NoError(t, resp.Body.Close())
++	require.EqualValues(t, 1, hitsB.Load())
++}
++
++func newVanoraTestOrchestrator(t *testing.T, pin VanoraPin, log *zerolog.Logger) (*Orchestrator, *Config) {
++	t.Helper()
++	rules, err := ingress.ParseIngress(&config.Configuration{Ingress: []config.UnvalidatedIngressRule{
++		{Hostname: pin.Hostname, Service: pin.Service(), OriginRequest: config.OriginRequestConfig{HTTPHostHeader: &pin.Hostname}},
++		{Service: "http_status:404"},
++	}})
++	require.NoError(t, err)
++	require.NoError(t, rules.PinLoopbackHTTPOrigin(pin.Origin))
++	compiled := &Config{
++		Ingress:             &rules,
++		VanoraPin:           pin,
++		OriginDialerService: ingress.NewOriginDialer(ingress.OriginConfig{BlockPrivateNetwork: true}, log),
++	}
++	orch, err := NewOrchestrator(t.Context(), compiled, nil, nil, log)
++	require.NoError(t, err)
++	return orch, compiled
++}
++
++func testVanoraWebsocket(t *testing.T, edge *connection.HTTP2Connection, hostname string) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	reqReader, reqWriter := io.Pipe()
++	defer func() { _ = reqWriter.Close() }()
++	respReader, respWriter := io.Pipe()
++	defer func() { _ = respReader.Close() }()
++	edgeWriter := &respReadWriteFlusher{Reader: respReader, w: respWriter, headers: make(http.Header), hasStatus: make(chan struct{})}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+hostname+"/relay", reqReader)
++	require.NoError(t, err)
++	req.Header.Set(connection.InternalUpgradeHeader, connection.WebsocketUpgrade)
++	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		defer func() { _ = respWriter.Close() }()
++		edge.ServeHTTP(edgeWriter, req)
++	}()
++	stop := context.AfterFunc(ctx, func() {
++		_ = reqWriter.CloseWithError(ctx.Err())
++		_ = respWriter.CloseWithError(ctx.Err())
++	})
++	defer stop()
++	select {
++	case <-edgeWriter.hasStatus:
++	case <-ctx.Done():
++		t.Fatal("websocket upgrade timed out")
++	}
++	require.Equal(t, http.StatusOK, edgeWriter.statusCode)
++	checkVanoraHostHeader(t, edgeWriter.Header(), hostname)
++	require.NoError(t, wsutil.WriteClientText(reqWriter, []byte("vanora pinned echo")))
++	echo, err := wsutil.ReadServerText(edgeWriter)
++	require.NoError(t, err)
++	require.Equal(t, "vanora pinned echo", string(echo))
++	require.NoError(t, reqWriter.Close())
++	select {
++	case <-done:
++	case <-ctx.Done():
++		t.Fatal("websocket proxy did not close")
++	}
++}
++
++func checkVanoraHostHeader(t *testing.T, headers http.Header, hostname string) {
++	t.Helper()
++	decoded, err := connection.DeserializeHeaders(headers.Get(connection.CanonicalResponseUserHeaders))
++	require.NoError(t, err)
++	require.Contains(t, decoded, connection.HTTPHeader{Name: "X-Observed-Host", Value: hostname})
++}
++
++type vanoraTestControlStream struct{}
++
++func (vanoraTestControlStream) ServeControlStream(ctx context.Context, _ io.ReadWriteCloser, _ *pogs.ConnectionOptions, _ connection.TunnelConfigJSONGetter) error {
++	<-ctx.Done()
++	return ctx.Err()
++}
++
++func (vanoraTestControlStream) IsStopped() bool {
++	return false
++}
++
++func testVanoraQUICEdge(t *testing.T, orch *Orchestrator, dialer *ingress.OriginDialerService,
++	certificates []tls.Certificate, cert *x509.Certificate, hostname, matching, drift string,
++) {
++	t.Helper()
++	const alpn = "vanora-test"
++	const timeout = 5 * time.Second
++	ctx, cancel := context.WithTimeout(t.Context(), timeout)
++	defer cancel()
++	quicConfig := &quic.Config{EnableDatagrams: true}
++	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{Certificates: certificates, NextProtos: []string{alpn}}, quicConfig)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = listener.Close() })
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++	log := zerolog.Nop()
++	conn, err := connection.DialQuic(ctx, quicConfig, &tls.Config{
++		ServerName: "example.com", RootCAs: roots, NextProtos: []string{alpn},
++	}, netip.MustParseAddrPort(listener.Addr().String()), net.IPv4(127, 0, 0, 1), 0, &log, dialopts.DialOpts{SkipPortReuse: true})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
++	edge, err := listener.Accept(ctx)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = edge.CloseWithError(0, "") })
++
++	datagrams := connection.NewDatagramV2Connection(ctx, conn, dialer, nil, 0, timeout, timeout, orch.GetFlowLimiter(), &log)
++	tunnel := connection.NewTunnelConnection(ctx, conn, 0, orch, datagrams, vanoraTestControlStream{},
++		&client.ConnectionOptionsSnapshot{}, timeout, timeout, 0, &log)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_ = tunnel.Serve(ctx)
++	}()
++	defer func() {
++		cancel()
++		<-done
++	}()
++
++	rpcStream, err := edge.OpenStreamSync(ctx)
++	require.NoError(t, err)
++	cfdStream := cfdquic.NewSafeStreamCloser(rpcStream, timeout, &log)
++	rpc, err := rpcquic.NewCloudflaredClient(ctx, cfdStream, timeout)
++	require.NoError(t, err)
++	defer rpc.Close()
++	lastVersion := orch.currentVersion
++	response, err := rpc.UpdateConfiguration(ctx, lastVersion+1, []byte(drift))
++	require.NoError(t, err)
++	require.Error(t, response.Err)
++	require.Equal(t, lastVersion, response.LastAppliedVersion)
++	response, err = rpc.UpdateConfiguration(ctx, lastVersion+1, []byte(matching))
++	require.NoError(t, err)
++	require.NoError(t, response.Err)
++	require.Equal(t, lastVersion+1, response.LastAppliedVersion)
++
++	openStream := func() *rpcquic.RequestClientStream {
++		stream, err := edge.OpenStreamSync(ctx)
++		require.NoError(t, err)
++		require.NoError(t, stream.SetDeadline(time.Now().Add(timeout)))
++		safeStream := cfdquic.NewSafeStreamCloser(stream, timeout, &log)
++		t.Cleanup(func() { _ = safeStream.Close() })
++		return &rpcquic.RequestClientStream{ReadWriteCloser: safeStream}
++	}
++	for _, test := range []struct{ host, status string }{
++		{strings.ToUpper(hostname), "204"},
++		{"unmatched.example", "404"},
++		{"management.argotunnel.com", "404"},
++	} {
++		stream := openStream()
++		require.NoError(t, stream.WriteConnectRequestData("https://"+test.host+"/relay", pogs.ConnectionTypeHTTP,
++			pogs.Metadata{Key: connection.HTTPHostKey, Val: test.host},
++			pogs.Metadata{Key: connection.HTTPMethodKey, Val: http.MethodGet}))
++		result, err := stream.ReadConnectResponseData()
++		require.NoError(t, err)
++		require.Empty(t, result.Error)
++		require.Contains(t, result.Metadata, pogs.Metadata{Key: connection.HTTPStatus, Val: test.status})
++		if test.status == "204" {
++			require.Contains(t, result.Metadata, pogs.Metadata{Key: "HttpHeader:X-Observed-Host", Val: hostname})
++		}
++	}
++
++	ws := openStream()
++	require.NoError(t, ws.WriteConnectRequestData("https://"+hostname+"/relay", pogs.ConnectionTypeWebsocket,
++		pogs.Metadata{Key: connection.HTTPHostKey, Val: hostname},
++		pogs.Metadata{Key: connection.HTTPMethodKey, Val: http.MethodGet},
++		pogs.Metadata{Key: "HttpHeader:Sec-WebSocket-Key", Val: "dGhlIHNhbXBsZSBub25jZQ=="}))
++	result, err := ws.ReadConnectResponseData()
++	require.NoError(t, err)
++	require.Empty(t, result.Error)
++	require.Contains(t, result.Metadata, pogs.Metadata{Key: connection.HTTPStatus, Val: "101"})
++	require.Contains(t, result.Metadata, pogs.Metadata{Key: "HttpHeader:X-Observed-Host", Val: hostname})
++	require.NoError(t, wsutil.WriteClientText(ws, []byte("vanora QUIC echo")))
++	echo, err := wsutil.ReadServerText(ws)
++	require.NoError(t, err)
++	require.Equal(t, "vanora QUIC echo", string(echo))
++
++	virtualDNS := origins.VirtualDNSServiceAddr
++	tcp := openStream()
++	require.NoError(t, tcp.WriteConnectRequestData("192.168.1.20:5151", pogs.ConnectionTypeTCP))
++	result, err = tcp.ReadConnectResponseData()
++	require.NoError(t, err)
++	require.Contains(t, result.Error, "private network origin dialing is disabled")
++	for _, addr := range []netip.AddrPort{netip.MustParseAddrPort("192.168.1.20:5151"), virtualDNS} {
++		udp, err := rpc.RegisterUdpSession(ctx, uuid.New(), net.IP(addr.Addr().AsSlice()), addr.Port(), time.Second, "")
++		require.NoError(t, err)
++		require.ErrorContains(t, udp.Err, "private network origin dialing is disabled")
++	}
++
++	echoRequest, err := packet.NewEncoder().Encode(&packet.ICMP{
++		IP: &packet.IP{
++			Src: netip.MustParseAddr("192.0.2.1"), Dst: netip.MustParseAddr("127.0.0.1"),
++			Protocol: layers.IPProtocolICMPv4, TTL: 1,
++		},
++		Message: &icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: 1, Seq: 1}},
++	})
++	require.NoError(t, err)
++	raw, err := cfdquic.SuffixType(echoRequest.Data, cfdquic.DatagramTypeIP)
++	require.NoError(t, err)
++	require.NoError(t, edge.SendDatagram(raw))
++	datagramCtx, cancelDatagram := context.WithTimeout(ctx, 200*time.Millisecond)
++	defer cancelDatagram()
++	_, err = edge.ReceiveDatagram(datagramCtx)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++}
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index 970ef05..e0a2239 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -135,7 +135,7 @@ func (p *Proxy) ProxyHTTP(
+ 	rule, ruleNum := p.ingressRules.FindMatchingRule(req.Host, req.URL)
+ 	ruleSpan.SetAttributes(attribute.Int("rule-num", ruleNum))
+ 	ruleSpan.End()
+-	logger := newHTTPLogger(p.log, tr.ConnIndex, req, ruleNum, rule.Service.String())
++	logger := newHTTPLogger(p.log, tr.ConnIndex, req, ruleNum, rule.ServiceForLogging())
+ 	logHTTPRequest(&logger, req)
+ 	if err, applied := p.applyIngressMiddleware(rule, req, w); err != nil {
+ 		if applied {
+diff --git a/supervisor/supervisor.go b/supervisor/supervisor.go
+index f497eb8..2ce73c2 100644
+--- a/supervisor/supervisor.go
++++ b/supervisor/supervisor.go
+@@ -122,7 +122,9 @@ func (s *Supervisor) Run(
+ 	}
+ 
+ 	// Setup DNS Resolver refresh
+-	go s.config.OriginDNSService.StartRefreshLoop(ctx)
++	if s.config.OriginDNSService != nil {
++		go s.config.OriginDNSService.StartRefreshLoop(ctx)
++	}
+ 
+ 	return s.runWithRegionChanges(ctx, connectedSignal)
+ }

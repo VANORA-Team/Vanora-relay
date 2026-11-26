@@ -1,0 +1,4 @@
+repo=https://github.com/cloudflare/cloudflared.git
+tag=2026.11.2
+commit=dc57315806d5faa8715f728fd37b5302c81c467b
+patch_sha256=78672d11eec27eb25ee996cc793ee7336b461630e14c07dfd991f24ac7f35dff

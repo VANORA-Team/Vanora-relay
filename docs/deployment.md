@@ -264,3 +264,21 @@ Content-Type: application/json
 | **本机 IP 过滤与动态网卡** | `ice.Server` 在启动时采集宿主机 `net.InterfaceAddrs()`，自动拦截除同连接 `TURN_PUBLIC_IP` hairpin 外的全部本机网卡地址及私网/回环/保留段。若宿主机运行期间动态挂载新公网弹性 IP，需重启 `relay` 生效。 |
 | **流量计量日志** | 访问者的中继有效载荷字节数在 Grant 结束时通过 `slog.Info` 输出（去重计量、不含协议开销与直连流量）；如需计费或留档请在部署侧采集结构化日志。 |
 | **极端受限网络** | TURN 控制支持 UDP / TCP，媒体中继使用 UDP；仅允许出站 HTTPS (`443/tcp`) 的严格企业防火墙环境仍可能无法连通。 |
+
+## 6. 托管 Cloudflare Named Tunnel
+
+| 配置 | 行为 |
+| :--- | :--- |
+| `RELAY_TUNNEL_MODE=off`（默认） | 保留信令与 STUN/TURN，无隧道数据库或 Cloudflare API 依赖。 |
+| `RELAY_TUNNEL_MODE=managed` | 启用隧道分配、连接器令牌、边缘门禁与清理。 |
+| `RELAY_TUNNEL_MODE=drain` | 保留分配查询与清理，停止新分配、连接器令牌和访客接入。 |
+| `RELAY_TUNNEL_PROCESS=all`（默认） | 同时提供 `/v1/signal`、STUN/TURN、`/v1/tunnels/*` 与 `/healthz`。 |
+| `RELAY_TUNNEL_PROCESS=control` | 仅提供 `/v1/tunnels/*` 与 `/healthz`，运行后台清理与操作队列。要求启用隧道和 Postgres。 |
+| `RELAY_TUNNEL_STORE=sqlite`（默认） | 设置私有持久目录中的 `RELAY_TUNNEL_SQLITE_PATH`，每个库由单进程持有。 |
+| `RELAY_TUNNEL_STORE=postgres` | 设置 `RELAY_TUNNEL_PG_DSN`，远程连接要求 `sslmode=verify-full`。 |
+
+- 启用时设置 `RELAY_TUNNEL_CONTROL_ORIGIN`、`RELAY_TUNNEL_MASTER_KEY`（至少 32 字节，使用 hex 或 base64 表示）、`RELAY_CF_ACCOUNT_ID`、`RELAY_CF_ZONE_ID`、`RELAY_CF_BASE_DOMAIN` 和 `RELAY_CF_NAMESPACE`。配置最小权限的 `RELAY_CF_API_TOKEN`，或同时设置 `RELAY_CF_TUNNEL_TOKEN` 与 `RELAY_CF_DNS_TOKEN`。启动会校验持久化作用域与 Cloudflare Zone。
+- 官方 `cn` / `global` 分别配置独立 CA、`RELAY_ALLOWED_ISSUER`、权益服务、Cloudflare 资源与数据库。`RELAY_TUNNEL_SITE_MANIFEST` 指定的 JSON 文件须包含 `channel`、`ca_public_key_sha256`、`allowed_issuer`、`membership_origin`、`control_origin`、`cf_account_id`、`cf_zone_id`、`cf_base_domain`、`cf_namespace`。自建 `self` 则配置 `RELAY_SELF_TOKEN` 和逗号分隔的 `RELAY_TUNNEL_SELF_ALLOWED_DEVICES`，每台准入设备可持有一个槽位。
+- `RELAY_TUNNEL_EDGE_GATE` 支持 `worker_hmac`（默认，Free Zone）、`waf_hmac`（使用支持 timed HMAC 的 WAF 方案）和仅用于 `self` 的 `desktop_only`。HMAC 模式要求 `RELAY_CF_EDGE_KEY`。托管模式还要求 `RELAY_TUNNEL_EDGE_CANARY_HOST`，启动探针须通过 TLS 校验并收到无票 `401` 或 `403`。Free Zone 部署与密钥轮换见 [Worker 部署手册](../deploy/cf-edge-worker/README.md)。Universal SSL 的一级子域覆盖意味着 `<label>.t.example.com` 需要额外证书覆盖，或改用专用 Zone apex。
+- `RELAY_TRUSTED_PROXY_CIDRS` 仅填写可控的反代 IP / CIDR。隧道管理面和隧道信令配额从右向左跳过可信代理，选择第一个不可信的 `X-Forwarded-For` 地址。未配置时直接使用连接 IP。
+- `RELAY_TUNNEL_REAPER` 默认 `dry-run`，确认观察结果后可切换 `active`，也可设为 `off`。官方槽位可通过 `RELAY_TUNNEL_FREE_SLOTS`、`RELAY_TUNNEL_PAID_DEFAULT_SLOTS` 调整，账号硬上限通过 `RELAY_TUNNEL_ACCOUNT_CAP` 配置。

@@ -294,6 +294,53 @@ AI 对话正文仅在加密 DataChannel（或局域网 mTLS WebSocket）与本�
 
 ---
 
+## 托管 Cloudflare 隧道
+
+### HTTPS 管理面
+
+所有路径均使用 `POST /v1/tunnels/…`，JSON 正文不超过 8 KiB。除 `challenge` 外，每次请求都须使用一次性挑战。官方认证头为 `Vanora-Certificate` 和 `Vanora-Lease`，自建认证头为 `Authorization: Bearer …` 和无填充 base64url 的 `Vanora-Public-Key`。管理响应使用 `Cache-Control: no-store`。
+
+| 路径后缀 | 请求 JSON | 成功响应 |
+| :--- | :--- | :--- |
+| `challenge` | `{action, device_id}`，`device_id` 为签名设备 | `200 {challenge, expires_at}`，有效期 30 秒 |
+| `{device_id}/status` | `{}` | `200` 分配视图 |
+| `{device_id}/register`、`origin`、`recover`、`resume` | `{origin, runtime_id, if_generation}` | `202` 操作视图，同代且已就绪时可返回 `200` 分配视图 |
+| `{device_id}/token` | `{origin, runtime_id, if_generation}` | `200 {generation, incarnation, hostname, tunnel_id, connector_token}` |
+| `{device_id}/release`、`disconnect`、`deprovision` | `{if_generation}` | `202` 操作视图，已达目标状态或同步解绑时返回 `200` 分配视图 |
+| `{device_id}/operations/{operation_id}` | `{}`，挑战动作名为 `operations` | `200` 操作视图 |
+
+`Vanora-Proof` 为无填充 base64url 的 Ed25519 签名。签名按下列顺序拼接字段，每个字段使用 4 字节大端长度前缀与原始 UTF-8 字节。
+
+```text
+vanora/tunnel-http/v1, channel, canonical_control_origin, POST,
+canonical_path, actor_device_id, Vanora-Challenge, hex(sha256(raw_body)),
+Idempotency-Key, credential_hash_hex
+```
+
+官方凭据摘要为 `hex(sha256(certificate + NUL + lease))`，自建为 `hex(sha256(raw_public_key))`。写操作需要 1–128 个可见 ASCII 字符的 `Idempotency-Key`。使用新挑战和原始请求字节重试同一操作。`status`、`operations`、`disconnect`、`deprovision` 支持官方同账号设备代管，其余操作仅支持目标设备本人。需要运行时的操作须先经信令上报宿主。`origin` 只接受回环地址与端口。错误为 `{error, request_id, retry_after?, operation_id?}`。`429` 与 `503` 的 `Retry-After` 和 `retry_after` 均为整数秒。
+
+### WSS 隧道信令
+
+启用时 `/v1/signal` 的 `auth.ok` 附带 `tunnel_scope`。端点发出的每条 `tunnel.*` 消息都须使用现有 Ed25519 信封签名，签名 JSON `body` 含 `aud: "tunnel-v1"` 和 `scope: tunnel_scope`。
+
+隧道访客在签名 `auth.login` 正文中提供 `desktop` 和 `tunnel: true`。Relay 为该目标保留独立的信令位置，只处理隧道消息和官方租约续期，使 WebRTC 与隧道可以同时建立连接。
+
+| 记录 | 关键字段与行为 |
+| :--- | :--- |
+| `tunnel.host` → `tunnel.host.ack` | 桌面提交 `socket_id`、`runtime_id`、`phase`、`generation`、`incarnation`、`can_recover`。按 15 秒续告，有效期 45 秒。首次注册前可使用 generation / incarnation `0`。 |
+| `tunnel.connect` → `tunnel.offer` | 访客提交 `expected_owner`、`target_pin_hash`（目标公钥 SHA-256 小写 hex）、`client_nonce`、可选 `lease` / `pair_proof`。自建的 `expected_owner` 为宿主设备 ID。Relay 转发原签名 `connect` 和身份信息，供桌面核验既有配对和 ACL。Offer 5 秒过期。 |
+| `tunnel.permit` → `tunnel.target` | 桌面签名确认 `generation`、`incarnation`、`runtime_id`、`hostname`、`jti`、`client_nonce`、`visitor_key_hash`、`path`、`expires_at`，可带 `lease`。`tunnel.target` 带原签名 `permit`、`edge_ticket` 与 `access_until`。 |
+| `tunnel.refresh` → `tunnel.access` | 访客使用递增序号提交 `jti`、`generation`、`incarnation`、`runtime_id`。每次刷新至少间隔 10 秒。Relay 向双方发送更新后的 `access_until`，受权益及证书和租约约束，最长 60 秒。 |
+| `tunnel.close` | 双方可以提交 `reason` 和可选 `retry_after`。未获许可、无权或不可用的访客收到 `device_unavailable`。 |
+
+边缘入口为 `GET /v1/tunnel/ws`，须为 WebSocket 升级。HMAC 门禁使用 `Vanora-Ticket-ID` 与 `Vanora-Edge-Ticket`。桌面还须独立校验 `Vanora-Client-Proof`、一次性许可和内层双向 TLS。
+
+### 已配对连接的路由选择
+
+路由优先级依次为 `loopback`、`lan`、`tailnet`、`direct`、`relay`、`cf_tunnel`。首次配对通过 WebRTC 完成。已配对的 WAN 连接先尝试 WebRTC，遇到传输故障或等待 4 秒仍未就绪时尝试托管隧道。客户端只启用首个完成认证的连接，认证、配对或撤销错误会终止后备尝试。隧道重连沿用同一会话的 `events.resume` 游标。
+
+官方移动端通过 `NewChannelClient` 或 `SetChannel` 显式绑定 `cn` 或 `global`。客户端使用本地配置校验邀请站点。已配对且启用隧道回退的客户端在 `Routes()` 中报告 `cf_tunnel`，并在隧道连接建立后通过 `ConnectionState()` 报告该路径。
+
 ## 相关规范
 
 - [外部身份签发与验签规范 (EN)](../internal/identity/README.md)
