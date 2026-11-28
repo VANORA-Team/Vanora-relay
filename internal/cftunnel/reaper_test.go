@@ -108,11 +108,15 @@ func TestReaperObservationsPresenceAndDryRun(t *testing.T) {
 		check(t, h.service.RecordPresence(t.Context(), req.DeviceBinding, cftunnel.Presence{
 			SocketID: "socket", RuntimeID: "runtime", Phase: phase, Generation: a.Generation, Seq: int64(index + 1),
 		}))
+		h.cf.calls = nil
 		sweep, err := reaper.SweepOnce(t.Context())
 		check(t, err)
 		want := 0
 		if phase == cftunnel.PresenceStopping {
 			want = 1
+		}
+		if observed := slices.Contains(h.cf.calls, "get_tunnel"); observed != (want == 1) {
+			t.Fatalf("Cloudflare observation during %s: %v", phase, h.cf.calls)
 		}
 		if sweep.Candidates["down"] != want || sweep.ReleaseClaims != 0 || sweep.PendingExpired != 0 {
 			t.Fatalf("dry run with %s: %+v", phase, sweep)

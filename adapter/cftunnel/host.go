@@ -82,6 +82,7 @@ type HostManager struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	listener        *Listener
+	sendSignal      func(protocol.Message) error
 	runtimeID       string
 	socketID        string
 	seq             uint64
@@ -92,6 +93,7 @@ type HostManager struct {
 	ack             chan struct{}
 	wake            chan struct{}
 	leaseWake       chan struct{}
+	offerSlots      chan struct{}
 	workers         sync.WaitGroup
 	status          HostStatus
 	observed        HostStatus
@@ -102,6 +104,7 @@ type HostManager struct {
 	connectorRun    uint64
 	revision        uint64
 	lease           endpoint.LeaseProof
+	leaseUntil      time.Time
 	leaseVersion    atomic.Uint64
 }
 
@@ -123,8 +126,11 @@ func NewHostManager(opts HostOptions) (*HostManager, error) {
 			return StartConnector(ctx, connector)
 		}
 	}
-	return &HostManager{opts: opts, control: control, pub: control.pub, ack: make(chan struct{}, 1),
-		wake: make(chan struct{}, 1), leaseWake: make(chan struct{}, 1), status: HostStatus{State: "disabled"}}, nil
+	return &HostManager{
+		opts: opts, control: control, pub: control.pub, sendSignal: opts.SendSignal,
+		ack: make(chan struct{}, 1), wake: make(chan struct{}, 1), leaseWake: make(chan struct{}, 1),
+		offerSlots: make(chan struct{}, 8), status: HostStatus{State: "disabled"},
+	}, nil
 }
 
 type hostHandler struct {
@@ -181,6 +187,33 @@ func (h *HostManager) Start(ctx context.Context) error {
 	return nil
 }
 
+// ReattachSignal rebinds the running HostManager to a replacement signaling
+// socket on the same scope so the loopback listener and cloudflared connector
+// stay alive across brief signaling reconnects.
+func (h *HostManager) ReattachSignal(scope string, send func(protocol.Message) error) error {
+	if scope != h.opts.Scope || send == nil {
+		return errors.New("cftunnel: signal reattach scope mismatch")
+	}
+	h.mu.Lock()
+	if h.ctx == nil || h.stopping || h.ctx.Err() != nil {
+		h.mu.Unlock()
+		return ErrTunnelUnavailable
+	}
+	h.sendSignal = send
+	h.socketID = protocol.NewID()
+	h.ackedUntil = time.Time{}
+	h.ackedSeq = h.seq
+	if h.phase == "listening" {
+		h.listeningSeq = 0
+	}
+	h.mu.Unlock()
+	if _, err := h.announce(); err != nil {
+		return err
+	}
+	h.observe()
+	return nil
+}
+
 func (h *HostManager) Stop() {
 	h.lifecycle.Lock()
 	defer h.lifecycle.Unlock()
@@ -203,6 +236,7 @@ func (h *HostManager) Stop() {
 	h.opMu.Unlock()
 	h.mu.Lock()
 	h.lease = endpoint.LeaseProof{}
+	h.leaseUntil = time.Time{}
 	h.status = HostStatus{State: "disabled"}
 	h.mu.Unlock()
 	h.observe()
@@ -240,6 +274,16 @@ func (h *HostManager) setPhaseLocked(phase string) {
 	}
 }
 
+func (h *HostManager) sendMessage(msg protocol.Message) error {
+	h.mu.Lock()
+	send := h.sendSignal
+	h.mu.Unlock()
+	if send == nil {
+		return errors.New("cftunnel: host signaling unavailable")
+	}
+	return send(msg)
+}
+
 func (h *HostManager) announce() (uint64, error) {
 	h.signalMu.Lock()
 	defer h.signalMu.Unlock()
@@ -256,25 +300,54 @@ func (h *HostManager) announce() (uint64, error) {
 		h.listeningSeq = h.seq
 	}
 	msg := protocol.Message{Type: "tunnel.host", From: h.opts.DeviceID, To: "signal", Seq: h.seq}
+	send := h.sendSignal
 	h.mu.Unlock()
+	if send == nil {
+		return 0, errors.New("cftunnel: host signaling unavailable")
+	}
 	if err := msg.Sign(h.opts.PrivateKey, protocol.Encode(body)); err != nil {
 		return 0, err
 	}
-	return msg.Seq, h.opts.SendSignal(msg)
+	return msg.Seq, send(msg)
+}
+
+func (h *HostManager) syncPresence(ctx context.Context) error {
+	seq, err := h.announce()
+	if err != nil {
+		return err
+	}
+	ackCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	return h.waitAck(ackCtx, seq)
+}
+
+func isBindingMismatch(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusForbidden && apiErr.Code == "device_binding_mismatch"
 }
 
 func (h *HostManager) heartbeat() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	consecutiveErrors := 0
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
 			if _, err := h.announce(); err != nil {
-				h.cancel()
-				return
+				consecutiveErrors++
+				h.mu.Lock()
+				h.ackedUntil = time.Time{}
+				h.mu.Unlock()
+				h.observe()
+				if consecutiveErrors >= 3 {
+					h.cancel()
+					return
+				}
+				continue
 			}
+			consecutiveErrors = 0
 			h.observe()
 		}
 	}
@@ -399,6 +472,12 @@ func (h *HostManager) reconcile(ctx context.Context) error {
 			result, err = control.Recover(ctx, device, origin, h.runtimeID, a.Generation)
 		case "ready":
 			result, err = control.ReconcileOrigin(ctx, device, origin, h.runtimeID, a.Generation)
+			if isBindingMismatch(err) {
+				if syncErr := h.syncPresence(ctx); syncErr != nil {
+					return syncErr
+				}
+				result, err = control.ReconcileOrigin(ctx, device, origin, h.runtimeID, a.Generation)
+			}
 		case "pending", "reconciling", "releasing", "disconnecting", "deprovisioning":
 			if err := backoff(ctx, attempt, 200*time.Millisecond); err != nil {
 				return err
@@ -407,8 +486,22 @@ func (h *HostManager) reconcile(ctx context.Context) error {
 		default:
 			return errors.New("cftunnel: allocation unavailable")
 		}
+		asyncOp := result.Operation.ID != ""
 		if err = h.awaitMutation(ctx, result, err); err != nil {
 			return err
+		}
+		if a.State == "disabled" || a.State == "released" {
+			updated, statusErr := h.allocation(ctx)
+			if statusErr != nil {
+				return statusErr
+			}
+			h.setAllocation(updated)
+			if updated.Generation != a.Generation || updated.Incarnation != a.Incarnation {
+				if syncErr := h.syncPresence(ctx); syncErr != nil {
+					return syncErr
+				}
+			}
+			continue
 		}
 		if a.State == "ready" && result.Allocation.State == "ready" {
 			if !h.validAllocation(result.Allocation) {
@@ -416,12 +509,33 @@ func (h *HostManager) reconcile(ctx context.Context) error {
 			}
 			return h.startConnector(ctx, result.Allocation)
 		}
+		if a.State == "ready" && asyncOp {
+			updated, statusErr := h.allocation(ctx)
+			if statusErr != nil {
+				return statusErr
+			}
+			if updated.State == "ready" {
+				h.setAllocation(updated)
+				if updated.Generation != a.Generation || updated.Incarnation != a.Incarnation {
+					if syncErr := h.syncPresence(ctx); syncErr != nil {
+						return syncErr
+					}
+				}
+				return h.startConnector(ctx, updated)
+			}
+		}
 	}
 }
 
 func (h *HostManager) startConnector(ctx context.Context, allocation AllocationView) error {
 	h.setAllocation(allocation)
 	token, err := h.control.Token(ctx, h.opts.DeviceID, h.listener.Origin(), h.runtimeID, allocation.Generation)
+	if isBindingMismatch(err) {
+		if syncErr := h.syncPresence(ctx); syncErr != nil {
+			return syncErr
+		}
+		token, err = h.control.Token(ctx, h.opts.DeviceID, h.listener.Origin(), h.runtimeID, allocation.Generation)
+	}
 	if err != nil {
 		return err
 	}
@@ -462,10 +576,11 @@ func (h *HostManager) startConnector(ctx context.Context, allocation AllocationV
 
 func (h *HostManager) connectorEvent(run uint64, state string) {
 	switch state {
-	case "ready", "starting", "backoff", "stopped", "exited", "start_failed", "startup_timeout", "fallback":
+	case "ready", "starting", "backoff", "stopped", "exited", "start_failed", "startup_timeout", "fallback", "failed":
 	default:
 		return
 	}
+	var failedConnector ConnectorProcess
 	h.mu.Lock()
 	if h.stopping || h.paused || run != h.connectorRun {
 		h.mu.Unlock()
@@ -475,9 +590,28 @@ func (h *HostManager) connectorEvent(run uint64, state string) {
 	if state == "ready" {
 		phase = "listening"
 	}
+	if state == "failed" {
+		failedConnector = h.connector
+		h.connector = nil
+		h.connectorRun++
+	}
 	changed := h.phase != phase
 	h.setPhaseLocked(phase)
 	h.mu.Unlock()
+	if failedConnector != nil {
+		// Stop asynchronously so we never deadlock when called from the connector's own observer goroutine.
+		go failedConnector.Stop()
+		h.listener.RevokeAll()
+		if _, err := h.announce(); err != nil {
+			h.cancel()
+		}
+		h.observe()
+		select {
+		case h.wake <- struct{}{}:
+		default:
+		}
+		return
+	}
 	if changed {
 		if phase != "listening" {
 			h.listener.RevokeAll()
@@ -519,17 +653,65 @@ func (h *HostManager) fail(err error) {
 	h.observe()
 }
 
+func (h *HostManager) verifiedLeaseExpiry(proof endpoint.LeaseProof, now time.Time) (time.Time, bool) {
+	if proof.Certificate == "" || proof.Lease == "" || len(h.opts.CA) != ed25519.PublicKeySize {
+		return time.Time{}, false
+	}
+	principal, err := identity.VerifyCertificate(proof.Certificate, h.opts.CA, now)
+	if err != nil || principal.DeviceID != h.opts.DeviceID || principal.RemoteUserID() != h.opts.OwnerID ||
+		!principal.PublicKey.Equal(h.pub) || !principal.Expires.After(now) {
+		return time.Time{}, false
+	}
+	until, err := identity.VerifyEndpointLease(proof.Lease, h.opts.CA, now, proof.Certificate, principal)
+	if err != nil || !until.After(now) {
+		return time.Time{}, false
+	}
+	if principal.Expires.Before(until) {
+		until = principal.Expires
+	}
+	return until, true
+}
+
 func (h *HostManager) localLease(ctx context.Context) (endpoint.LeaseProof, error) {
+	now := time.Now()
+	h.mu.Lock()
+	if h.lease.Lease != "" && now.Add(10*time.Second).Before(h.leaseUntil) {
+		proof := h.lease
+		h.mu.Unlock()
+		return proof, nil
+	}
+	h.mu.Unlock()
 	proof, err := h.control.proof(ctx)
 	if err != nil {
 		return endpoint.LeaseProof{}, err
 	}
-	principal, err := identity.VerifyCertificate(proof.Certificate, h.opts.CA, time.Now())
-	if err != nil || principal.RemoteUserID() != h.opts.OwnerID {
+	until, ok := h.verifiedLeaseExpiry(proof, time.Now())
+	if !ok {
 		return endpoint.LeaseProof{}, errors.New("cftunnel: local tunnel owner changed")
 	}
-	h.UpdateLocalLease(proof)
+	h.setLocalLease(proof, until)
 	return proof, nil
+}
+
+func (h *HostManager) setLocalLease(proof endpoint.LeaseProof, until time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopping || h.opts.Channel == "self" {
+		return
+	}
+	if proof == h.lease {
+		if until.After(h.leaseUntil) {
+			h.leaseUntil = until
+		}
+		return
+	}
+	h.lease = proof
+	h.leaseUntil = until
+	h.leaseVersion.Add(1)
+	select {
+	case h.leaseWake <- struct{}{}:
+	default:
+	}
 }
 
 func (h *HostManager) renewPeers() {
@@ -549,22 +731,17 @@ func (h *HostManager) renewPeers() {
 }
 
 func (h *HostManager) UpdateLocalLease(proof endpoint.LeaseProof) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.stopping || h.opts.Channel == "self" || proof == h.lease {
+	if h.opts.Channel == "self" {
 		return
 	}
-	h.lease = proof
-	h.leaseVersion.Add(1)
-	select {
-	case h.leaseWake <- struct{}{}:
-	default:
-	}
+	until, _ := h.verifiedLeaseExpiry(proof, time.Now())
+	h.setLocalLease(proof, until)
 }
 
 func (h *HostManager) AuthorityLost() {
 	h.mu.Lock()
 	h.lease = endpoint.LeaseProof{}
+	h.leaseUntil = time.Time{}
 	h.leaseVersion.Add(1)
 	h.revision++
 	listener := h.listener
@@ -611,6 +788,7 @@ func (h *HostManager) HandleSignal(m protocol.Message) {
 		var body struct {
 			RuntimeID string    `json:"runtime_id"`
 			ExpiresAt time.Time `json:"expires_at"`
+			Seq       uint64    `json:"seq,omitempty"`
 		}
 		now := time.Now()
 		if m.Connection != "" || m.From != "" || m.To != "" || strictjson.Decode(m.Data, &body) != nil ||
@@ -619,18 +797,31 @@ func (h *HostManager) HandleSignal(m protocol.Message) {
 		}
 		h.mu.Lock()
 		becameReady := false
-		if body.RuntimeID == h.runtimeID && h.runtimeID != "" && h.ackedSeq < h.seq && !body.ExpiresAt.Before(h.ackedUntil) {
-			h.ackedSeq++
-			if h.listeningSeq != 0 && h.ackedSeq >= h.listeningSeq {
-				becameReady = !h.status.ConnectorReady || !now.Before(h.ackedUntil)
-				h.status.ConnectorReady = true
+		if body.RuntimeID == h.runtimeID && h.runtimeID != "" && !body.ExpiresAt.Before(h.ackedUntil) {
+			validSeq := false
+			if body.Seq > 0 {
+				if body.Seq <= h.seq && (body.Seq > h.ackedSeq || body.ExpiresAt.After(h.ackedUntil)) {
+					if body.Seq > h.ackedSeq {
+						h.ackedSeq = body.Seq
+					}
+					validSeq = true
+				}
+			} else if h.ackedSeq < h.seq {
+				h.ackedSeq++
+				validSeq = true
 			}
-			h.ackedUntil = body.ExpiresAt
-			close(h.ack)
-			h.ack = make(chan struct{})
-			select {
-			case h.wake <- struct{}{}:
-			default:
+			if validSeq {
+				if h.listeningSeq != 0 && h.ackedSeq >= h.listeningSeq {
+					becameReady = !h.status.ConnectorReady || !now.Before(h.ackedUntil)
+					h.status.ConnectorReady = true
+				}
+				h.ackedUntil = body.ExpiresAt
+				close(h.ack)
+				h.ack = make(chan struct{})
+				select {
+				case h.wake <- struct{}{}:
+				default:
+				}
 			}
 		}
 		h.mu.Unlock()
@@ -644,13 +835,31 @@ func (h *HostManager) HandleSignal(m protocol.Message) {
 	}
 	h.mu.Lock()
 	listener, binding := h.listener, h.bindingLocked()
-	h.mu.Unlock()
 	if listener == nil {
+		h.mu.Unlock()
 		return
 	}
+	if m.Type == "tunnel.offer" {
+		if h.stopping || h.ctx == nil || h.ctx.Err() != nil {
+			h.mu.Unlock()
+			return
+		}
+		select {
+		case h.offerSlots <- struct{}{}:
+			h.workers.Add(1)
+			h.mu.Unlock()
+			go func() {
+				defer h.workers.Done()
+				defer func() { <-h.offerSlots }()
+				h.offer(m)
+			}()
+		default:
+			h.mu.Unlock()
+		}
+		return
+	}
+	h.mu.Unlock()
 	switch m.Type {
-	case "tunnel.offer":
-		h.offer(m)
 	case "tunnel.access":
 		var body accessBody
 		if m.From == "" && m.To == "" && strictjson.Decode(m.Data, &body) == nil && body.signalBinding == binding {
@@ -699,11 +908,35 @@ func (h *HostManager) offer(m protocol.Message) {
 		h.mu.Unlock()
 		return
 	}
-	hostname, proof, revision := h.status.Hostname, h.lease, h.revision
+	hostname, proof, leaseUntil, revision, lifetime := h.status.Hostname, h.lease, h.leaseUntil, h.revision, h.ctx
 	h.mu.Unlock()
+	if h.opts.Channel != "self" && (proof.Lease == "" || !now.Add(2*time.Second).Before(leaseUntil)) {
+		refreshCtx, cancel := context.WithTimeout(lifetime, 2*time.Second)
+		refreshed, err := h.localLease(refreshCtx)
+		cancel()
+		if err == nil {
+			proof = refreshed
+		}
+	}
+	now = time.Now()
 	remote, local, ok := h.offerIdentities(offered.Connect, offered.VisitorPublicKey, proof, now)
 	var connect connectBody
-	if !ok || !readSigned(offered.Connect, remote.PublicKey, &connect) || !connect.valid(h.opts.Scope) ||
+	if !ok {
+		// If our own local lease was missing/expired on an official channel, check
+		// whether this was a genuine signed visitor offer so we fail fast instead of
+		// making the visitor wait 5s for a permit timeout.
+		if h.opts.Channel != "self" && offered.VisitorPublicKey == "" {
+			if r, err := identity.VerifyCertificate(offered.Connect.Certificate, h.opts.CA, now); err == nil &&
+				r.DeviceID == offered.Connect.From && r.Expires.After(now) &&
+				readSigned(offered.Connect, r.PublicKey, &connect) && connect.valid(h.opts.Scope) &&
+				connect.ExpectedOwner == h.opts.OwnerID && connect.TargetPinHash == KeyHash(h.pub) &&
+				tunnelIdentifier.MatchString(connect.ClientNonce) {
+				h.denyOffer(m)
+			}
+		}
+		return
+	}
+	if !readSigned(offered.Connect, remote.PublicKey, &connect) || !connect.valid(h.opts.Scope) ||
 		connect.ExpectedOwner != h.opts.OwnerID || connect.TargetPinHash != KeyHash(h.pub) ||
 		!tunnelIdentifier.MatchString(connect.ClientNonce) {
 		return
@@ -747,7 +980,7 @@ func (h *HostManager) offer(m protocol.Message) {
 	msg := protocol.Message{Type: "tunnel.permit", Connection: m.Connection, From: m.To, To: m.From, Seq: 1}
 	body := permitBody{signalDomain{tunnelAudience, h.opts.Scope}, offered.signalBinding, hostname, permit.JTI,
 		connect.ClientNonce, permit.VisitorKeyHash, tunnelPath, expires.UTC(), ""}
-	if msg.Sign(h.opts.PrivateKey, protocol.Encode(body)) != nil || h.opts.SendSignal(msg) != nil {
+	if msg.Sign(h.opts.PrivateKey, protocol.Encode(body)) != nil || h.sendMessage(msg) != nil {
 		h.listener.CloseConnection(m.Connection)
 	}
 }
@@ -783,7 +1016,7 @@ func validPresentedLease(ca ed25519.PublicKey, cert, lease string, principal ide
 func (h *HostManager) denyOffer(m protocol.Message) {
 	msg := protocol.Message{Type: "tunnel.close", From: h.opts.DeviceID, To: m.From, Connection: m.Connection, Seq: 1}
 	if msg.Sign(h.opts.PrivateKey, protocol.Encode(closeBody{signalDomain: signalDomain{tunnelAudience, h.opts.Scope}, Reason: "access_denied"})) == nil {
-		_ = h.opts.SendSignal(msg)
+		_ = h.sendMessage(msg)
 	}
 }
 
@@ -859,14 +1092,7 @@ func (h *HostManager) manageLocked(ctx context.Context, action string) error {
 		h.mu.Unlock()
 		h.listener.RevokeAll()
 		h.stopConnector()
-		seq, err := h.announce()
-		if err != nil {
-			return err
-		}
-		ackCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		err = h.waitAck(ackCtx, seq)
-		cancel()
-		if err != nil {
+		if err := h.syncPresence(ctx); err != nil {
 			return err
 		}
 	}
@@ -898,6 +1124,9 @@ func (h *HostManager) manageLocked(ctx context.Context, action string) error {
 		}
 	}
 	if action == "resume" {
+		if err := h.syncPresence(ctx); err != nil {
+			return err
+		}
 		h.mu.Lock()
 		if h.stopping {
 			h.mu.Unlock()

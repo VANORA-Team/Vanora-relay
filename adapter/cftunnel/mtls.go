@@ -19,6 +19,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -121,9 +122,33 @@ func validPrivateKey(key ed25519.PrivateKey) bool {
 	return len(key) == ed25519.PrivateKeySize && key.Equal(ed25519.NewKeyFromSeed(key.Seed()))
 }
 
+type certCacheKey struct {
+	keyHash [sha256.Size]byte
+	usage   x509.ExtKeyUsage
+}
+
+type cachedCert struct {
+	cert    tls.Certificate
+	renewAt time.Time
+}
+
+var innerCertCache struct {
+	mu      sync.Mutex
+	entries map[certCacheKey]cachedCert
+}
+
 func makeCertificate(key ed25519.PrivateKey, usage x509.ExtKeyUsage, now time.Time) (tls.Certificate, error) {
+	pub, _ := key.Public().(ed25519.PublicKey)
+	cacheKey := certCacheKey{keyHash: sha256.Sum256(pub), usage: usage}
+	innerCertCache.mu.Lock()
+	if cached, ok := innerCertCache.entries[cacheKey]; ok && now.Before(cached.renewAt) {
+		innerCertCache.mu.Unlock()
+		return cached.cert, nil
+	}
+	innerCertCache.mu.Unlock()
+
 	template := &x509.Certificate{
-		NotBefore:             now.Add(-time.Minute),
+		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{usage},
@@ -133,7 +158,24 @@ func makeCertificate(key ed25519.PrivateKey, usage x509.ExtKeyUsage, now time.Ti
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	innerCertCache.mu.Lock()
+	if innerCertCache.entries == nil {
+		innerCertCache.entries = make(map[certCacheKey]cachedCert)
+	}
+	if len(innerCertCache.entries) >= 64 {
+		for k, v := range innerCertCache.entries {
+			if !now.Before(v.renewAt) {
+				delete(innerCertCache.entries, k)
+			}
+		}
+		if len(innerCertCache.entries) >= 64 {
+			clear(innerCertCache.entries)
+		}
+	}
+	innerCertCache.entries[cacheKey] = cachedCert{cert: cert, renewAt: now.Add(12 * time.Hour)}
+	innerCertCache.mu.Unlock()
+	return cert, nil
 }
 
 func tlsConfig(key ed25519.PrivateKey, pin ed25519.PublicKey, server bool) (*tls.Config, error) {
@@ -249,18 +291,17 @@ func exchangeProof(ctx context.Context, conn *tls.Conn, binding ConnectionContex
 		}
 		record.Lease = protocol.Encode(proof)
 	}
-	if server {
-		if err := readProof(conn, remoteMAC, access); err != nil {
-			return err
-		}
-	}
-	if err := writeRecord(conn, frameProof, protocol.Encode(record)); err != nil {
+	// Exchange proofs full-duplex so handshake saves one network RTT.
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- writeRecord(conn, frameProof, protocol.Encode(record))
+	}()
+	readErr := readProof(conn, remoteMAC, access)
+	if err := <-writeErr; err != nil {
 		return err
 	}
-	if !server {
-		if err := readProof(conn, remoteMAC, access); err != nil {
-			return err
-		}
+	if readErr != nil {
+		return readErr
 	}
 	if access != nil && !access.Allows(time.Now(), true, true) {
 		return transport.ErrUnauthorized

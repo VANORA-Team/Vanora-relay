@@ -547,6 +547,7 @@ func (a *Adapter) handleSessionCreate(ps *peerState, req wireRequest) {
 		delete(a.state.CreatedSessions, sessionID)
 		delete(a.state.CreateRequests, key)
 		a.mu.Unlock()
+		_ = os.Remove(sessionFile)
 		a.logger.Error("persist created session", "session", sessionID, "error", err)
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -602,7 +603,7 @@ func (a *Adapter) sessionSummaryLocked(sr *sessionRuntime, user string) sessionS
 		ActiveRunUserID:    activeRunUser,
 		QueuedRunCount:     len(sr.queue),
 		PendingGuestCount:  pendingGuests,
-		ViewerCount:        len(a.sessionParticipantsLocked(sr)),
+		ViewerCount:        a.viewerCountLocked(sr),
 		LinkOrigin:         s.linkOrigin,
 		AllowGuestRequests: s.allowGuestRequests,
 	}
@@ -697,7 +698,49 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		}
 		return
 	}
-	sr.syncLocked(a)
+	// Reload the backing session JSONL file outside Adapter.mu when idle so
+	// large session files do not stall concurrent runs or peer heartbeats.
+	if sr.active == nil {
+		sessionFile := sr.cfg.sessionFile
+		prevStamp := sr.stamp
+		wasLoaded := sr.loaded
+		a.mu.Unlock()
+
+		var reloaded []Message
+		var nextStamp fileStamp
+		didReload := false
+		if st, err := os.Stat(sessionFile); err != nil {
+			a.logger.Error("stat session", "session", req.SessionID, "error", err)
+		} else if !wasLoaded || st.Size() != prevStamp.size || !st.ModTime().Equal(prevStamp.modTime) {
+			if msgs, stamp, err := loadSessionMessages(sessionFile); err != nil {
+				a.logger.Error("reload session", "session", req.SessionID, "error", err)
+			} else {
+				reloaded, nextStamp, didReload = msgs, stamp, true
+			}
+		}
+
+		a.mu.Lock()
+		sr, ok = a.sessions[req.SessionID]
+		if !ok || !sr.cfg.canRead(user) {
+			_, wasSub := ps.subscriptions[req.SessionID]
+			delete(ps.subscriptions, req.SessionID)
+			delete(ps.presenceSubs, req.SessionID)
+			if wasSub {
+				presenceObs = a.presenceUpdatesLocked(req.SessionID)
+			}
+			a.sendErrorLocked(ps, req.RequestID, codeUnavailable, "", false)
+			a.mu.Unlock()
+			for _, ev := range presenceObs {
+				a.emitObserve(ev)
+			}
+			return
+		}
+		if didReload && sr.active == nil && sr.cfg.sessionFile == sessionFile {
+			sr.messages = reloaded
+			sr.stamp = nextStamp
+			sr.loaded = true
+		}
+	}
 	rawMsgs := append([]Message(nil), sr.messages...)
 	if sr.active != nil && (sr.active.pending.Len() > 0 || sr.active.pendingThinking.Len() > 0 || len(sr.active.pendingToolCalls) > 0) {
 		// session.open and last_seq are read under the same lock, so an event
@@ -780,7 +823,7 @@ func (a *Adapter) handleSessionOpen(ps *peerState, req wireRequest) {
 		}
 		return
 	}
-	a.sendResultLocked(ps, req.RequestID, snapshot, req.SessionID, false)
+	a.sendResultLocked(ps, req.RequestID, json.RawMessage(encoded), req.SessionID, false)
 	if !wasSub {
 		presenceObs = a.presenceUpdatesLocked(req.SessionID)
 	}
@@ -1310,7 +1353,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 		if officialRun(r) {
 			r.authorityUntil = a.authorityUntil
 		}
-		origEvents := slices.Clone(sr.ps.Events)
+		origEventLen := len(sr.ps.Events)
 		origLastSeq := sr.ps.LastSeq
 		origFirstSeq := sr.ps.FirstSeq
 
@@ -1332,9 +1375,7 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 			delete(sr.ps.Runs, runID)
 			delete(sr.runs, runID)
 			delete(a.runs, runID)
-			sr.ps.Events = origEvents
-			sr.ps.LastSeq = origLastSeq
-			sr.ps.FirstSeq = origFirstSeq
+			sr.ps.rollbackEvents(origEventLen, origLastSeq, origFirstSeq)
 			a.mu.Unlock()
 			a.logger.Error("persist queued run", "session", sr.cfg.id, "run", runID, "error", err)
 			return nil, codeUnavailable
@@ -1366,17 +1407,11 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 		a.logger.Error("generate run id", "session", sr.cfg.id, "error", err)
 		return nil, codeUnavailable
 	}
-	cmd, err := a.buildCommand(runCfg)
+	cmd, runCfg, err := a.buildRunCommandLocked(sr, hasToolsLimit, limitTools)
 	if err != nil {
 		a.mu.Unlock()
 		a.logger.Error("build vanora command", "session", sr.cfg.id, "error", err)
 		return nil, codeUnavailable
-	}
-	if runCfg.linkOrigin != "" {
-		if cmd.Env == nil {
-			cmd.Env = os.Environ()
-		}
-		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
 	}
 	now := a.now().UnixMilli()
 	r := &run{
@@ -1399,18 +1434,14 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 	if officialRun(r) {
 		r.authorityUntil = a.authorityUntil
 	}
-	origEvents := slices.Clone(sr.ps.Events)
-	origLastSeq := sr.ps.LastSeq
-	origFirstSeq := sr.ps.FirstSeq
 	discardRun := func() {
 		delete(sr.ps.Requests, key)
 		delete(sr.ps.Runs, runID)
 		delete(sr.runs, runID)
 		delete(a.runs, runID)
-		sr.active = nil
-		sr.ps.Events = origEvents
-		sr.ps.LastSeq = origLastSeq
-		sr.ps.FirstSeq = origFirstSeq
+		if sr.active == r {
+			sr.active = nil
+		}
 	}
 	sr.active = r
 	sr.runs[runID] = r
@@ -1426,31 +1457,41 @@ func (a *Adapter) startRun(ps *peerState, req wireRequest) (*run, string) {
 		a.logger.Error("persist run request", "session", sr.cfg.id, "run", runID, "error", err)
 		return nil, codeUnavailable
 	}
+	a.wg.Add(1)
+	sessionID := sr.cfg.id
+	a.mu.Unlock()
+
+	// Spawn outside Adapter.mu so process creation never stalls peers or other sessions.
 	handle, err := startProcess(cmd)
+
+	a.mu.Lock()
 	if err != nil {
 		discardRun()
 		if saveErr := a.saveLocked(); saveErr != nil {
-			a.logger.Error("persist failed run start", "session", sr.cfg.id, "run", runID, "error", saveErr)
+			a.logger.Error("persist failed run start", "session", sessionID, "run", runID, "error", saveErr)
 		}
+		a.wg.Done()
 		a.mu.Unlock()
-		a.logger.Error("start vanora", "session", sr.cfg.id, "error", err)
+		a.logger.Error("start vanora", "session", sessionID, "error", err)
 		return nil, codeUnavailable
 	}
 	r.handle = handle
 	// Enqueue the run id result before broadcasting run.started and before the
 	// process reader can enqueue any delta, preserving causal order for both
 	// the initiator and all subscribed collaborators.
-	a.sendResultLocked(ps, req.RequestID, runStartedResult{RunID: runID, Status: statusRunning}, sr.cfg.id, true)
+	a.sendResultLocked(ps, req.RequestID, runStartedResult{RunID: runID, Status: statusRunning}, sessionID, true)
 	a.appendEventLocked(sr, runID, kindRunStarted, runStartedData{
 		UserID:    user,
 		Text:      req.Text,
 		Timestamp: now,
 	}, r.tools)
 	sr.ps.trim(a.cfg.retention)
-	a.wg.Add(1)
-	sessionID := sr.cfg.id
+	shouldKill := a.closed || r.stopFlag.Load()
 	a.mu.Unlock()
 
+	if shouldKill {
+		r.kill()
+	}
 	a.emitActivity(ActivityEvent{
 		SessionID: sessionID,
 		RunID:     runID,
@@ -1540,7 +1581,7 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 		Text:           req.Text,
 		CreatedAt:      now,
 	}
-	origEvents := slices.Clone(sr.ps.Events)
+	origEventLen := len(sr.ps.Events)
 	origLastSeq := sr.ps.LastSeq
 	origFirstSeq := sr.ps.FirstSeq
 
@@ -1555,9 +1596,7 @@ func (a *Adapter) handleGuestRequest(ps *peerState, req wireRequest) {
 	if err := a.saveLocked(); err != nil {
 		sr.ps.PendingGuest = sr.ps.PendingGuest[:len(sr.ps.PendingGuest)-1]
 		delete(sr.ps.GuestRequests, key)
-		sr.ps.Events = origEvents
-		sr.ps.LastSeq = origLastSeq
-		sr.ps.FirstSeq = origFirstSeq
+		sr.ps.rollbackEvents(origEventLen, origLastSeq, origFirstSeq)
 		a.mu.Unlock()
 		a.sendError(ps, req.RequestID, codeUnavailable)
 		return
@@ -1871,7 +1910,7 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 		}
 		origPending := slices.Clone(sr.ps.PendingGuest)
 		origGuestReqs := maps.Clone(sr.ps.GuestRequests)
-		origEvents := slices.Clone(sr.ps.Events)
+		origEventLen := len(sr.ps.Events)
 		origLastSeq := sr.ps.LastSeq
 		origFirstSeq := sr.ps.FirstSeq
 
@@ -1903,9 +1942,7 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 			delete(sr.ps.Runs, runID)
 			delete(sr.runs, runID)
 			delete(a.runs, runID)
-			sr.ps.Events = origEvents
-			sr.ps.LastSeq = origLastSeq
-			sr.ps.FirstSeq = origFirstSeq
+			sr.ps.rollbackEvents(origEventLen, origLastSeq, origFirstSeq)
 			a.mu.Unlock()
 			return GuestRespondResult{}, nil, codeUnavailable
 		}
@@ -1942,16 +1979,10 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
 	}
-	cmd, err := a.buildCommand(runCfg)
+	cmd, runCfg, err := a.buildRunCommandLocked(sr, hasToolsLimit, limitTools)
 	if err != nil {
 		a.mu.Unlock()
 		return GuestRespondResult{}, nil, codeUnavailable
-	}
-	if runCfg.linkOrigin != "" {
-		if cmd.Env == nil {
-			cmd.Env = os.Environ()
-		}
-		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
 	}
 	now := a.now().UnixMilli()
 	r := &run{
@@ -1979,7 +2010,7 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 	}
 	origPending := slices.Clone(sr.ps.PendingGuest)
 	origGuestReqs := maps.Clone(sr.ps.GuestRequests)
-	origEvents := slices.Clone(sr.ps.Events)
+	origEventLen := len(sr.ps.Events)
 	origLastSeq := sr.ps.LastSeq
 	origFirstSeq := sr.ps.FirstSeq
 
@@ -1989,10 +2020,10 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 		delete(sr.ps.Runs, runID)
 		delete(sr.runs, runID)
 		delete(a.runs, runID)
-		sr.active = nil
-		sr.ps.Events = origEvents
-		sr.ps.LastSeq = origLastSeq
-		sr.ps.FirstSeq = origFirstSeq
+		if sr.active == r {
+			sr.active = nil
+		}
+		sr.ps.rollbackEvents(origEventLen, origLastSeq, origFirstSeq)
 	}
 
 	sr.ps.PendingGuest = slices.Delete(sr.ps.PendingGuest, idx, idx+1)
@@ -2001,6 +2032,25 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 	sr.runs[runID] = r
 	a.runs[runID] = r
 	sr.ps.Runs[runID] = runRecord{Status: statusRunning, UserID: runUser, Tools: r.tools, Created: now}
+	if err := a.saveLocked(); err != nil {
+		rollback()
+		a.mu.Unlock()
+		return GuestRespondResult{}, nil, codeUnavailable
+	}
+	a.wg.Add(1)
+	a.mu.Unlock()
+
+	handle, err := startProcess(cmd)
+
+	a.mu.Lock()
+	if err != nil {
+		rollback()
+		_ = a.saveLocked()
+		a.wg.Done()
+		a.mu.Unlock()
+		return GuestRespondResult{}, nil, codeUnavailable
+	}
+	r.handle = handle
 	resolvedEv, resolvedWire := a.recordEventVisibleLocked(sr, runID, kindGuestResolved, guestResolvedData{
 		GuestRequestID: guestRequestID,
 		Status:         "approved",
@@ -2014,19 +2064,6 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 		GuestRequestID: guestRequestID,
 		RequestedBy:    item.UserID,
 	}, r.tools, visAll, "", false)
-	if err := a.saveLocked(); err != nil {
-		rollback()
-		a.mu.Unlock()
-		return GuestRespondResult{}, nil, codeUnavailable
-	}
-	handle, err := startProcess(cmd)
-	if err != nil {
-		rollback()
-		_ = a.saveLocked()
-		a.mu.Unlock()
-		return GuestRespondResult{}, nil, codeUnavailable
-	}
-	r.handle = handle
 	sr.ps.trim(a.cfg.retention)
 	res := GuestRespondResult{
 		GuestRequestID: guestRequestID,
@@ -2038,9 +2075,12 @@ func (a *Adapter) respondGuest(user string, localHost bool, ps *peerState, reqID
 	}
 	a.broadcastEventLocked(sr, resolvedEv, resolvedWire)
 	a.broadcastEventLocked(sr, startedEv, startedWire)
-	a.wg.Add(1)
+	shouldKill := a.closed || r.stopFlag.Load()
 	a.mu.Unlock()
 
+	if shouldKill {
+		r.kill()
+	}
 	a.emitObserve(map[string]any{
 		"type":             "guest.resolved",
 		"session_id":       sessionID,
@@ -2091,10 +2131,12 @@ func (a *Adapter) enqueueLocked(ps *peerState, d delivery) {
 	select {
 	case ps.out <- d:
 	default:
-		// A peer that cannot drain ordered output is disconnected so that its
-		// client reconnects and resumes from its cursor. The retained event log
-		// is the recovery path.
-		a.logger.Warn("peer output queue full", "user", ps.peer.UserID())
-		go a.closePeer(ps)
+		// A peer that cannot drain ordered output is disconnected immediately so
+		// later frames in the same burst cannot slip past a dropped frame or
+		// spawn a goroutine storm. The retained event log is the recovery path.
+		if ps.abort() {
+			a.logger.Warn("peer output queue full", "user", ps.peer.UserID())
+			go a.closePeer(ps)
+		}
 	}
 }

@@ -39,9 +39,14 @@ var errClosed = errors.New("desktop: adapter is closed")
 // Adapter implements transport.Handler for one local desktop configuration.
 type Adapter struct {
 	mu       sync.Mutex
+	saveMu   sync.Mutex
+	saveSeq  uint64
+	savedSeq uint64
 	cfg      *normalizedConfig
 	state    *persistedState
 	stateDir string
+
+	approvalGuardPath string
 
 	peers    map[transport.Peer]*peerState
 	sessions map[string]*sessionRuntime
@@ -239,6 +244,16 @@ func New(cfg *Config, statePath string) (*Adapter, error) {
 			runs:     make(map[string]*run),
 		}
 	}
+	if guardPath, err := a.ensureApprovalExtension(); err == nil {
+		a.approvalGuardPath = guardPath
+	}
+	for id := range st.Sessions {
+		if _, active := a.sessions[id]; !active {
+			if _, created := st.CreatedSessions[id]; !created {
+				delete(st.Sessions, id)
+			}
+		}
+	}
 	a.recoverRunRecordsLocked()
 	if err := a.saveLocked(); err != nil {
 		return nil, err
@@ -355,9 +370,14 @@ func (a *Adapter) defaultCommand(s *normalizedSession) (*exec.Cmd, error) {
 	}
 	args = append(args, "--no-extensions")
 	if s.remoteApproval() && len(s.tools) > 0 {
-		guardPath, err := a.ensureApprovalExtension()
-		if err != nil {
-			return nil, err
+		guardPath := a.approvalGuardPath
+		if guardPath == "" {
+			var err error
+			guardPath, err = a.ensureApprovalExtension()
+			if err != nil {
+				return nil, err
+			}
+			a.approvalGuardPath = guardPath
 		}
 		if guardPath != "" {
 			args = append(args, "-e", guardPath)
@@ -373,6 +393,26 @@ func (a *Adapter) defaultCommand(s *normalizedSession) (*exec.Cmd, error) {
 	cmd := exec.Command(a.cfg.executable, args...)
 	cmd.Dir = s.workDir
 	return cmd, nil
+}
+
+func (a *Adapter) buildRunCommandLocked(sr *sessionRuntime, hasToolsLimit bool, limitTools []string) (*exec.Cmd, *normalizedSession, error) {
+	runCfg := sr.cfg
+	if hasToolsLimit {
+		narrowed := *sr.cfg
+		narrowed.tools = intersectTools(sr.cfg.tools, limitTools)
+		runCfg = &narrowed
+	}
+	cmd, err := a.buildCommand(runCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if runCfg.linkOrigin != "" {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
+	}
+	return cmd, runCfg, nil
 }
 
 // Open implements transport.Handler.
@@ -536,12 +576,13 @@ func (a *Adapter) deliver(ps *peerState, d delivery) {
 	}
 }
 
-func (ps *peerState) abort() {
+func (ps *peerState) abort() bool {
 	if !ps.closed.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	ps.peer.Close()
 	ps.closeOnce.Do(func() { close(ps.done) })
+	return true
 }
 
 func (a *Adapter) closePeer(ps *peerState) {
@@ -617,8 +658,9 @@ func (a *Adapter) Close() error {
 		}
 		_ = a.cancelRunPendingUILocked(r, "cancelled")
 	}
-	firstErr := a.saveLocked()
+	firstSnap, firstSeq := a.snapshotForSaveLocked()
 	a.mu.Unlock()
+	firstErr := a.writeSnapshot(firstSnap, firstSeq)
 
 	for _, ps := range peers {
 		a.closePeer(ps)
@@ -629,8 +671,9 @@ func (a *Adapter) Close() error {
 	a.wg.Wait()
 
 	a.mu.Lock()
-	lastErr := a.saveLocked()
+	lastSnap, lastSeq := a.snapshotForSaveLocked()
 	a.mu.Unlock()
+	lastErr := a.writeSnapshot(lastSnap, lastSeq)
 	if firstErr != nil {
 		return firstErr
 	}
@@ -651,19 +694,17 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		messages []Message
 		stamp    fileStamp
 	}
-	preload := make(map[string]loadedSession, len(nc.sessions))
-	for _, s := range nc.sessions {
-		messages, stamp, err := loadSessionMessages(s.sessionFile)
-		if err != nil {
-			return err
-		}
-		preload[s.id] = loadedSession{messages: messages, stamp: stamp}
-	}
 
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
 		return errClosed
+	}
+	cachedByFile := make(map[string]loadedSession, len(a.sessions))
+	for _, sr := range a.sessions {
+		if sr.loaded && sr.active == nil {
+			cachedByFile[sr.cfg.sessionFile] = loadedSession{messages: sr.messages, stamp: sr.stamp}
+		}
 	}
 	// Snapshot dynamically created sessions for reloading against updated workspaces.
 	createdRecords := make([]createdSessionRecord, 0, len(a.state.CreatedSessions))
@@ -671,6 +712,29 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		createdRecords = append(createdRecords, rec)
 	}
 	a.mu.Unlock()
+
+	loadCachedOrRead := func(sessionFile string) (loadedSession, error) {
+		if cached, ok := cachedByFile[sessionFile]; ok {
+			if st, err := os.Stat(sessionFile); err == nil &&
+				st.Size() == cached.stamp.size && st.ModTime().Equal(cached.stamp.modTime) {
+				return cached, nil
+			}
+		}
+		messages, stamp, err := loadSessionMessages(sessionFile)
+		if err != nil {
+			return loadedSession{}, err
+		}
+		return loadedSession{messages: messages, stamp: stamp}, nil
+	}
+
+	preload := make(map[string]loadedSession, len(nc.sessions))
+	for _, s := range nc.sessions {
+		loaded, err := loadCachedOrRead(s.sessionFile)
+		if err != nil {
+			return err
+		}
+		preload[s.id] = loaded
+	}
 
 	type preloadedCreated struct {
 		cfg      *normalizedSession
@@ -690,14 +754,14 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		if err != nil {
 			continue
 		}
-		messages, stamp, err := loadSessionMessages(sessionFile)
+		loaded, err := loadCachedOrRead(sessionFile)
 		if err != nil {
 			continue
 		}
 		createdPreload[rec.ID] = preloadedCreated{
 			cfg:      sessionFromWorkspace(w, rec, sessionFile),
-			messages: messages,
-			stamp:    stamp,
+			messages: loaded.messages,
+			stamp:    loaded.stamp,
 		}
 	}
 
@@ -780,6 +844,14 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 		}
 		delete(a.sessions, id)
 	}
+	for id := range a.state.Sessions {
+		if _, keep := next[id]; !keep {
+			if _, created := a.state.CreatedSessions[id]; !created {
+				delete(a.state.Sessions, id)
+				a.markDirtyLocked()
+			}
+		}
+	}
 	for _, r := range a.runs {
 		sr := next[r.sessionID]
 		if sr == nil {
@@ -852,6 +924,9 @@ func (a *Adapter) ReloadACL(cfg *Config) error {
 	}
 	a.sessions = next
 	a.cfg = nc
+	if nc.approvalExtension != "" {
+		a.approvalGuardPath = nc.approvalExtension
+	}
 	a.maxRequestBytes = max(64<<10, nc.maxText+16<<10)
 	if len(affectedPresence) > 0 {
 		sids := make([]string, 0, len(affectedPresence))
@@ -1309,6 +1384,27 @@ func (a *Adapter) prunePendingGuestsLocked(sr *sessionRuntime, match func(GuestR
 	return observeEvents, activityEvents
 }
 
+func (a *Adapter) viewerCountLocked(sr *sessionRuntime) int {
+	if sr == nil || len(a.peers) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, 4)
+	for peer, ps := range a.peers {
+		if ps == nil || ps.closed.Load() {
+			continue
+		}
+		if _, subscribed := ps.subscriptions[sr.cfg.id]; !subscribed {
+			continue
+		}
+		uid := peer.UserID()
+		if !sr.cfg.canRead(uid) {
+			continue
+		}
+		seen[uid] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (a *Adapter) sessionParticipantsLocked(sr *sessionRuntime) []ParticipantInfo {
 	if sr == nil {
 		return nil
@@ -1446,18 +1542,63 @@ func (a *Adapter) markDirtyLocked() {
 
 func (a *Adapter) flush() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.flushTimer = nil
 	if a.closed || !a.dirty {
+		a.mu.Unlock()
 		return
 	}
-	if err := a.saveLocked(); err != nil {
+	snap, seq := a.snapshotForSaveLocked()
+	a.dirty = false
+	a.mu.Unlock()
+	if err := a.writeSnapshot(snap, seq); err != nil {
+		a.markSaveFailed(err)
 		a.logger.Error("persist desktop state", "error", err)
 	}
 }
 
+func (a *Adapter) markSaveFailed(err error) {
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	a.dirty = true
+	if !a.closed && a.flushTimer == nil {
+		a.flushTimer = time.AfterFunc(flushDelay, a.flush)
+	}
+	a.mu.Unlock()
+}
+
+func (a *Adapter) snapshotForSaveLocked() (*persistedState, uint64) {
+	activeIDs := make(map[string]bool, len(a.sessions))
+	for id, sr := range a.sessions {
+		if sr.active != nil || len(sr.queue) > 0 {
+			activeIDs[id] = true
+		}
+	}
+	a.state.enforceGlobalBudget(activeIDs, softPersistedEventCap)
+	a.saveSeq++
+	return a.state.cloneForSave(), a.saveSeq
+}
+
+func (a *Adapter) writeSnapshot(snap *persistedState, seq uint64) error {
+	if snap == nil {
+		return nil
+	}
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	if seq <= a.savedSeq {
+		return nil
+	}
+	if err := saveState(a.stateDir, snap); err != nil {
+		return err
+	}
+	a.savedSeq = seq
+	return nil
+}
+
 func (a *Adapter) saveLocked() error {
-	if err := saveState(a.stateDir, a.state); err != nil {
+	snap, seq := a.snapshotForSaveLocked()
+	if err := a.writeSnapshot(snap, seq); err != nil {
 		a.dirty = true
 		return err
 	}

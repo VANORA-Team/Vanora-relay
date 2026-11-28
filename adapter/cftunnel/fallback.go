@@ -55,11 +55,10 @@ func DialFallback(ctx context.Context, tracker *routes.Tracker, key string, head
 			candidate.Close()
 			return Candidate{}, err
 		}
+		tracker.RecordWebRTCSuccess(key)
 		return candidate, nil
 	}
-	if headStart <= 0 {
-		headStart = routes.CFTunnelHeadStart
-	}
+	headStart = tracker.TunnelHeadStart(key, headStart)
 
 	type result struct {
 		candidate Candidate
@@ -97,7 +96,7 @@ func DialFallback(ctx context.Context, tracker *routes.Tracker, key string, head
 		tunnelPending = true
 		launch(tunnel, true)
 	}
-	var primaryErr error
+	var primaryErr, tunnelErr error
 	for {
 		var res result
 		select {
@@ -117,14 +116,18 @@ func DialFallback(ctx context.Context, tracker *routes.Tracker, key string, head
 			return Candidate{}, err
 		}
 		if !res.tunnel {
-			if res.err == nil || isWebRTCAuthError(res.err) {
+			if res.err == nil {
+				tracker.RecordWebRTCSuccess(key)
+				return res.candidate, nil
+			}
+			if isWebRTCAuthError(res.err) {
 				return res.candidate, res.err
 			}
 			primaryErr = res.err
 			if headStartDone != nil {
 				startTunnel()
 			} else if !tunnelPending {
-				return Candidate{}, primaryErr
+				return Candidate{}, errors.Join(primaryErr, tunnelErr)
 			}
 			continue
 		}
@@ -132,12 +135,13 @@ func DialFallback(ctx context.Context, tracker *routes.Tracker, key string, head
 			tracker.RecordTunnelSuccess(key)
 			return res.candidate, nil
 		}
-		if errors.Is(res.err, ErrTunnelUnavailable) {
+		tunnelErr = res.err
+		if errors.Is(res.err, ErrTunnelUnavailable) || errors.Is(res.err, transport.SignalError("tunnel_released")) {
 			tracker.RecordTunnelUnavailable(key, time.Now())
 		}
 		tunnelPending = false
 		if primaryErr != nil {
-			return Candidate{}, primaryErr
+			return Candidate{}, errors.Join(primaryErr, tunnelErr)
 		}
 	}
 }

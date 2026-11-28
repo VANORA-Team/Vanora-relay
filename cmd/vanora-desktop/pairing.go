@@ -57,9 +57,10 @@ func (s *officialSlot) invite(ctx context.Context) (inviteInfo, pairing.Display,
 		return inviteInfo{}, pairing.Display{}, err
 	}
 	s.pairMu.Lock()
-	defer s.pairMu.Unlock()
 	s.pruneLocked()
-	if len(s.invites) >= 32 || len(s.account.Pairings()) >= 128 {
+	full := len(s.invites) >= 32 || len(s.account.Pairings()) >= 128
+	s.pairMu.Unlock()
+	if full {
 		return inviteInfo{}, pairing.Display{}, errors.New("pairing limit reached")
 	}
 	target := pairing.NewOfficial(s.name, s.url, creds.DeviceID(), creds.UserID(), creds.PublicKey())
@@ -68,10 +69,23 @@ func (s *officialSlot) invite(ctx context.Context) (inviteInfo, pairing.Display,
 	if err != nil {
 		return inviteInfo{}, pairing.Display{}, err
 	}
+	s.pairMu.Lock()
+	s.pruneLocked()
+	if !s.online.Load() || s.socket.Load() != socket || len(s.invites) >= 32 || len(s.account.Pairings()) >= 128 {
+		s.pairMu.Unlock()
+		if retire != nil {
+			retire()
+		}
+		if !s.online.Load() || s.socket.Load() != socket {
+			return inviteInfo{}, pairing.Display{}, errors.New("official relay is offline")
+		}
+		return inviteInfo{}, pairing.Display{}, errors.New("pairing limit reached")
+	}
 	if s.invites == nil {
 		s.invites = make(map[string]officialInvite)
 	}
 	s.invites[info.ID] = officialInvite{info, target, retire}
+	s.pairMu.Unlock()
 	return info, display, nil
 }
 
@@ -80,6 +94,12 @@ func (s *officialSlot) authorize(connection string, remote identity.Principal, r
 		return false
 	}
 	peer := account.PeerBinding{Owner: remote.RemoteUserID(), Pin: base64.RawURLEncoding.EncodeToString(remote.PublicKey)}
+	var retire func()
+	defer func() {
+		if retire != nil {
+			retire()
+		}
+	}()
 	s.pairMu.Lock()
 	defer s.pairMu.Unlock()
 	s.pruneLocked()
@@ -112,7 +132,7 @@ func (s *officialSlot) authorize(connection string, remote identity.Principal, r
 					return false
 				}
 				delete(s.invites, id)
-				inv.retire()
+				retire = inv.retire
 				return true
 			}
 		}
@@ -148,13 +168,16 @@ func (s *officialSlot) authorizeTunnel(_ string, remote identity.Principal, role
 
 func (s *officialSlot) revokeInvite(id string) error {
 	s.pairMu.Lock()
-	defer s.pairMu.Unlock()
 	inv, ok := s.invites[id]
 	if !ok {
+		s.pairMu.Unlock()
 		return pairing.ErrInvalid
 	}
 	delete(s.invites, id)
-	inv.retire()
+	s.pairMu.Unlock()
+	if inv.retire != nil {
+		inv.retire()
+	}
 	return nil
 }
 
@@ -171,6 +194,7 @@ func (s *officialSlot) revokeClients(id string, all bool) error {
 	if all {
 		id = ""
 	}
+	var retires []func()
 	s.pairMu.Lock()
 	var err error
 	group, _ := s.account.PairingIdentity(s.url, "desktop")
@@ -191,10 +215,15 @@ func (s *officialSlot) revokeClients(id string, all bool) error {
 	if err == nil && all {
 		for key, inv := range s.invites {
 			delete(s.invites, key)
-			inv.retire()
+			if inv.retire != nil {
+				retires = append(retires, inv.retire)
+			}
 		}
 	}
 	s.pairMu.Unlock()
+	for _, retire := range retires {
+		retire()
+	}
 	if err == nil {
 		if socket := s.socket.Load(); socket != nil {
 			socket.RevokeDevice(id)
@@ -205,18 +234,23 @@ func (s *officialSlot) revokeClients(id string, all bool) error {
 }
 
 func (m *accessManager) createRelayInvite(cmd accessCommand, result map[string]any) error {
-	if (cmd.Channel != "" && cmd.Channel != m.activeChannel) || (strings.HasPrefix(cmd.Type, "access.self.") && m.activeChannel != "self") {
+	m.mu.Lock()
+	activeChannel := m.activeChannel
+	selfServer := m.selfServer
+	slot := m.activeSlot
+	m.mu.Unlock()
+	if (cmd.Channel != "" && cmd.Channel != activeChannel) || (strings.HasPrefix(cmd.Type, "access.self.") && activeChannel != "self") {
 		return errors.New("inactive relay channel")
 	}
 	var display pairing.Display
 	var err error
-	if m.activeChannel == "self" && m.selfServer != nil {
+	if activeChannel == "self" && selfServer != nil {
 		level := cmd.Access
 		if level == "" {
 			level = selfrelay.Read
 		}
-		result["invitation"], display, err = m.selfServer.InvitePairing(m.ctx, level, cmd.IncludeToken == nil || *cmd.IncludeToken)
-	} else if slot := m.activeSlot; slot != nil {
+		result["invitation"], display, err = selfServer.InvitePairing(m.ctx, level, cmd.IncludeToken == nil || *cmd.IncludeToken)
+	} else if slot != nil {
 		if cmd.Access != "" {
 			return errors.New("official relay permissions are configured by the desktop resource ACL")
 		}
@@ -228,7 +262,7 @@ func (m *accessManager) createRelayInvite(cmd accessCommand, result map[string]a
 		return err
 	}
 	result["type"] = strings.TrimSuffix(cmd.Type, ".create") + ".created"
-	result["channel"] = m.activeChannel
+	result["channel"] = activeChannel
 	result["link"], result["pairing_code"], result["qr_code"] = display.Link, display.Code, display.QR
 	return nil
 }

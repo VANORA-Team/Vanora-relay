@@ -18,7 +18,15 @@ import (
 	"github.com/coder/websocket"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/pairing"
+	"vanora-relay/internal/strictjson"
 	"vanora-relay/protocol"
+)
+
+const (
+	maxConcurrentRPC    = 8
+	tunnelHostQueueSize = 8
+	duplicateWait       = 1300 * time.Millisecond
+	freshPeerWindow     = 250 * time.Millisecond
 )
 
 func readMessage(ctx context.Context, ws *websocket.Conn) (protocol.Message, error) {
@@ -30,7 +38,7 @@ func readMessage(ctx context.Context, ws *websocket.Conn) (protocol.Message, err
 	if kind != websocket.MessageText {
 		return m, errors.New("text record required")
 	}
-	err = json.Unmarshal(data, &m)
+	err = strictjson.Decode(data, &m)
 	return m, err
 }
 func writeMessage(ctx context.Context, ws *websocket.Conn, m protocol.Message) error {
@@ -64,11 +72,15 @@ func (h *Hub) authorized(r *http.Request) bool {
 // per-IP gate. Repeated failures lock the source IP out with 429s before
 // the token is hashed again, which throttles token guessing.
 func (h *Hub) authorizedReq(w http.ResponseWriter, r *http.Request) bool {
+	ip := h.clientIP(r)
+	now := time.Now()
+	if h.gate.tokenLocked(ip, now) {
+		limitResponse(w, h.gate.lockRemaining(ip, now))
+		return false
+	}
 	if h.authorized(r) {
 		return true
 	}
-	ip := remoteIPAddr(r.RemoteAddr)
-	now := time.Now()
 	if h.gate.recordTokenFailure(ip, now) {
 		limitResponse(w, h.gate.lockRemaining(ip, now))
 		return false
@@ -125,19 +137,15 @@ func (h *Hub) acquirePreAuth(ip string) (func(), int) {
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Query().Get("probe") == "1" {
-		w.Header().Set("Cache-Control", "no-store")
-		if h.requireToken && !h.authorizedReq(w, r) {
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+		h.ServeProbe(w, r)
 		return
 	}
 	if r.URL.Query().Has("activity") {
-		h.serveActivity(w, r)
+		h.ServeActivity(w, r)
 		return
 	}
 	if r.Method == http.MethodPost || (r.Method == http.MethodGet && r.URL.Query().Has("pairing")) {
-		h.servePairing(w, r)
+		h.ServePairing(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -147,11 +155,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.requireToken && !h.authorizedReq(w, r) {
 		return
 	}
-	clientIP := remoteIPAddr(r.RemoteAddr)
-	tunnelIP := clientIP
-	if h.tunnelClientIP != nil {
-		tunnelIP = h.tunnelClientIP(r)
+	h.mu.Lock()
+	draining := h.draining
+	h.mu.Unlock()
+	if draining {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
 	}
+	clientIP := h.clientIP(r)
 	releasePreAuth, status := h.acquirePreAuth(clientIP)
 	if status != 0 {
 		http.Error(w, "busy", status)
@@ -213,7 +224,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			PublicKey: ed25519.PublicKey(pub),
 		}
 	} else {
-		id, err = identity.VerifyCertificate(m.Certificate, h.key, time.Now())
+		id, err = identity.VerifyCertificateWithKeys(m.Certificate, h.trustedKeys(), time.Now())
 		if err != nil {
 			ws.Close(websocket.StatusPolicyViolation, "invalid certificate")
 			return
@@ -227,7 +238,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ws.Close(websocket.StatusPolicyViolation, "invalid proof")
 			return
 		}
-		until, err = identity.VerifyEndpointLease(auth.Lease, h.key, time.Now(), m.Certificate, id)
+		until, err = identity.VerifyEndpointLeaseWithKeys(auth.Lease, h.trustedKeys(), time.Now(), m.Certificate, id)
 		if err != nil {
 			ws.Close(websocket.StatusPolicyViolation, "invalid lease")
 			return
@@ -238,73 +249,38 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ws.Close(websocket.StatusPolicyViolation, "tunnel target required")
 		return
 	}
-	select {
-	case h.slots <- struct{}{}:
-		defer func() { <-h.slots }()
-	default:
-		ws.Close(websocket.StatusTryAgainLater, "busy")
-		return
-	}
-	releasePreAuth()
 	p := &peer{
-		id:         id,
-		cert:       cert,
-		role:       auth.Role,
-		desktop:    auth.Desktop,
-		tunnelOnly: auth.Tunnel,
-		selfHosted: h.selfHosted,
-		remoteIP:   clientIP,
-		tunnelIP:   tunnelIP,
-		lease:      until,
-		ctx:        ctx,
-		cancel:     cancel,
-		out:        make(chan protocol.Message, 32),
-		probeWake:  make(chan struct{}, 1),
+		id:                 id,
+		cert:               cert,
+		role:               auth.Role,
+		desktop:            auth.Desktop,
+		tunnelOnly:         auth.Tunnel,
+		selfHosted:         h.selfHosted,
+		remoteIP:           clientIP,
+		tunnelIP:           clientIP,
+		legacyTunnelAcks:   r.Header.Get("X-Vanora-Tunnel-Ack-Seq") != "1",
+		legacyTunnelErrors: r.Header.Get("X-Vanora-Tunnel-Availability") != "1",
+		lease:              until,
+		ctx:                ctx,
+		cancel:             cancel,
+		out:                make(chan protocol.Message, 32),
+		probeWake:          make(chan struct{}, 1),
+		done:               make(chan struct{}),
+		ws:                 ws,
 	}
-	h.mu.Lock()
-	existing := h.peers[p.slotKey()]
-	exists := existing != nil
-	if p.desktop != "" {
-		host := h.peers[p.desktop]
-		exists = exists || (p.role != "mobile" && p.role != "desktop") || host == nil || !host.allows(p)
-	}
-	count := 0
-	for _, other := range h.peers {
-		if other.id.DeviceID == id.DeviceID {
-			if other.tunnelOnly == p.tunnelOnly {
-				count++
-			}
-			exists = exists || other.role != p.role
-		}
-	}
-	limit := maxPhoneLinks + 1
-	if p.tunnelOnly {
-		limit = maxPhoneLinks
-	}
-	exists = exists || count >= limit
-	if !exists {
-		h.peers[p.slotKey()] = p
-	} else if existing != nil && existing.role == p.role && existing.id.PublicKey.Equal(id.PublicKey) {
-		// Preserve "first connection wins" so a racing connection cannot kick a
-		// healthy peer, while immediately probing the incumbent socket so a
-		// half-open blackholed connection is evicted within ~1.2s instead of
-		// waiting out the full 15s+5s heartbeat cycle (VR-SEC-08).
-		now := time.Now()
-		if now.Sub(existing.lastProbe) >= 500*time.Millisecond {
-			existing.lastProbe = now
-			select {
-			case existing.probeWake <- struct{}{}:
-			default:
-			}
-		}
-	}
-	tunnel := h.tunnel
-	h.mu.Unlock()
-	if exists {
-		ws.Close(websocket.StatusPolicyViolation, "endpoint already connected")
+	tunnel, closeStatus, reason := h.registerPeer(p, true)
+	if closeStatus != 0 {
+		ws.Close(closeStatus, reason)
 		return
 	}
-	defer h.remove(p)
+	var handlers sync.WaitGroup
+	defer func() {
+		cancel()
+		h.remove(p)
+		handlers.Wait()
+		h.connections.Done()
+	}()
+	releasePreAuth()
 	stop()
 	var tunnelScope string
 	if tunnel != nil {
@@ -327,7 +303,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if writeMessage(ctx, ws, protocol.Message{Type: "auth.ok", Data: protocol.Encode(okData)}) != nil {
 		return
 	}
-	go func() {
+	handlers.Go(func() {
 		defer cancel()
 		for {
 			select {
@@ -339,8 +315,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	}()
-	go func() {
+	})
+	handlers.Go(func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		ping := func(timeout time.Duration) bool {
@@ -367,7 +343,27 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	}()
+	})
+	rpcSlots := make(chan struct{}, maxConcurrentRPC)
+	hostQueue := make(chan protocol.Message, tunnelHostQueueSize)
+	dispatch := func(m protocol.Message) {
+		if err := h.handle(p, m); err != nil {
+			p.signalError(m, err.Error())
+		}
+	}
+	handlers.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-hostQueue:
+				if ctx.Err() != nil {
+					return
+				}
+				dispatch(event)
+			}
+		}
+	})
 	// Burst allowance covers ICE trickling without allowing an unbounded verification loop.
 	budget := 120
 	window := time.Now()
@@ -385,10 +381,111 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			cancel()
 			return
 		}
-		if err = h.handle(p, m); err != nil {
-			p.send(protocol.Message{Type: "error", Connection: m.Connection, Data: protocol.Encode(err.Error())})
+		switch m.Type {
+		case "connect.accept", "ice.refresh", "tunnel.connect", "tunnel.permit", "tunnel.refresh":
+			select {
+			case rpcSlots <- struct{}{}:
+				event := m
+				handlers.Go(func() {
+					defer func() { <-rpcSlots }()
+					dispatch(event)
+				})
+			default:
+				p.signalError(m, "busy")
+			}
+		case "tunnel.host":
+			select {
+			case hostQueue <- m:
+			default:
+				p.signalError(m, "busy")
+			}
+		default:
+			dispatch(m)
 		}
 	}
+}
+
+func (h *Hub) registerPeer(p *peer, wait bool) (TunnelController, websocket.StatusCode, string) {
+	h.mu.Lock()
+	now := time.Now()
+	if h.draining {
+		h.mu.Unlock()
+		return nil, websocket.StatusGoingAway, "relay shutting down"
+	}
+	if !p.live(now) {
+		h.mu.Unlock()
+		return nil, websocket.StatusPolicyViolation, "authorization_expired"
+	}
+	key := p.slotKey()
+	if existing := h.peers[key]; existing != nil {
+		sameKey := existing.role == p.role && existing.id.PublicKey.Equal(p.id.PublicKey)
+		if sameKey && now.Sub(existing.lastProbe) >= 500*time.Millisecond {
+			existing.lastProbe = now
+			select {
+			case existing.probeWake <- struct{}{}:
+			default:
+			}
+		}
+		canWait := sameKey && wait && now.Sub(existing.connectedAt) >= freshPeerWindow
+		h.mu.Unlock()
+		if canWait {
+			timer := time.NewTimer(duplicateWait)
+			defer timer.Stop()
+			select {
+			case <-existing.done:
+				return h.registerPeer(p, false)
+			case <-timer.C:
+			case <-p.ctx.Done():
+			}
+		}
+		return nil, websocket.StatusPolicyViolation, "endpoint already connected"
+	}
+	defer h.mu.Unlock()
+	if p.desktop != "" {
+		host := h.peers[p.desktop]
+		if host == nil || !host.live(now) || !host.allows(p) {
+			return nil, websocket.StatusPolicyViolation, "device_unavailable"
+		}
+	}
+	slots := h.peersByDevice[p.id.DeviceID]
+	if slots.role != "" && slots.role != p.role {
+		return nil, websocket.StatusPolicyViolation, "device_unavailable"
+	}
+	if len(h.peers) >= h.maxSlots {
+		return nil, websocket.StatusTryAgainLater, "slot_limit"
+	}
+	if p.tunnelOnly {
+		if slots.tunnels >= maxPhoneLinks {
+			return nil, websocket.StatusPolicyViolation, "slot_limit"
+		}
+		slots.tunnels++
+	} else {
+		if slots.normal >= maxPhoneLinks+1 {
+			return nil, websocket.StatusPolicyViolation, "slot_limit"
+		}
+		slots.normal++
+	}
+	slots.role = p.role
+	p.connectedAt = now
+	h.peersByDevice[p.id.DeviceID], h.peers[key] = slots, p
+	h.connections.Add(1)
+	return h.tunnel, 0, ""
+}
+
+func (p *peer) signalError(m protocol.Message, reason string) {
+	p.send(protocol.Message{Type: "error", Connection: m.Connection, Data: protocol.Encode(reason)})
+}
+
+func (h *Hub) ServeProbe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.requireToken && !h.authorizedReq(w, r) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (p *peer) registered() {
@@ -398,9 +495,13 @@ func (p *peer) registered() {
 	p.send(protocol.Message{Type: "device.registered", Data: protocol.Encode(map[string]string{"pairing_ticket": p.pairTicket})})
 }
 
-func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
+func (h *Hub) ServePairing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	ip := remoteIPAddr(r.RemoteAddr)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := h.clientIP(r)
 	now := time.Now()
 	if !h.gate.allowRequest(ip, now) {
 		limitResponse(w, 0)
@@ -408,6 +509,9 @@ func (h *Hub) servePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodGet {
 		locator := r.URL.Query().Get("pairing")
+		if r.URL.Path == "/v1/pairing" && locator == "" {
+			locator = r.URL.Query().Get("locator")
+		}
 		if !validPairingLocator(locator) {
 			http.NotFound(w, r)
 			return

@@ -3,6 +3,7 @@ package ice
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -117,16 +118,21 @@ func TestConfiguredSTUNURLs(t *testing.T) {
 	t.Setenv("TURN_RELAY_MAX_PORT", "0")
 
 	for _, tc := range []struct {
-		name  string
-		value string
-		want  []string
+		name    string
+		channel string
+		value   string
+		want    []string
 	}{
-		{"default", "", []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}},
-		{"mixed", "stun:stun.miwifi.com, stun:stun.cloudflare.com:3478", []string{"stun:stun.miwifi.com", "stun:stun.cloudflare.com:3478"}},
-		{"local", "local", nil},
-		{"invalid", "stun:stun.cloudflare.com:3478,turn:example.com", nil},
+		{"default", "", "", []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}},
+		{"cn", "cn", "", []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}},
+		{"global", "global", "", []string{"stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"}},
+		{"self", "self", "", nil},
+		{"mixed", "self", "stun:stun.miwifi.com, stun:stun.cloudflare.com:3478", []string{"stun:stun.miwifi.com", "stun:stun.cloudflare.com:3478"}},
+		{"local", "global", "local", nil},
+		{"invalid", "cn", "stun:stun.cloudflare.com:3478,turn:example.com", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("RELAY_CHANNEL", tc.channel)
 			t.Setenv("STUN_URLS", tc.value)
 			s, err := FromEnv()
 			if s != nil {
@@ -142,7 +148,7 @@ func TestConfiguredSTUNURLs(t *testing.T) {
 				t.Fatalf("FromEnv: %v", err)
 			}
 			want := tc.want
-			if tc.name == "local" {
+			if want == nil {
 				want = []string{"stun:" + s.controlAddr}
 			}
 			for _, until := range []time.Time{time.Time{}, time.Now().Add(time.Minute)} {
@@ -156,6 +162,49 @@ func TestConfiguredSTUNURLs(t *testing.T) {
 				servers[0].URLs[0] = "stun:example.com"
 			}
 		})
+	}
+}
+
+func TestRelayWriteDeniesInvalidDestination(t *testing.T) {
+	relay := &relayConn{srv: &Server{}}
+	for _, addr := range []net.Addr{
+		nil, (*net.UDPAddr)(nil), &net.UDPAddr{}, &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8)},
+		&net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 65537},
+	} {
+		if n, err := relay.WriteTo([]byte("data"), addr); n != 0 || !errors.Is(err, errRelayPeerDenied) {
+			t.Fatalf("WriteTo(%v) = %d, %v", addr, n, err)
+		}
+	}
+}
+
+func TestHostAddressesRefreshAfterExpiry(t *testing.T) {
+	s := &Server{}
+	testAddr := netip.MustParseAddr("192.0.2.79")
+	stale := map[netip.Addr]struct{}{testAddr: {}}
+	s.localAddrs.Store(&stale)
+	s.localAddrUntil.Store(new(time.Now().Add(-time.Second)))
+	if s.isLocalHostAddr(testAddr) {
+		t.Fatal("expired address remained in the host interface snapshot")
+	}
+}
+
+func TestRelayBandwidthSharedAcrossAllocationsAndGrants(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.maxBytesPerSec = 1
+	s.maxVisitorBytesPerSec = 1
+	for _, ids := range [][2]string{{"first", "visitor"}, {"second", "visitor"}, {"other", "other"}} {
+		if _, err := s.Config(ids[0], ids[1], time.Now().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, sameGrant, sameVisitor, other := &relayConn{srv: s}, &relayConn{srv: s}, &relayConn{srv: s}, &relayConn{srv: s}
+	first.grantRef.Store(s.grants["first"])
+	sameGrant.grantRef.Store(s.grants["first"])
+	sameVisitor.grantRef.Store(s.grants["second"])
+	other.grantRef.Store(s.grants["other"])
+	burst := s.grants["first"].bandwidth.Burst()
+	if !first.allowRelayBytes(burst) || sameGrant.allowRelayBytes(burst) || sameVisitor.allowRelayBytes(burst) || !other.allowRelayBytes(burst) {
+		t.Fatal("bandwidth bucket was not shared within the same grant or visitor")
 	}
 }
 

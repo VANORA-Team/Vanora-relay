@@ -18,17 +18,17 @@ type MembershipLookup interface {
 	Lookup(context.Context, string, string) (membership.Entitlement, error)
 }
 
-const errMembershipUnavailable ErrorCode = "membership_unavailable"
+const ErrMembershipUnavailable ErrorCode = "membership_unavailable"
 
 func (s *Service) lookupMembership(ctx context.Context, principal identity.Principal) (membership.Entitlement, error) {
 	if s.membership == nil || principal.Issuer != s.scope.AllowedIssuer || principal.Subject == "" {
-		return membership.Entitlement{}, errMembershipUnavailable
+		return membership.Entitlement{}, ErrMembershipUnavailable
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	ent, err := s.membership.Lookup(ctx, principal.Issuer, principal.Subject)
 	if err != nil {
-		return membership.Entitlement{}, errMembershipUnavailable
+		return membership.Entitlement{}, ErrMembershipUnavailable
 	}
 	return ent, nil
 }
@@ -84,11 +84,11 @@ func (h *httpHandler) authenticate(r *http.Request, action, bodyHash string, now
 	} else {
 		cert, lease := r.Header.Get("Vanora-Certificate"), r.Header.Get("Vanora-Lease")
 		var err error
-		principal, err = identity.VerifyCertificate(cert, h.caKey, now)
+		principal, err = identity.VerifyCertificateWithKeys(cert, h.caKeys, now)
 		if err != nil || principal.Issuer != h.s.scope.AllowedIssuer || !principal.Expires.After(now) {
 			return principal, ProofUse{}, ErrInvalidProof
 		}
-		expires, err := identity.VerifyEndpointLease(lease, h.caKey, now, cert, principal)
+		expires, err := identity.VerifyEndpointLeaseWithKeys(lease, h.caKeys, now, cert, principal)
 		if err != nil || !expires.After(now) {
 			return principal, ProofUse{}, ErrInvalidProof
 		}

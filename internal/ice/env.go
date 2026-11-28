@@ -3,6 +3,7 @@ package ice
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -17,6 +18,7 @@ import (
 // controlPortBindAttempts bounds how often binding the TCP/UDP control pair on
 // an ephemeral port is retried when a port is already in use.
 const controlPortBindAttempts = 16
+const udpControlBufferSize = 4 << 20
 
 // options is the parsed, validated server configuration. FromEnv fills it from
 // the environment; tests construct it directly.
@@ -37,6 +39,8 @@ type options struct {
 	maxGrants              int
 	maxGrantsPerVisitor    int
 	maxAllocationsPerGrant int
+	maxBytesPerSec         int
+	maxVisitorBytesPerSec  int
 	maxTCPConns            int
 	maxTCPConnsPerIP       int
 	logLevel               logging.LogLevel
@@ -52,11 +56,17 @@ type options struct {
 // variables documented in README.md. TURN_PUBLIC_IP must be the public IPv4
 // address clients can reach for relaying.
 func FromEnv() (*Server, error) {
+	return FromEnvForChannel(os.Getenv("RELAY_CHANNEL"))
+}
+
+// FromEnvForChannel starts the server with channel-specific STUN defaults.
+// STUN_URLS overrides the defaults for every channel.
+func FromEnvForChannel(channel string) (*Server, error) {
 	publicIP, err := envIPv4("TURN_PUBLIC_IP", "")
 	if err != nil {
 		return nil, err
 	}
-	stunURLs, err := envSTUNURLs()
+	stunURLs, err := envSTUNURLs(channel)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +112,14 @@ func FromEnv() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxBytesPerSec, err := envInt("TURN_MAX_BYTES_PER_SEC", 0, 0, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
+	maxVisitorBytesPerSec, err := envInt("TURN_MAX_VISITOR_BYTES_PER_SEC", 0, 0, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
 	maxTCPConns, err := envInt("TURN_TCP_MAX_CONNS", 512, 1, 65536)
 	if err != nil {
 		return nil, err
@@ -135,6 +153,8 @@ func FromEnv() (*Server, error) {
 		maxGrants:              maxGrants,
 		maxGrantsPerVisitor:    maxGrantsPerVisitor,
 		maxAllocationsPerGrant: maxAllocationsPerGrant,
+		maxBytesPerSec:         maxBytesPerSec,
+		maxVisitorBytesPerSec:  maxVisitorBytesPerSec,
 		maxTCPConns:            maxTCPConns,
 		maxTCPConnsPerIP:       maxTCPConnsPerIP,
 		logLevel:               logLevel,
@@ -190,8 +210,9 @@ func newServer(opts options) (*Server, error) {
 		maxGrants:              opts.maxGrants,
 		maxGrantsPerVisitor:    opts.maxGrantsPerVisitor,
 		maxAllocationsPerGrant: opts.maxAllocationsPerGrant,
+		maxBytesPerSec:         opts.maxBytesPerSec,
+		maxVisitorBytesPerSec:  opts.maxVisitorBytesPerSec,
 		allowUnsafePeers:       opts.allowUnsafePeers,
-		localAddrs:             hostInterfaceAddrs(),
 		onRemove:               opts.onRemove,
 		grants:                 make(map[string]*grant),
 		byUsername:             make(map[string]*grant),
@@ -202,7 +223,7 @@ func newServer(opts options) (*Server, error) {
 	}
 
 	port := opts.port
-	var packetConns []net.PacketConn
+	var packetConns []*net.UDPConn
 	var listeners []net.Listener
 	closeAll := func() {
 		for _, pc := range packetConns {
@@ -245,7 +266,7 @@ func newServer(opts options) (*Server, error) {
 		}
 
 		if opts.enableUDP {
-			pc, err := net.ListenPacket("udp4", net.JoinHostPort(opts.bindIP.String(), strconv.Itoa(port)))
+			sockets, err := listenUDPControl(opts.bindIP, port)
 			if err != nil {
 				if attempt+1 < attempts {
 					closeAll()
@@ -258,9 +279,13 @@ func newServer(opts options) (*Server, error) {
 
 				return nil, fmt.Errorf("ice: listen udp %s:%d: %w", opts.bindIP, port, err)
 			}
-			packetConns = append(packetConns, pc)
+			packetConns = sockets
+			for _, pc := range packetConns {
+				_ = pc.SetReadBuffer(udpControlBufferSize)
+				_ = pc.SetWriteBuffer(udpControlBufferSize)
+			}
 			if port == 0 {
-				port = pc.LocalAddr().(*net.UDPAddr).Port
+				port = packetConns[0].LocalAddr().(*net.UDPAddr).Port
 			}
 		}
 
@@ -343,11 +368,18 @@ func (o options) relayGenerator(s *Server) turn.RelayAddressGenerator {
 	return &countingGenerator{inner: inner, srv: s}
 }
 
-func envSTUNURLs() ([]string, error) {
+func envSTUNURLs(channel string) ([]string, error) {
 	value := strings.TrimSpace(os.Getenv("STUN_URLS"))
 	switch value {
 	case "":
-		return []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}, nil
+		switch strings.ToLower(strings.TrimSpace(channel)) {
+		case "self":
+			return nil, nil
+		case "global":
+			return []string{"stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"}, nil
+		default:
+			return []string{"stun:stun.miwifi.com:3478", "stun:stun.chat.bilibili.com:3478"}, nil
+		}
 	case "local":
 		return nil, nil
 	}

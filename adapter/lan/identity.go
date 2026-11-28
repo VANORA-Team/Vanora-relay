@@ -11,9 +11,21 @@ import (
 	"math/big"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"vanora-relay/internal/routes"
+)
+
+type cachedLANCert struct {
+	cert     tls.Certificate
+	pin      string
+	notAfter time.Time
+}
+
+var (
+	lanCertMu    sync.RWMutex
+	lanCertCache = make(map[string]cachedLANCert)
 )
 
 const (
@@ -59,6 +71,14 @@ func LoadClientKey(store Store) (string, error) {
 }
 
 func makeCertificate(seed string) (tls.Certificate, string, error) {
+	now := time.Now()
+	lanCertMu.RLock()
+	if cached, ok := lanCertCache[seed]; ok && now.Add(24*time.Hour).Before(cached.notAfter) {
+		lanCertMu.RUnlock()
+		return cached.cert, cached.pin, nil
+	}
+	lanCertMu.RUnlock()
+
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(seed)
 	if err != nil || len(raw) != ed25519.SeedSize {
 		return tls.Certificate{}, "", errors.New("LAN: invalid device key")
@@ -69,18 +89,26 @@ func makeCertificate(seed string) (tls.Certificate, string, error) {
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	now := time.Now()
+	notAfter := now.AddDate(10, 0, 0)
 	template := &x509.Certificate{
 		SerialNumber: serial.Add(serial, big.NewInt(1)),
 		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.AddDate(10, 0, 0),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, key)
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, fingerprint(publicKey), nil
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	pin := fingerprint(publicKey)
+	lanCertMu.Lock()
+	if len(lanCertCache) >= 16 {
+		clear(lanCertCache)
+	}
+	lanCertCache[seed] = cachedLANCert{cert: cert, pin: pin, notAfter: notAfter}
+	lanCertMu.Unlock()
+	return cert, pin, nil
 }
 
 func fingerprint(key ed25519.PublicKey) string {

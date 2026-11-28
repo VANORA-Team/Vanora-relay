@@ -4,30 +4,41 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
+	"vanora-relay/internal/cftunnel"
 	"vanora-relay/internal/identity"
 	"vanora-relay/protocol"
 )
 
 type signalTunnelController struct {
-	denyRefresh bool
-	mintGate    func(context.Context)
+	refreshErr   error
+	mintGate     func(context.Context)
+	presenceGate func(context.Context, int64)
 }
 
 func (c *signalTunnelController) ScopeID() string { return "test-scope" }
-func (c *signalTunnelController) RecordHostPresence(context.Context, identity.Principal, string, string, string, int64, int64, int64, bool) error {
+func (c *signalTunnelController) RecordHostPresence(ctx context.Context, _ identity.Principal, _, _, _ string, _, _, seq int64, _ bool) error {
+	if c.presenceGate != nil {
+		c.presenceGate(ctx, seq)
+	}
 	return nil
 }
 func (c *signalTunnelController) AuthorizeVisitor(context.Context, TunnelAccessRequest) (string, time.Time, error) {
 	return "host.edge.example", time.Now().Add(time.Hour), nil
 }
 func (c *signalTunnelController) RefreshVisitorAccess(ctx context.Context, req TunnelAccessRequest) (string, time.Time, error) {
-	if c.denyRefresh {
-		return "", time.Time{}, errors.New("denied")
+	if c.refreshErr != nil {
+		return "", time.Time{}, c.refreshErr
 	}
 	return c.AuthorizeVisitor(ctx, req)
 }
@@ -39,6 +50,112 @@ func (c *signalTunnelController) MintEdgeTicket(ctx context.Context, _ identity.
 }
 func (c *signalTunnelController) ReleasedForOwner(context.Context, identity.Principal, string) bool {
 	return false
+}
+
+func TestTunnelHostQueueKeepsWebSocketResponsiveAndOrdered(t *testing.T) {
+	h := NewSelfHosted("", nil)
+	presenceStarted := make(chan struct{})
+	unblockPresence := make(chan struct{})
+	ctrl := &signalTunnelController{presenceGate: func(ctx context.Context, seq int64) {
+		if seq == 1 {
+			close(presenceStarted)
+			select {
+			case <-unblockPresence:
+			case <-ctx.Done():
+			}
+		}
+	}}
+	h.ConfigureTunnel(ctrl)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Vanora-Tunnel-Ack-Seq": {"1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := readMessage(ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := mustSelfDeviceID(t, pub)
+	login := protocol.Message{Type: "auth.login", Connection: challenge.Connection, From: device, To: "signal"}
+	if err := login.Sign(key, protocol.Encode(loginBody{Role: "desktop", PublicKey: base64.RawURLEncoding.EncodeToString(pub)})); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMessage(ctx, ws, login); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := readMessage(ctx, ws); err != nil || msg.Type != "auth.ok" {
+		t.Fatalf("login reply %q: %v", msg.Type, err)
+	}
+	for seq := uint64(1); seq <= 2; seq++ {
+		event := protocol.Message{Type: "tunnel.host", From: device, Seq: seq}
+		err := event.Sign(key, protocol.Encode(tunnelHostBody{
+			tunnelDomain: tunnelDomain{Audience: tunnelAudience, Scope: ctrl.ScopeID()},
+			RuntimeID:    "runtime", SocketID: "socket", Phase: "listening", Generation: 1, Incarnation: 1,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeMessage(ctx, ws, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-presenceStarted:
+	case <-ctx.Done():
+		t.Fatal("presence RPC did not start")
+	}
+	acks := make(chan uint64, 2)
+	readDone := make(chan error, 1)
+	go func() {
+		for range 2 {
+			msg, err := readMessage(ctx, ws)
+			if err != nil {
+				readDone <- err
+				return
+			}
+			var ack struct {
+				Seq uint64 `json:"seq"`
+			}
+			if msg.Type != "tunnel.host.ack" || json.Unmarshal(msg.Data, &ack) != nil {
+				readDone <- errors.New("invalid tunnel.host.ack")
+				return
+			}
+			acks <- ack.Seq
+		}
+		_, err := readMessage(ctx, ws)
+		readDone <- err
+	}()
+	pingCtx, stopPing := context.WithTimeout(ctx, 500*time.Millisecond)
+	err = ws.Ping(pingCtx)
+	stopPing()
+	if err != nil {
+		t.Fatalf("ping blocked behind presence RPC: %v", err)
+	}
+	close(unblockPresence)
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case got := <-acks:
+			if got != want {
+				t.Fatalf("ack seq = %d, want %d", got, want)
+			}
+		case err := <-readDone:
+			t.Fatalf("ack read: %v", err)
+		}
+	}
+	h.Drain(ctx)
+	if err := <-readDone; websocket.CloseStatus(err) != websocket.StatusGoingAway {
+		t.Fatalf("drain close status = %d (%v)", websocket.CloseStatus(err), err)
+	}
 }
 
 func newTunnelPeer(t *testing.T, h *Hub, role string) (*peer, ed25519.PrivateKey) {
@@ -142,8 +259,20 @@ func TestTunnelPermitRefreshAndRuntimeFencing(t *testing.T) {
 	}
 	next(visitor, "tunnel.access")
 	next(host, "tunnel.access")
+	priorAccess := h.tunnelSessions[id].accessUntil
 	h.tunnelSessions[id].lastRefresh = time.Now().Add(-time.Minute)
-	ctrl.denyRefresh = true
+	ctrl.refreshErr = cftunnel.ErrMembershipUnavailable
+	refreshRecord.Seq++
+	if err := send(visitor, visitorKey, refreshRecord, refresh); err != nil {
+		t.Fatal(err)
+	}
+	next(visitor, "tunnel.access")
+	next(host, "tunnel.access")
+	if got := h.tunnelSessions[id].accessUntil; !got.Equal(priorAccess) {
+		t.Fatalf("transient refresh changed grant from %v to %v", priorAccess, got)
+	}
+	h.tunnelSessions[id].lastRefresh = time.Now().Add(-time.Minute)
+	ctrl.refreshErr = errors.New("denied")
 	refreshRecord.Seq++
 	if err := send(visitor, visitorKey, refreshRecord, refresh); err != nil {
 		t.Fatal(err)
@@ -165,6 +294,14 @@ func TestTunnelPermitRefreshAndRuntimeFencing(t *testing.T) {
 	next(host, "tunnel.close")
 	next(host, "tunnel.host.ack")
 	next(visitor, "tunnel.close")
+	connectRecord.Connection = protocol.NewID()
+	if err := send(visitor, visitorKey, connectRecord, connect); err == nil || err.Error() != "tunnel_unavailable" {
+		t.Fatalf("paired visitor with a valid pin received %v for stopped host", err)
+	}
+	connect.TargetPinHash = tunnelKeyHash(visitor.id.PublicKey)
+	if err := send(visitor, visitorKey, connectRecord, connect); !errors.Is(err, errTunnelUnavailable) {
+		t.Fatalf("visitor with an invalid pin received %v for stopped host", err)
+	}
 }
 
 func TestTunnelConcurrentPermitRejected(t *testing.T) {

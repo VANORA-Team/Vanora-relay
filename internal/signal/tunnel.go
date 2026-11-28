@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"vanora-relay/internal/cftunnel"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/strictjson"
 	"vanora-relay/protocol"
@@ -61,7 +62,7 @@ func (h *Hub) ConfigureTunnel(ctrl TunnelController) {
 }
 
 func (h *Hub) ConfigureTunnelClientIP(extract func(*http.Request) string) {
-	h.tunnelClientIP = extract
+	h.ConfigureClientIP(extract)
 }
 
 func (h *Hub) HasActiveTunnelRuntime(deviceID, deviceKeyHash, runtimeID string, now time.Time) bool {
@@ -231,10 +232,15 @@ func (h *Hub) announceTunnelHost(p *peer, m protocol.Message, body tunnelHostBod
 			slog.DebugContext(ctx, "tunnel presence update failed")
 		}
 	}
+	seq := m.Seq
+	if p.legacyTunnelAcks {
+		seq = 0
+	}
 	p.send(protocol.Message{Type: "tunnel.host.ack", Data: protocol.Encode(struct {
 		RuntimeID string    `json:"runtime_id"`
 		ExpiresAt time.Time `json:"expires_at"`
-	}{body.RuntimeID, expires.UTC()})})
+		Seq       uint64    `json:"seq,omitempty"`
+	}{body.RuntimeID, expires.UTC(), seq})})
 	return nil
 }
 
@@ -263,23 +269,39 @@ func (h *Hub) connectTunnel(p *peer, m protocol.Message, body tunnelConnectBody,
 	}
 	if host == nil || !host.live(now) || !host.online {
 		id, owner := p.id, tunnelOwner(p)
+		if body.ExpectedOwner != owner || p.releasedLookup || now.Before(p.nextReleasedLookup) {
+			h.mu.Unlock()
+			return errTunnelUnavailable
+		}
+		p.releasedLookup = true
+		p.nextReleasedLookup = now.Add(250 * time.Millisecond)
 		h.mu.Unlock()
-		if body.ExpectedOwner == owner && ctrl.ReleasedForOwner(p.ctx, id, m.To) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			current := h.peers[m.To]
-			now = time.Now()
-			if p.live(now) && (current == nil || !current.online || !current.live(now)) {
-				return errors.New("tunnel_released")
-			}
+		ctx, cancel := context.WithTimeout(p.ctx, time.Second)
+		released := ctrl.ReleasedForOwner(ctx, id, m.To)
+		cancel()
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		p.releasedLookup = false
+		current := h.peers[m.To]
+		now = time.Now()
+		if released && p.live(now) && (current == nil || !current.online || !current.live(now)) {
+			return errors.New("tunnel_released")
 		}
 		return errTunnelUnavailable
 	}
+	if !tunnelAllows(host, p) || body.ExpectedOwner != tunnelOwner(host) || body.TargetPinHash != tunnelKeyHash(host.id.PublicKey) {
+		h.mu.Unlock()
+		return errTunnelUnavailable
+	}
 	state := host.tunnelHost
-	if !tunnelAllows(host, p) || state.Phase != "listening" || !now.Before(state.expires) ||
-		state.Generation < 1 || state.Incarnation < 1 || body.ExpectedOwner != tunnelOwner(host) ||
-		body.TargetPinHash != tunnelKeyHash(host.id.PublicKey) || h.tunnelSessions[m.Connection] != nil ||
-		!h.tunnelCapacity(host, p, nil, false) {
+	if state.Phase != "listening" || !now.Before(state.expires) || state.Generation < 1 || state.Incarnation < 1 {
+		h.mu.Unlock()
+		if state.Phase == "stopping" && p.legacyTunnelErrors {
+			return errTunnelUnavailable
+		}
+		return errors.New("tunnel_unavailable")
+	}
+	if h.tunnelSessions[m.Connection] != nil || !tunnelCapacity(host, p, nil, false) {
 		h.mu.Unlock()
 		return errTunnelUnavailable
 	}
@@ -290,9 +312,16 @@ func (h *Hub) connectTunnel(p *peer, m protocol.Message, body tunnelConnectBody,
 	}
 	req := session.accessRequest()
 	cert := p.cert
-	h.tunnelSessions[session.id] = session
+	if host.hostTunnels == nil {
+		host.hostTunnels = make(map[string]*tunnelSession)
+	}
+	if p.visitorTunnels == nil {
+		p.visitorTunnels = make(map[string]*tunnelSession)
+	}
+	h.tunnelSessions[session.id], host.hostTunnels[session.id], p.visitorTunnels[session.id] = session, session, session
+	offerDeadline := session.offerUntil
 	h.mu.Unlock()
-	ctx, cancel := context.WithDeadline(p.ctx, session.offerUntil)
+	ctx, cancel := context.WithDeadline(p.ctx, offerDeadline)
 	defer cancel()
 	var hostname string
 	var until time.Time
@@ -314,8 +343,8 @@ func (h *Hub) connectTunnel(p *peer, m protocol.Message, body tunnelConnectBody,
 		return nil
 	}
 	if authErr != nil || hostname == "" || !session.live(now) || !until.After(now) ||
-		!h.tunnelCapacity(host, p, session, false) {
-		delete(h.tunnelSessions, session.id)
+		!tunnelCapacity(host, p, session, false) {
+		h.removeTunnel(session)
 		return errTunnelUnavailable
 	}
 	session.hostname, session.accessUntil, session.offered = hostname, until, true
@@ -374,7 +403,7 @@ func (h *Hub) permitTunnel(p *peer, m protocol.Message, body tunnelPermitBody, c
 		until = lease
 	}
 	if err != nil || !session.live(now) || !until.After(now) || !body.ExpiresAt.After(now) ||
-		!h.tunnelCapacity(p, session.visitor, session, true) {
+		!tunnelCapacity(p, session.visitor, session, true) {
 		h.dropTunnel(session, "device_unavailable", 0)
 		return nil
 	}
@@ -407,7 +436,7 @@ func (h *Hub) refreshTunnel(p *peer, m protocol.Message, body tunnelRefreshBody,
 	req := session.accessRequest()
 	expires := session.accessUntil
 	h.mu.Unlock()
-	ctx, cancel := context.WithDeadline(p.ctx, expires)
+	ctx, cancel := context.WithDeadline(p.ctx, minTime(expires, now.Add(5*time.Second)))
 	defer cancel()
 	hostname, until, err := ctrl.RefreshVisitorAccess(ctx, req)
 	h.mu.Lock()
@@ -415,6 +444,9 @@ func (h *Hub) refreshTunnel(p *peer, m protocol.Message, body tunnelRefreshBody,
 	now = time.Now()
 	if h.tunnelSessions[session.id] != session {
 		return nil
+	}
+	if errors.Is(err, cftunnel.ErrMembershipUnavailable) || errors.Is(err, context.DeadlineExceeded) {
+		until, hostname, err = expires, session.hostname, nil
 	}
 	until = session.clampAccess(until, now)
 	if err != nil || hostname != session.hostname || !session.live(now) || !until.After(now) {
@@ -484,17 +516,17 @@ func minTime(value time.Time, bounds ...time.Time) time.Time {
 }
 
 func (h *Hub) tunnelLease(raw, cert string, id identity.Principal, current, now time.Time) time.Time {
-	expires, err := identity.VerifyEndpointLease(raw, h.key, now, cert, id)
+	expires, err := identity.VerifyEndpointLeaseWithKeys(raw, h.trustedKeys(), now, cert, id)
 	if h.selfHosted || err != nil || !expires.After(now) {
 		return time.Time{}
 	}
 	return minTime(current, expires)
 }
 
-func (h *Hub) tunnelCapacity(host, visitor *peer, current *tunnelSession, permitting bool) bool {
+func tunnelCapacity(host, visitor *peer, current *tunnelSession, permitting bool) bool {
 	pending, perVisitor, perIP, active, activeVisitor := 0, 0, 0, 0, 0
-	for _, s := range h.tunnelSessions {
-		if s == current || s.host != host {
+	for _, s := range host.hostTunnels {
+		if s == current {
 			continue
 		}
 		sameVisitor := s.visitor.id.DeviceID == visitor.id.DeviceID
@@ -519,8 +551,14 @@ func (h *Hub) tunnelCapacity(host, visitor *peer, current *tunnelSession, permit
 	return pending < 32 && perVisitor < 2 && perIP < 16 && active < 16 && activeVisitor < 2
 }
 
-func (h *Hub) dropTunnel(s *tunnelSession, reason string, retry int) {
+func (h *Hub) removeTunnel(s *tunnelSession) {
 	delete(h.tunnelSessions, s.id)
+	delete(s.host.hostTunnels, s.id)
+	delete(s.visitor.visitorTunnels, s.id)
+}
+
+func (h *Hub) dropTunnel(s *tunnelSession, reason string, retry int) {
+	h.removeTunnel(s)
 	domain := tunnelDomain{Audience: tunnelAudience, Scope: s.scope}
 	msg := protocol.Message{Type: "tunnel.close", Connection: s.id, Data: protocol.Encode(tunnelCloseBody{
 		tunnelDomain: domain, Reason: reason, RetryAfter: retry,
@@ -535,24 +573,21 @@ func (h *Hub) dropTunnel(s *tunnelSession, reason string, retry int) {
 }
 
 func (h *Hub) dropPeerTunnels(p *peer, reason string) {
-	for _, s := range h.tunnelSessions {
-		if s.host == p || s.visitor == p {
-			h.dropTunnel(s, reason, 0)
-		}
+	h.dropPeerHostTunnels(p, reason)
+	for _, s := range p.visitorTunnels {
+		h.dropTunnel(s, reason, 0)
 	}
 }
 
 func (h *Hub) dropPeerHostTunnels(p *peer, reason string) {
-	for _, s := range h.tunnelSessions {
-		if s.host == p {
-			h.dropTunnel(s, reason, 0)
-		}
+	for _, s := range p.hostTunnels {
+		h.dropTunnel(s, reason, 0)
 	}
 }
 
 func (h *Hub) revokeTunnelGrants(p *peer) {
-	for _, s := range h.tunnelSessions {
-		if s.host == p && !tunnelAllows(p, s.visitor) {
+	for _, s := range p.hostTunnels {
+		if !tunnelAllows(p, s.visitor) {
 			h.dropTunnel(s, "access_revoked", 0)
 		}
 	}

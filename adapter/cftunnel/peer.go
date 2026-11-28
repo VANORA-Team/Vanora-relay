@@ -3,15 +3,22 @@ package cftunnel
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
 	"vanora-relay/internal/strictjson"
 	"vanora-relay/protocol"
+)
+
+const (
+	peerInboxSize        = 256
+	controlWriteTimeout  = 5 * time.Second
+	keepaliveInterval    = 25 * time.Second
+	keepaliveReadTimeout = 90 * time.Second
 )
 
 var (
@@ -29,18 +36,37 @@ type Peer struct {
 	handler  transport.Handler
 	budget   *AssemblyBudget
 
-	stateMu     sync.Mutex
-	access      *endpoint.Access
-	accessUntil time.Time
-	expiry      *time.Timer
+	stateMu      sync.Mutex
+	access       *endpoint.Access
+	accessUntil  time.Time
+	expiry       *time.Timer
+	pendingLease *endpoint.LeaseProof
+	onClose      func()
+	closeOnce    sync.Once
 
-	writeMu sync.Mutex
-	writeID uint32
+	writeMu      sync.Mutex
+	writeScratch []byte
+	lastWriteAt  atomic.Int64
+
+	pongWake  chan struct{}
+	leaseWake chan struct{}
 }
 
 func newPeer(ctx context.Context, cancel context.CancelFunc, conn *tls.Conn, user string, allows func() bool, until time.Time, access *endpoint.Access, handler transport.Handler, budget *AssemblyBudget) *Peer {
-	peer := &Peer{ctx: ctx, cancel: cancel, conn: conn, userID: user, allows: allows,
-		access: access, handler: handler, budget: budget}
+	peer := &Peer{
+		ctx:          ctx,
+		cancel:       cancel,
+		conn:         conn,
+		userID:       user,
+		allows:       allows,
+		access:       access,
+		handler:      handler,
+		budget:       budget,
+		writeScratch: make([]byte, 0, tlsMaxPlaintext),
+		pongWake:     make(chan struct{}, 1),
+		leaseWake:    make(chan struct{}, 1),
+	}
+	peer.lastWriteAt.Store(time.Now().UnixNano())
 	peer.UpdateAccessUntil(until)
 	return peer
 }
@@ -61,13 +87,29 @@ func (p *Peer) accessAllows(requiresOnline bool) bool {
 		(p.access == nil || p.access.Allows(now, requiresOnline, true))
 }
 
+func (p *Peer) setOnClose(fn func()) {
+	p.stateMu.Lock()
+	p.onClose = fn
+	p.stateMu.Unlock()
+}
+
 func (p *Peer) Close() {
 	p.cancel()
 	p.stateMu.Lock()
 	if p.expiry != nil {
 		p.expiry.Stop()
 	}
+	fn := p.onClose
+	p.onClose = nil
 	p.stateMu.Unlock()
+	p.closeOnce.Do(func() {
+		if p.conn != nil {
+			_ = p.conn.Close()
+		}
+		if fn != nil {
+			fn()
+		}
+	})
 }
 
 func (p *Peer) UpdateAccessUntil(until time.Time) {
@@ -110,8 +152,36 @@ func (p *Peer) UpdateLocalLease(proof endpoint.LeaseProof) error {
 }
 
 func (p *Peer) updateLocalLease(proof endpoint.LeaseProof, current func() bool) error {
+	if err := p.applyLocalLease(proof, current); err != nil {
+		return err
+	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	if p.ctx.Err() != nil {
+		return transport.ErrPeerClosed
+	}
+	return p.writeControl(controlRecord{Type: "lease.update", Proof: protocol.Encode(proof)})
+}
+
+// enqueueLocalLease updates local access synchronously and coalesces the
+// outbound lease.update frame onto controlLoop so one slow peer cannot stall
+// renewals for other peers on the same Listener.
+func (p *Peer) enqueueLocalLease(proof endpoint.LeaseProof, current func() bool) error {
+	if err := p.applyLocalLease(proof, current); err != nil {
+		return err
+	}
+	cp := proof
+	p.stateMu.Lock()
+	p.pendingLease = &cp
+	p.stateMu.Unlock()
+	select {
+	case p.leaseWake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (p *Peer) applyLocalLease(proof endpoint.LeaseProof, current func() bool) error {
 	if p.ctx.Err() != nil {
 		return transport.ErrPeerClosed
 	}
@@ -119,17 +189,11 @@ func (p *Peer) updateLocalLease(proof endpoint.LeaseProof, current func() bool) 
 		return transport.ErrUnauthorized
 	}
 	p.stateMu.Lock()
-	var err error
+	defer p.stateMu.Unlock()
 	if p.access == nil || current != nil && !current() {
-		err = transport.ErrUnauthorized
-	} else {
-		err = p.access.Update(true, proof, time.Now())
+		return transport.ErrUnauthorized
 	}
-	p.stateMu.Unlock()
-	if err != nil {
-		return err
-	}
-	return p.writeControl(controlRecord{Type: "lease.update", Proof: protocol.Encode(proof)})
+	return p.access.Update(true, proof, time.Now())
 }
 
 func (p *Peer) Send(data []byte, requiresOnline bool) error {
@@ -157,42 +221,93 @@ func (p *Peer) send(data []byte, online, removal bool) error {
 	}
 	defer p.conn.SetWriteDeadline(time.Time{})
 	_ = p.conn.SetWriteDeadline(time.Now().Add(frameTimeout))
-	if len(data) <= maxChunk && !isChunk(data) {
+	if len(data) <= maxStreamPayload && !isChunk(data) {
 		return p.write(frameData, data)
 	}
-	p.writeID++
-	total := uint32((len(data) + maxChunk - 1) / maxChunk)
-	chunk := make([]byte, chunkHeader, chunkHeader+maxChunk)
-	copy(chunk, chunkMagic)
-	binary.BigEndian.PutUint32(chunk[4:8], p.writeID)
-	binary.BigEndian.PutUint32(chunk[12:16], total)
-	for index := uint32(0); index < total; index++ {
-		if !allowed() {
+	// Stream in exact TLS 1.3 record-aligned slices (5B header + 16379B = 16384B)
+	// so every write emits one TLS record and one WebSocket binary frame.
+	for offset, chunkIndex := 0, 0; offset < len(data); chunkIndex++ {
+		if chunkIndex > 0 && chunkIndex%16 == 0 && !allowed() {
 			p.Close()
 			return transport.ErrUnauthorized
 		}
-		start := int(index) * maxChunk
-		binary.BigEndian.PutUint32(chunk[8:12], index)
-		if err := p.write(frameData, append(chunk, data[start:min(start+maxChunk, len(data))]...)); err != nil {
+		end := min(offset+maxStreamPayload, len(data))
+		kind := frameDataPart
+		if end == len(data) {
+			kind = frameDataFinal
+		}
+		if err := p.write(kind, data[offset:end]); err != nil {
 			return err
 		}
+		offset = end
 	}
 	return nil
 }
 
 func (p *Peer) write(kind byte, data []byte) error {
-	if err := writeRecord(p.conn, kind, data); err != nil {
+	if err := writeRecordScratch(p.conn, &p.writeScratch, kind, data); err != nil {
 		p.Close()
 		return err
 	}
+	p.lastWriteAt.Store(time.Now().UnixNano())
 	return nil
+}
+
+func (p *Peer) controlLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	sendControl := func(rec controlRecord) bool {
+		p.writeMu.Lock()
+		defer p.writeMu.Unlock()
+		if p.ctx.Err() != nil {
+			return false
+		}
+		return p.writeControl(rec) == nil
+	}
+	for {
+		select {
+		case <-done:
+			return
+		case <-p.ctx.Done():
+			return
+		case <-p.leaseWake:
+			p.stateMu.Lock()
+			proof := p.pendingLease
+			p.pendingLease = nil
+			p.stateMu.Unlock()
+			if proof != nil {
+				if !sendControl(controlRecord{Type: "lease.update", Proof: protocol.Encode(*proof)}) {
+					return
+				}
+			}
+		case <-p.pongWake:
+			if !sendControl(controlRecord{Type: "pong"}) {
+				return
+			}
+		case now := <-ticker.C:
+			last := time.Unix(0, p.lastWriteAt.Load())
+			if now.Sub(last) >= keepaliveInterval {
+				if !sendControl(controlRecord{Type: "ping"}) {
+					return
+				}
+			}
+		}
+	}
 }
 
 func (p *Peer) run() {
 	recv := assembly{budget: p.budget}
 	opened := false
+	controlDone := make(chan struct{})
+	var inbox chan []byte
+	var deliverDone chan struct{}
 	defer func() {
 		p.Close()
+		close(controlDone)
+		if inbox != nil {
+			close(inbox)
+			<-deliverDone
+		}
 		recv.reset()
 		if opened {
 			p.handler.Closed(p)
@@ -204,21 +319,50 @@ func (p *Peer) run() {
 	if p.handler != nil {
 		opened = true
 		p.handler.Open(p)
+		inbox = make(chan []byte, peerInboxSize)
+		deliverDone = make(chan struct{})
+		go func() {
+			defer close(deliverDone)
+			for frame := range inbox {
+				if !p.Allows(false) {
+					return
+				}
+				p.handler.Message(p, frame)
+			}
+		}()
 	}
+	go p.controlLoop(controlDone)
+
 	for p.Allows(false) {
-		_ = p.conn.SetReadDeadline(recv.deadline)
+		deadline := time.Now().Add(keepaliveReadTimeout)
+		if recv.active() && !recv.deadline.IsZero() && recv.deadline.Before(deadline) {
+			deadline = recv.deadline
+		}
+		_ = p.conn.SetReadDeadline(deadline)
 		kind, payload, err := readRecord(p.conn)
 		if err != nil || !p.Allows(false) {
 			return
 		}
 		switch kind {
-		case frameData:
-			frame, err := recv.accept(payload, time.Now())
+		case frameData, frameDataPart, frameDataFinal:
+			var frame []byte
+			if kind == frameData {
+				frame, err = recv.accept(payload, time.Now())
+			} else {
+				frame, err = recv.acceptStream(payload, kind == frameDataFinal, time.Now())
+			}
 			if err != nil {
 				return
 			}
-			if frame != nil && p.handler != nil && p.Allows(false) {
-				p.handler.Message(p, frame)
+			if frame != nil && inbox != nil && p.Allows(false) {
+				select {
+				case inbox <- frame:
+				case <-p.ctx.Done():
+					return
+				default:
+					// Slow consumer overflow: close cleanly so upper layer resumes via events.resume.
+					return
+				}
 			}
 		case frameControl:
 			if err := p.handleControl(payload); err != nil {
@@ -238,7 +382,7 @@ type controlRecord struct {
 
 func (p *Peer) writeControl(record controlRecord) error {
 	defer p.conn.SetWriteDeadline(time.Time{})
-	_ = p.conn.SetWriteDeadline(time.Now().Add(frameTimeout))
+	_ = p.conn.SetWriteDeadline(time.Now().Add(controlWriteTimeout))
 	return p.write(frameControl, protocol.Encode(record))
 }
 
@@ -264,9 +408,10 @@ func (p *Peer) handleControl(payload []byte) error {
 			return errFrame
 		}
 		if record.Type == "ping" {
-			p.writeMu.Lock()
-			defer p.writeMu.Unlock()
-			return p.writeControl(controlRecord{Type: "pong"})
+			select {
+			case p.pongWake <- struct{}{}:
+			default:
+			}
 		}
 		return nil
 	case "close":

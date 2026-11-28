@@ -11,13 +11,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/zalando/go-keyring"
 )
 
 // Store only the small encryption key in the OS vault. Provider refresh handles
 // may exceed platform credential size limits, especially Windows' blob limit.
-type vault struct{ file, id string }
+type vault struct {
+	file, id string
+	mu       sync.Mutex
+	cached   cipher.AEAD
+}
 
 func openVault(dir, authority, ca string) *vault {
 	return namedVault(dir, "account.enc", authority+"\x00"+ca)
@@ -35,9 +40,14 @@ func openChannelVault(dir, channel, authority, ca string) *vault {
 func namedVault(dir, name, scope string) *vault {
 	file := filepath.Join(dir, name)
 	hash := sha256.Sum256([]byte(file + "\x00" + scope))
-	return &vault{file, hex.EncodeToString(hash[:])}
+	return &vault{file: file, id: hex.EncodeToString(hash[:])}
 }
 func (v *vault) cipher(create bool) (cipher.AEAD, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.cached != nil {
+		return v.cached, nil
+	}
 	const service = "Vanora Desktop Relay"
 	encoded, err := keyring.Get(service, v.id)
 	if errors.Is(err, keyring.ErrNotFound) && create {
@@ -59,7 +69,12 @@ func (v *vault) cipher(create bool) (cipher.AEAD, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cipher.NewGCM(block)
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	v.cached = gcm
+	return gcm, nil
 }
 func (v *vault) Load() (string, error) {
 	b, err := os.ReadFile(v.file)

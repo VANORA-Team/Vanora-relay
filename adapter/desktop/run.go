@@ -2,10 +2,10 @@ package desktop
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -19,10 +19,12 @@ import (
 )
 
 type processHandle struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.ReadCloser
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stdout   io.ReadCloser
+	stderr   io.ReadCloser
+	killTree func()
+	cleanup  func()
 
 	stdinOnce sync.Once
 	waitOnce  sync.Once
@@ -32,7 +34,91 @@ const (
 	defaultUIApprovalTimeout = 5 * time.Minute
 	maxPendingUI             = 8
 	maxToolUpdateBytes       = 4 << 10
+	maxRPCLineBytes          = 16 << 20
+	stderrRingBytes          = 8 << 10
 )
+
+var errRecordTooLarge = errors.New("desktop: rpc record exceeds size limit")
+
+// tailBuffer keeps the last cap bytes written to it for failure diagnostics.
+type tailBuffer struct {
+	mu   sync.Mutex
+	buf  []byte
+	cap  int
+	pos  int
+	full bool
+}
+
+func newTailBuffer(capacity int) *tailBuffer {
+	return &tailBuffer{buf: make([]byte, capacity), cap: capacity}
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	orig := len(p)
+	if len(p) >= t.cap {
+		copy(t.buf, p[len(p)-t.cap:])
+		t.pos = 0
+		t.full = true
+		return orig, nil
+	}
+	first := min(len(p), t.cap-t.pos)
+	copy(t.buf[t.pos:], p[:first])
+	if rem := len(p) - first; rem > 0 {
+		copy(t.buf, p[first:])
+		t.pos = rem
+		t.full = true
+	} else {
+		t.pos += first
+		if t.pos == t.cap {
+			t.pos = 0
+			t.full = true
+		}
+	}
+	return orig, nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.full {
+		return string(bytes.TrimSpace(t.buf[:t.pos]))
+	}
+	out := make([]byte, t.cap)
+	n := copy(out, t.buf[t.pos:])
+	copy(out[n:], t.buf[:t.pos])
+	return string(bytes.TrimSpace(out))
+}
+
+// recordLimitedReader bounds bytes consumed per decoded JSON record while
+// supporting an unbounded stream of valid records over a run's lifetime.
+type recordLimitedReader struct {
+	r         io.Reader
+	remaining atomic.Int64
+}
+
+func (l *recordLimitedReader) reset(n int64) {
+	l.remaining.Store(n)
+}
+
+func (l *recordLimitedReader) Read(p []byte) (int, error) {
+	rem := l.remaining.Load()
+	if rem <= 0 {
+		return 0, errRecordTooLarge
+	}
+	if int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := l.r.Read(p)
+	if n > 0 {
+		l.remaining.Add(-int64(n))
+	}
+	return n, err
+}
 
 type pendingUIRequest struct {
 	info     uiRequestData
@@ -109,6 +195,7 @@ type run struct {
 }
 
 func startProcess(cmd *exec.Cmd) (*processHandle, error) {
+	configureCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -130,7 +217,15 @@ func startProcess(cmd *exec.Cmd) (*processHandle, error) {
 		stderr.Close()
 		return nil, err
 	}
-	return &processHandle{cmd: cmd, stdin: stdin, stdout: stdout, stderr: stderr}, nil
+	killTree, cleanup := attachProcessControl(cmd)
+	return &processHandle{
+		cmd:      cmd,
+		stdin:    stdin,
+		stdout:   stdout,
+		stderr:   stderr,
+		killTree: killTree,
+		cleanup:  cleanup,
+	}, nil
 }
 
 func (h *processHandle) closeStdin() {
@@ -152,6 +247,11 @@ func (h *processHandle) shutdown(timeout time.Duration) {
 	}
 	h.closeStdin()
 	h.waitOnce.Do(func() {
+		defer func() {
+			if h.cleanup != nil {
+				h.cleanup()
+			}
+		}()
 		if h.cmd == nil || h.cmd.Process == nil {
 			return
 		}
@@ -178,6 +278,10 @@ func (h *processHandle) shutdown(timeout time.Duration) {
 
 func (h *processHandle) kill() {
 	if h == nil || h.cmd == nil || h.cmd.Process == nil {
+		return
+	}
+	if h.killTree != nil {
+		h.killTree()
 		return
 	}
 	_ = h.cmd.Process.Kill()
@@ -224,11 +328,29 @@ func (r *run) stop(grace time.Duration) {
 
 func (a *Adapter) executeRun(r *run) {
 	defer a.wg.Done()
+	stderrBuf := newTailBuffer(stderrRingBytes)
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		if r.handle != nil && r.handle.stderr != nil {
+			_, _ = io.Copy(stderrBuf, r.handle.stderr)
+		}
+	}()
 	defer func() {
 		r.handle.shutdown(processExitTimeout)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-stderrDone:
+		case <-timer.C:
+		}
+		timer.Stop()
+		if r.failReason != "" && !r.stopFlag.Load() {
+			if snippet := truncateUTF8(stderrBuf.String(), 4<<10); snippet != "" {
+				a.logger.Warn("vanora process exited with stderr", "session", r.sessionID, "run", r.id, "reason", r.failReason, "stderr", snippet)
+			}
+		}
 		a.finishRun(r)
 	}()
-	go io.Copy(io.Discard, r.handle.stderr)
 	if err := r.writeJSON(map[string]any{
 		"id":      r.id,
 		"type":    "prompt",
@@ -237,7 +359,9 @@ func (a *Adapter) executeRun(r *run) {
 		r.failReason = "start_failed"
 		return
 	}
-	dec := json.NewDecoder(bufio.NewReaderSize(r.handle.stdout, 128<<10))
+	limited := &recordLimitedReader{r: bufio.NewReaderSize(r.handle.stdout, 128<<10)}
+	limited.reset(maxRPCLineBytes)
+	dec := json.NewDecoder(limited)
 	for {
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
@@ -246,11 +370,15 @@ func (a *Adapter) executeRun(r *run) {
 				return
 			case errors.Is(err, io.EOF):
 				r.setFail("process_exit")
+			case errors.Is(err, errRecordTooLarge):
+				r.setFail("protocol_error")
+				r.kill()
 			default:
 				r.setFail("protocol_error")
 			}
 			return
 		}
+		limited.reset(maxRPCLineBytes)
 		if a.handleRecord(r, raw) {
 			return
 		}
@@ -907,35 +1035,109 @@ func (a *Adapter) finishRun(r *run) {
 			r.session.active = nil
 		}
 		delete(a.runs, r.id)
-		nextRun := a.promoteNextQueuedRunLocked(r.session)
-		r.session.ps.trim(a.cfg.retention)
-		if err := a.saveLocked(); err != nil {
-			a.logger.Error("persist run terminal", "session", r.session.cfg.id, "run", r.id, "error", err)
-		}
-		sessionID := r.session.cfg.id
+		sr := r.session
+		sr.ps.trim(a.cfg.retention)
+		snap, saveSeq := a.snapshotForSaveLocked()
+		sessionID := sr.cfg.id
 		runID := r.id
 		close(r.done)
 		a.mu.Unlock()
+
 		flushUICancels(uiCancels)
+		if err := a.writeSnapshot(snap, saveSeq); err != nil {
+			a.markSaveFailed(err)
+			a.logger.Error("persist run terminal", "session", sessionID, "run", runID, "error", err)
+		}
 		a.emitActivity(ActivityEvent{
 			SessionID: sessionID,
 			RunID:     runID,
 			Phase:     status,
 		})
-		if nextRun != nil {
+		if nextRun, shouldKill := a.promoteNextQueuedRun(sr); nextRun != nil {
 			a.emitActivity(ActivityEvent{
 				SessionID: sessionID,
 				RunID:     nextRun.id,
 				Phase:     statusRunning,
 			})
+			if shouldKill {
+				nextRun.kill()
+			}
 			go a.executeRun(nextRun)
 		}
 	})
 }
 
-func (a *Adapter) promoteNextQueuedRunLocked(sr *sessionRuntime) *run {
+func (a *Adapter) promoteNextQueuedRun(sr *sessionRuntime) (*run, bool) {
+	for {
+		a.mu.Lock()
+		next, cmd, runCfg := a.claimNextQueuedRunLocked(sr)
+		if next == nil {
+			var snap *persistedState
+			var seq uint64
+			if a.dirty {
+				snap, seq = a.snapshotForSaveLocked()
+			}
+			a.mu.Unlock()
+			if snap != nil {
+				if err := a.writeSnapshot(snap, seq); err != nil {
+					a.markSaveFailed(err)
+				}
+			}
+			return nil, false
+		}
+		a.wg.Add(1)
+		a.mu.Unlock()
+
+		handle, err := startProcess(cmd)
+		if err != nil {
+			a.logger.Error("start queued vanora", "session", sr.cfg.id, "run", next.id, "error", err)
+			a.mu.Lock()
+			if sr.active == next {
+				sr.active = nil
+			}
+			a.failQueuedRunLocked(sr, next, "start_failed")
+			a.wg.Done()
+			a.mu.Unlock()
+			continue
+		}
+
+		a.mu.Lock()
+		startedAt := a.now().UnixMilli()
+		next.handle = handle
+		next.tools = len(runCfg.tools) > 0
+		next.started = startedAt
+		next.pendingTimestamp = startedAt
+		if !next.stopFlag.Load() {
+			next.status = statusRunning
+		}
+		sr.ps.Runs[next.id] = runRecord{
+			Status:  statusRunning,
+			UserID:  next.userID,
+			Tools:   next.tools,
+			Created: startedAt,
+		}
+		a.appendEventLocked(sr, next.id, kindRunStarted, runStartedData{
+			UserID:         next.userID,
+			Text:           next.text,
+			Timestamp:      startedAt,
+			GuestRequestID: next.guestRequestID,
+			RequestedBy:    next.requestedBy,
+		}, next.tools)
+		sr.ps.trim(a.cfg.retention)
+		snap, seq := a.snapshotForSaveLocked()
+		shouldKill := a.closed || next.stopFlag.Load()
+		a.mu.Unlock()
+
+		if err := a.writeSnapshot(snap, seq); err != nil {
+			a.markSaveFailed(err)
+		}
+		return next, shouldKill
+	}
+}
+
+func (a *Adapter) claimNextQueuedRunLocked(sr *sessionRuntime) (*run, *exec.Cmd, *normalizedSession) {
 	if sr == nil || a.closed || sr.active != nil || a.sessions[sr.cfg.id] != sr {
-		return nil
+		return nil, nil, nil
 	}
 	now := a.now()
 	for len(sr.queue) > 0 {
@@ -969,53 +1171,18 @@ func (a *Adapter) promoteNextQueuedRunLocked(sr *sessionRuntime) *run {
 			a.cancelQueuedRunLocked(sr, next, cancelReason)
 			continue
 		}
-		runCfg := sr.cfg
-		if next.hasToolsLimit {
-			narrowed := *sr.cfg
-			narrowed.tools = intersectTools(sr.cfg.tools, next.toolsLimit)
-			runCfg = &narrowed
-		}
-		cmd, err := a.buildCommand(runCfg)
+		cmd, runCfg, err := a.buildRunCommandLocked(sr, next.hasToolsLimit, next.toolsLimit)
 		if err != nil {
 			a.failQueuedRunLocked(sr, next, "start_failed")
 			continue
 		}
-		if runCfg.linkOrigin != "" {
-			if cmd.Env == nil {
-				cmd.Env = os.Environ()
-			}
-			cmd.Env = append(cmd.Env, "VANORA_LINK_ORIGIN="+runCfg.linkOrigin)
-		}
-		handle, err := startProcess(cmd)
-		if err != nil {
-			a.logger.Error("start queued vanora", "session", sr.cfg.id, "run", next.id, "error", err)
-			a.failQueuedRunLocked(sr, next, "start_failed")
-			continue
-		}
-		startedAt := now.UnixMilli()
-		next.handle = handle
 		next.status = statusRunning
-		next.tools = len(runCfg.tools) > 0
-		next.started = startedAt
-		next.pendingTimestamp = startedAt
+		next.started = now.UnixMilli()
+		next.pendingTimestamp = next.started
 		sr.active = next
-		sr.ps.Runs[next.id] = runRecord{
-			Status:  statusRunning,
-			UserID:  next.userID,
-			Tools:   next.tools,
-			Created: startedAt,
-		}
-		a.appendEventLocked(sr, next.id, kindRunStarted, runStartedData{
-			UserID:         next.userID,
-			Text:           next.text,
-			Timestamp:      startedAt,
-			GuestRequestID: next.guestRequestID,
-			RequestedBy:    next.requestedBy,
-		}, next.tools)
-		a.wg.Add(1)
-		return next
+		return next, cmd, runCfg
 	}
-	return nil
+	return nil, nil, nil
 }
 
 func (a *Adapter) failQueuedRunLocked(sr *sessionRuntime, r *run, reason string) {

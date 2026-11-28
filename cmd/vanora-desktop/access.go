@@ -103,6 +103,9 @@ type accessManager struct {
 	requireHostToken bool
 
 	mu              sync.Mutex
+	closed          bool
+	remoteWG        sync.WaitGroup
+	wanMu           sync.Mutex
 	local           *lan.Server
 	selfServer      *selfrelay.Server
 	selfStore       selfrelay.Store
@@ -114,6 +117,7 @@ type accessManager struct {
 	relayDone       chan struct{}
 	remote          *remote.Manager
 	activityEnabled atomic.Bool
+	tunnelOpMu      sync.Mutex
 	tunnelMu        sync.Mutex
 	tunnelEnabled   bool
 	tunnelPinned    bool
@@ -437,21 +441,29 @@ func (m *accessManager) command(cmd accessCommand) {
 		case *cmd.Enabled:
 			if m.local == nil || !m.local.Status().Enabled {
 				if err = m.loadLANLocked(); err == nil {
-					err = m.local.Listen(m.ctx, cmd.Address)
+					local := m.local
+					m.mu.Unlock()
+					err = local.Listen(m.ctx, cmd.Address)
+					m.mu.Lock()
 				}
 			}
 		case m.local != nil:
-			m.local.Stop()
+			local := m.local
+			m.mu.Unlock()
+			local.Stop()
 			if m.service != nil {
 				m.service.RefreshLANAccess()
 			}
+			m.mu.Lock()
 		}
 	case "access.relay.set":
 		if cmd.Enabled == nil {
 			err = errors.New("enabled is required")
 			break
 		}
-		err = m.setRelayLocked(*cmd.Enabled, cmd.Channel, cmd.SignalURL, cmd.SignalToken)
+		m.mu.Unlock()
+		err = m.setRelay(*cmd.Enabled, cmd.Channel, cmd.SignalURL, cmd.SignalToken)
+		m.mu.Lock()
 	case "access.activity.set":
 		if cmd.Enabled == nil {
 			err = errors.New("enabled is required")
@@ -572,7 +584,10 @@ func (m *accessManager) command(cmd accessCommand) {
 			break
 		}
 		if cmd.Type == "access.network.remove" {
-			if err = remove(cmd.ID); err != nil {
+			m.mu.Unlock()
+			err = remove(cmd.ID)
+			m.mu.Lock()
+			if err != nil {
 				break
 			}
 			go m.onNetworkChanged(channel)
@@ -597,10 +612,13 @@ func (m *accessManager) command(cmd accessCommand) {
 				err = errors.New("LAN sharing has not been opened")
 				break
 			}
-			err = m.local.SetClientAccess(cmd.ID, cmd.Access)
+			local := m.local
+			m.mu.Unlock()
+			err = local.SetClientAccess(cmd.ID, cmd.Access)
 			if err == nil && m.service != nil {
 				m.service.RefreshLANAccess()
 			}
+			m.mu.Lock()
 		case "self":
 			if err = m.loadExistingSelfLocked(); err != nil {
 				break
@@ -609,14 +627,17 @@ func (m *accessManager) command(cmd accessCommand) {
 				err = errors.New("self-hosted relay has not been opened")
 				break
 			}
+			srv := m.selfServer
+			m.mu.Unlock()
 			if strings.TrimSpace(cmd.SignalURL) != "" {
-				err = m.selfServer.SetPeerAccessFor(cmd.SignalURL, cmd.ID, cmd.Access)
+				err = srv.SetPeerAccessFor(cmd.SignalURL, cmd.ID, cmd.Access)
 			} else {
-				err = m.selfServer.SetClientAccess(cmd.ID, cmd.Access)
+				err = srv.SetClientAccess(cmd.ID, cmd.Access)
 			}
 			if err == nil && m.service != nil {
 				m.service.RefreshSelfAccess()
 			}
+			m.mu.Lock()
 		default:
 			err = errors.New("access.client.access.set requires channel lan or self")
 		}
@@ -632,11 +653,17 @@ func (m *accessManager) command(cmd accessCommand) {
 		case m.local == nil:
 			err = errors.New("LAN sharing has not been opened")
 		case cmd.Type == "access.clients.revoke":
-			err = m.local.RevokeClients("")
+			local := m.local
+			m.mu.Unlock()
+			err = local.RevokeClients("")
+			m.mu.Lock()
 		case cmd.ID == "":
 			err = errors.New("client ID required")
 		default:
-			err = m.local.RevokeClients(cmd.ID)
+			local := m.local
+			m.mu.Unlock()
+			err = local.RevokeClients(cmd.ID)
+			m.mu.Lock()
 		}
 		if err == nil {
 			if m.service != nil {
@@ -645,12 +672,16 @@ func (m *accessManager) command(cmd accessCommand) {
 			go m.onNetworkChanged("lan")
 		}
 	case "access.self.invite.create", "access.relay.invite.create":
+		m.mu.Unlock()
 		err = m.createRelayInvite(cmd, result)
+		m.mu.Lock()
 	case "access.relay.invite.revoke":
 		if cmd.Channel != "" && cmd.Channel != m.activeChannel {
 			err = errors.New("inactive relay channel")
 		} else if slot := m.activeSlot; slot != nil {
+			m.mu.Unlock()
 			err = slot.revokeInvite(cmd.ID)
+			m.mu.Lock()
 		} else if m.activeChannel != "self" || m.selfServer == nil || !m.selfServer.RevokeInvitation(cmd.ID) {
 			err = errors.New("unknown pairing invitation")
 		}
@@ -666,7 +697,9 @@ func (m *accessManager) command(cmd accessCommand) {
 				break
 			}
 			if slot := m.activeSlot; slot != nil {
+				m.mu.Unlock()
 				err = slot.revokeClients(cmd.ID, all)
+				m.mu.Lock()
 				if err == nil {
 					go m.onNetworkChanged(slot.name)
 				}
@@ -680,11 +713,17 @@ func (m *accessManager) command(cmd accessCommand) {
 		case m.selfServer == nil:
 			err = errors.New("self-hosted relay has not been opened")
 		case all:
-			err = m.selfServer.RevokeClients("")
+			srv := m.selfServer
+			m.mu.Unlock()
+			err = srv.RevokeClients("")
+			m.mu.Lock()
 		case cmd.ID == "":
 			err = errors.New("client ID required")
 		default:
-			err = m.selfServer.RevokeClients(cmd.ID)
+			srv := m.selfServer
+			m.mu.Unlock()
+			err = srv.RevokeClients(cmd.ID)
+			m.mu.Lock()
 		}
 		if err == nil {
 			if m.service != nil {
@@ -693,7 +732,9 @@ func (m *accessManager) command(cmd accessCommand) {
 			go m.onNetworkChanged("self")
 		}
 	case "auth.token":
-		m.updateTokenLocked(cmd.Channel, cmd.Token)
+		m.mu.Unlock()
+		m.updateToken(cmd.Channel, cmd.Token)
+		m.mu.Lock()
 		return
 	case "auth.logout":
 		slot, slotErr := m.resolveOfficialChannelLocked(cmd.Channel)
@@ -701,16 +742,28 @@ func (m *accessManager) command(cmd accessCommand) {
 			err = slotErr
 			break
 		}
-		if m.activeChannel == slot.name {
-			m.stopOfficialLocked()
-			m.activeChannel = ""
+		isActive := m.activeChannel == slot.name
+		m.mu.Unlock()
+		if isActive {
+			m.wanMu.Lock()
+			m.stopOfficialWAN()
+			m.mu.Lock()
+			if m.activeChannel == slot.name {
+				m.activeChannel = ""
+			}
+			m.mu.Unlock()
+			m.wanMu.Unlock()
 		}
+		m.mu.Lock()
 		slot.token = ""
 		slot.verified.Store(false)
 		slot.online.Store(false)
-		if slot.account != nil && slot.account.UserID() != "" {
-			err = slot.account.Reset()
+		acc := slot.account
+		m.mu.Unlock()
+		if acc != nil && acc.UserID() != "" {
+			err = acc.Reset()
 		}
+		m.mu.Lock()
 		result["type"] = "auth.logout.ok"
 		result["channel"] = slot.name
 	default:
@@ -729,12 +782,17 @@ func (m *accessManager) command(cmd accessCommand) {
 	}
 }
 
-func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, signalToken string) error {
+func (m *accessManager) setRelay(enabled bool, rawChannel, signalURL, signalToken string) error {
+	m.wanMu.Lock()
+	defer m.wanMu.Unlock()
 	if !enabled {
-		m.stopAllWANLocked()
+		m.stopAllWAN()
+		m.mu.Lock()
 		m.activeChannel = ""
+		m.mu.Unlock()
 		return nil
 	}
+	m.mu.Lock()
 	ch := strings.ToLower(strings.TrimSpace(rawChannel))
 	if ch == "" {
 		if m.activeChannel != "" {
@@ -744,6 +802,7 @@ func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, sign
 				ch = k
 			}
 		} else {
+			m.mu.Unlock()
 			return errors.New("channel is required (cn, global, or self)")
 		}
 	}
@@ -751,17 +810,24 @@ func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, sign
 	case "cn", "global":
 		slot := m.slots[ch]
 		if slot == nil || slot.account == nil || slot.url == "" {
+			m.mu.Unlock()
 			return fmt.Errorf("official relay channel %s is not configured", ch)
 		}
 		if m.requireHostToken && slot.token == "" {
+			m.mu.Unlock()
 			return fmt.Errorf("Vanora sign-in required for %s channel", ch)
 		}
 		if m.activeChannel == ch && m.relayDone != nil {
+			m.mu.Unlock()
 			return nil
 		}
-		m.stopAllWANLocked()
+		m.mu.Unlock()
+		m.stopAllWAN()
+		m.mu.Lock()
 		m.activeChannel = ch
-		return m.startOfficialLocked(slot)
+		err := m.startOfficialLocked(slot)
+		m.mu.Unlock()
+		return err
 	case "self":
 		url := strings.TrimSpace(signalURL)
 		if url == "" {
@@ -772,53 +838,81 @@ func (m *accessManager) setRelayLocked(enabled bool, rawChannel, signalURL, sign
 			tok = m.selfToken
 		}
 		if err := selfrelay.ValidateSignalURL(url); err != nil {
+			m.mu.Unlock()
 			return err
 		}
 		if err := selfrelay.ValidateRelayToken(tok); err != nil {
+			m.mu.Unlock()
 			return err
 		}
 		if m.activeChannel == "self" && m.selfServer != nil && m.selfServer.Status().Enabled && m.selfURL == url && m.selfToken == tok {
+			m.mu.Unlock()
 			return nil
 		}
-		m.stopAllWANLocked()
+		m.mu.Unlock()
+		m.stopAllWAN()
+		m.mu.Lock()
 		m.selfURL = url
 		m.selfToken = tok
-		if err := m.startSelfLocked(); err != nil {
+		err := m.loadSelfLocked()
+		srv := m.selfServer
+		name := m.name
+		if err == nil && m.ctx.Err() != nil {
+			err = m.ctx.Err()
+		}
+		m.mu.Unlock()
+		if err == nil {
+			err = srv.Connect(m.ctx, url, tok, name)
+		}
+		m.mu.Lock()
+		if err != nil {
 			m.activeChannel = ""
+			m.mu.Unlock()
 			return err
 		}
 		m.activeChannel = "self"
+		m.mu.Unlock()
 		return nil
 	default:
+		m.mu.Unlock()
 		return fmt.Errorf("unknown relay channel %q (want cn, global or self)", ch)
 	}
 }
 
 func (m *accessManager) close() {
 	m.mu.Lock()
+	m.closed = true
 	rm := m.remote
 	m.remote = nil
-	if m.local != nil {
-		m.local.Stop()
+	local := m.local
+	m.mu.Unlock()
+	if local != nil {
+		local.Stop()
 		if m.service != nil {
 			m.service.RefreshLANAccess()
 		}
 	}
-	m.stopAllWANLocked()
-	m.tunnelMu.Lock()
+	m.wanMu.Lock()
+	m.stopAllWAN()
+	m.wanMu.Unlock()
+	m.tunnelOpMu.Lock()
 	m.stopTunnelLocked()
 	m.tunnelSession.Store(nil)
-	m.tunnelMu.Unlock()
-	m.mu.Unlock()
+	m.tunnelOpMu.Unlock()
+	m.remoteWG.Wait()
 	if rm != nil {
 		rm.Close()
 	}
 }
 
-func (m *accessManager) updateTokenLocked(rawChannel, token string) {
+func (m *accessManager) updateToken(rawChannel, token string) {
+	m.wanMu.Lock()
+	defer m.wanMu.Unlock()
 	token = strings.TrimSpace(token)
+	m.mu.Lock()
 	slot, err := m.resolveOfficialChannelLocked(rawChannel)
 	if err != nil || token == "" || len(token) > 16<<10 {
+		m.mu.Unlock()
 		msg := "configured official relay and a valid host token required"
 		if err != nil {
 			msg = err.Error()
@@ -831,14 +925,22 @@ func (m *accessManager) updateTokenLocked(rawChannel, token string) {
 		return
 	}
 	slot.token = token
-	if m.activeChannel == slot.name {
-		if !slot.verified.Load() && m.relayDone != nil {
-			m.stopOfficialLocked()
-		}
-		if m.relayDone == nil {
+	activeMatch := m.activeChannel == slot.name
+	needStop := activeMatch && !slot.verified.Load() && m.relayDone != nil
+	m.mu.Unlock()
+
+	if needStop {
+		m.stopOfficialWAN()
+	}
+	if activeMatch {
+		m.mu.Lock()
+		needStart := m.activeChannel == slot.name && m.relayDone == nil
+		if needStart {
 			_ = m.startOfficialLocked(slot)
+			m.mu.Unlock()
 			return
 		}
+		m.mu.Unlock()
 		if err := slot.account.UpdateToken(token); err != nil {
 			m.emitter.Emit(map[string]any{"type": "auth.error", "channel": slot.name, "error": err.Error()})
 			return
@@ -882,19 +984,24 @@ func (m *accessManager) startSelfLocked() error {
 	return m.selfServer.Connect(m.ctx, m.selfURL, m.selfToken, m.name)
 }
 
-func (m *accessManager) stopSelfLocked() {
-	if m.selfServer != nil {
+func (m *accessManager) stopSelfWAN() {
+	m.mu.Lock()
+	srv := m.selfServer
+	m.mu.Unlock()
+	if srv != nil {
+		// Stop the signaling loop first so OnSessionStart cannot recreate a
+		// tunnel session after stopTunnelChannel tears it down.
+		srv.Stop()
 		m.stopTunnelChannel("self")
-		m.selfServer.Stop()
 		if m.service != nil {
 			m.service.RefreshSelfAccess()
 		}
 	}
 }
 
-func (m *accessManager) stopAllWANLocked() {
-	m.stopOfficialLocked()
-	m.stopSelfLocked()
+func (m *accessManager) stopAllWAN() {
+	m.stopOfficialWAN()
+	m.stopSelfWAN()
 }
 
 func (m *accessManager) startOfficialLocked(slot *officialSlot) error {
@@ -933,21 +1040,30 @@ func (m *accessManager) startOfficialLocked(slot *officialSlot) error {
 	return nil
 }
 
-func (m *accessManager) stopOfficialLocked() {
-	if m.stopRelay == nil {
+func (m *accessManager) stopOfficialWAN() {
+	m.mu.Lock()
+	stopRelay := m.stopRelay
+	done := m.relayDone
+	slot := m.activeSlot
+	if stopRelay == nil {
+		m.mu.Unlock()
 		return
 	}
-	if m.activeSlot != nil {
-		m.stopTunnelChannel(m.activeSlot.name)
-	}
-	m.stopRelay()
-	<-m.relayDone
 	m.stopRelay, m.relayDone, m.activeSlot = nil, nil, nil
-	m.service.SetOfficialOwner("")
-	m.service.AuthorityLost()
+	m.mu.Unlock()
+	if slot != nil {
+		m.stopTunnelChannel(slot.name)
+	}
+	stopRelay()
+	<-done
+	if m.service != nil {
+		m.service.SetOfficialOwner("")
+		m.service.AuthorityLost()
+	}
 }
 
 func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot) {
+	defer m.stopTunnelChannel(slot.name)
 	source := &authority{account: slot.account, adapter: m.service, ca: slot.ca}
 	for delay := time.Second; ctx.Err() == nil; {
 		socket, err := transport.DialPairedDesktopWithRole(ctx, slot.url, source, m.service, slot.authorize)
@@ -975,7 +1091,11 @@ func (m *accessManager) runOfficialRelay(ctx context.Context, slot *officialSlot
 						}
 					}
 				}
-				m.endTunnelSession(session)
+				if ctx.Err() != nil {
+					m.endTunnelSession(session)
+				} else {
+					m.deferEndTunnelSession(session, 30*time.Second)
+				}
 			}
 			slot.socket.Store(nil)
 			socket.Close()

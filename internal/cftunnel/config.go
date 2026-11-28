@@ -168,6 +168,11 @@ func ConfigFromEnv(channel Channel, lookupEnv func(string) string) (Config, erro
 	if cfg.Process != ProcessAll && cfg.Process != ProcessControl {
 		return Config{}, errors.New("RELAY_TUNNEL_PROCESS must be all or control")
 	}
+	proxies, err := trustedProxies(lookupEnv("RELAY_TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.TrustedProxies = proxies
 	if cfg.Mode == ModeOff {
 		if cfg.Process == ProcessControl {
 			return Config{}, errors.New("RELAY_TUNNEL_PROCESS=control requires enabled tunnels")
@@ -198,9 +203,6 @@ func ConfigFromEnv(channel Channel, lookupEnv func(string) string) (Config, erro
 			cfg.SelfDevices[device] = struct{}{}
 		}
 	} else if err := cfg.loadManifest(env, manifest); err != nil {
-		return Config{}, err
-	}
-	if cfg.TrustedProxies, err = trustedProxies(lookupEnv("RELAY_TRUSTED_PROXY_CIDRS")); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadLimits(&env); err != nil {

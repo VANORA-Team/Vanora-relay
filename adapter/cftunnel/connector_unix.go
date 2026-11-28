@@ -1,4 +1,4 @@
-//go:build unix && !android && !ios
+//go:build unix && !linux && !android && !ios
 
 package cftunnel
 

@@ -20,9 +20,11 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/turn/v4"
+	"golang.org/x/time/rate"
 )
 
 // ICEServer is the standard WebRTC RTCIceServer JSON shape. An entry is
@@ -65,9 +67,14 @@ type Server struct {
 	maxGrants              int
 	maxGrantsPerVisitor    int
 	maxAllocationsPerGrant int
+	maxBytesPerSec         int
+	maxVisitorBytesPerSec  int
 	allowUnsafePeers       bool
-	localAddrs             map[netip.Addr]struct{}
 	onRemove               func(removal)
+
+	localAddrs     atomic.Pointer[map[netip.Addr]struct{}]
+	localAddrUntil atomic.Pointer[time.Time]
+	localAddrMu    sync.Mutex
 
 	// localRelays maps an advertised relay address to its socket so
 	// same-server hairpin traffic can be recognised on the hot path. It has
@@ -75,7 +82,7 @@ type Server struct {
 	localMu     sync.RWMutex
 	localRelays map[netip.AddrPort]*relayConn
 
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	closed      bool
 	grants      map[string]*grant
 	byUsername  map[string]*grant
@@ -97,6 +104,8 @@ type grant struct {
 	pendingAllocs map[string]time.Time
 	relayed       uint64
 	removed       bool
+	bandwidth     *rate.Limiter
+	visitorLimit  *visitorUsage
 }
 
 func (g *grant) prunePendingLocked(now time.Time) {
@@ -108,8 +117,10 @@ func (g *grant) prunePendingLocked(now time.Time) {
 }
 
 type visitorUsage struct {
-	grants  int
-	relayed uint64
+	grants      int
+	relayed     uint64
+	bandwidthMu sync.Mutex
+	bandwidth   *rate.Limiter
 }
 
 // removal is the accounting record emitted when a grant is dropped. It is also
@@ -194,6 +205,7 @@ func (s *Server) Config(connectionID, visitor string, until time.Time) ([]ICESer
 		until:         until,
 		allocations:   make(map[string]*relayConn),
 		pendingAllocs: make(map[string]time.Time),
+		bandwidth:     newBandwidthLimiter(s.maxBytesPerSec),
 	}
 	g.gen = 1
 	gen := g.gen
@@ -204,10 +216,11 @@ func (s *Server) Config(connectionID, visitor string, until time.Time) ([]ICESer
 
 	v := s.visitors[visitor]
 	if v == nil {
-		v = &visitorUsage{}
+		v = &visitorUsage{bandwidth: newBandwidthLimiter(s.maxVisitorBytesPerSec)}
 		s.visitors[visitor] = v
 	}
 	v.grants++
+	g.visitorLimit = v
 
 	return s.turnServers(g), nil
 }

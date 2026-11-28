@@ -1,31 +1,34 @@
 package ice
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// tcpFirstReadTimeout bounds how long an accepted control connection may sit
-// without producing any bytes. Without it a flood of idle connections pins
-// one file descriptor and a goroutine each for the whole connection lifetime.
-const tcpFirstReadTimeout = 30 * time.Second
+const (
+	tcpFirstReadTimeout = 30 * time.Second
+	tcpIdleTimeout      = 11 * time.Minute
+)
 
 // limitedListener caps concurrent TURN-over-TCP control connections, globally
-// and per source IP, and enforces a first-read deadline. TURN allocates a
+// and per source IP, and enforces handshake and idle deadlines. TURN allocates a
 // goroutine, a read buffer, and a socket per accepted connection, so an
 // unbounded accept loop lets a single attacker exhaust the process.
 type limitedListener struct {
-	ln       net.Listener
-	maxTotal int
-	maxPerIP int
-	mu       sync.Mutex
-	perIP    map[string]int
-	tracked  map[net.Conn]struct{}
+	ln           net.Listener
+	maxTotal     int
+	maxPerIP     int
+	firstTimeout time.Duration
+	idleTimeout  time.Duration
+	mu           sync.Mutex
+	closed       bool
+	perIP        map[string]int
+	tracked      map[net.Conn]struct{}
 }
 
-func newLimitedListener(ln net.Listener, maxTotal, maxPerIP int) net.Listener {
+func newLimitedListener(ln net.Listener, maxTotal, maxPerIP int) *limitedListener {
 	if maxTotal < 1 {
 		maxTotal = 1
 	}
@@ -33,17 +36,30 @@ func newLimitedListener(ln net.Listener, maxTotal, maxPerIP int) net.Listener {
 		maxPerIP = 1
 	}
 	return &limitedListener{
-		ln:       ln,
-		maxTotal: maxTotal,
-		maxPerIP: maxPerIP,
-		perIP:    make(map[string]int),
-		tracked:  make(map[net.Conn]struct{}),
+		ln:           ln,
+		maxTotal:     maxTotal,
+		maxPerIP:     maxPerIP,
+		firstTimeout: tcpFirstReadTimeout,
+		idleTimeout:  tcpIdleTimeout,
+		perIP:        make(map[string]int),
+		tracked:      make(map[net.Conn]struct{}),
 	}
 }
 
 func (l *limitedListener) Addr() net.Addr { return l.ln.Addr() }
 
-func (l *limitedListener) Close() error { return l.ln.Close() }
+func (l *limitedListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	err := l.ln.Close()
+	for conn := range l.tracked {
+		_ = conn.Close()
+	}
+	clear(l.tracked)
+	clear(l.perIP)
+	return err
+}
 
 func ipKey(addr net.Addr) string {
 	if tcp, ok := addr.(*net.TCPAddr); ok && tcp.IP != nil {
@@ -66,7 +82,11 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(tcpFirstReadTimeout))
+		if err := conn.SetReadDeadline(time.Now().Add(l.firstTimeout)); err != nil {
+			_ = conn.Close()
+			l.release(conn)
+			continue
+		}
 		return &firstReadConn{Conn: conn, l: l}, nil
 	}
 }
@@ -76,7 +96,7 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 func (l *limitedListener) reserve(conn net.Conn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.tracked) >= l.maxTotal {
+	if l.closed || len(l.tracked) >= l.maxTotal {
 		return false
 	}
 	ip := ipKey(conn.RemoteAddr())
@@ -105,33 +125,47 @@ func (l *limitedListener) release(conn net.Conn) {
 	}
 }
 
-// firstReadConn clears the idle deadline as soon as the peer produces bytes.
-// TURN never manages read deadlines after Accept, so after the first
-// successful read the connection is unrestricted and the cap bookkeeping
-// ends at Close (or a terminal read error, which in practice ends the
-// connection as well).
+// firstReadConn keeps the initial deadline until a complete STUN frame
+// arrives. A TURN client starts with STUN before it can use ChannelData.
 type firstReadConn struct {
 	net.Conn
-	l         *limitedListener
-	firstOnce sync.Once
-	cleared   atomic.Bool
+	l           *limitedListener
+	readMu      sync.Mutex
+	header      [20]byte
+	firstBytes  int
+	established bool
 }
 
 func (c *firstReadConn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.established {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.l.idleTimeout)); err != nil {
+			_ = c.Close()
+			return 0, err
+		}
+	}
 	n, err := c.Conn.Read(b)
-	if n > 0 {
-		c.firstOnce.Do(func() {
-			_ = c.Conn.SetReadDeadline(time.Time{})
-			c.cleared.Store(true)
-		})
+	if n > 0 && !c.established {
+		if c.firstBytes < len(c.header) {
+			copy(c.header[c.firstBytes:], b[:n])
+		}
+		c.firstBytes += n
+		if c.firstBytes >= len(c.header) {
+			bodySize := int(binary.BigEndian.Uint16(c.header[2:4]))
+			c.established = c.header[0]&0xc0 == 0 &&
+				binary.BigEndian.Uint32(c.header[4:8]) == 0x2112a442 &&
+				bodySize%4 == 0 && c.firstBytes >= len(c.header)+bodySize
+		}
 	}
 	if err != nil {
-		c.l.release(c.Conn)
+		_ = c.Close()
 	}
 	return n, err
 }
 
 func (c *firstReadConn) Close() error {
+	err := c.Conn.Close()
 	c.l.release(c.Conn)
-	return c.Conn.Close()
+	return err
 }

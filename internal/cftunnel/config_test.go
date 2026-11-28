@@ -39,6 +39,10 @@ func TestConfigOffAndSelf(t *testing.T) {
 	if err != nil || cfg.Mode != ModeOff || cfg.Store != "" || cfg.SiteManifest != nil {
 		t.Fatalf("off config = %+v, %v", cfg, err)
 	}
+	cfg, err = ConfigFromEnv(ChannelCN, testEnv{"RELAY_TRUSTED_PROXY_CIDRS": "192.0.2.0/24"}.lookup)
+	if err != nil || cfg.Mode != ModeOff || len(cfg.TrustedProxies) != 1 {
+		t.Fatalf("trusted proxies in off mode = %v, %v", cfg.TrustedProxies, err)
+	}
 	for _, channel := range []Channel{ChannelCN, ChannelSelf} {
 		env := testEnv{"RELAY_TUNNEL_SELF_ALLOWED_DEVICES": "a"}
 		if channel.IsSelfHosted() {

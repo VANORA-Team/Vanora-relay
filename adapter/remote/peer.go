@@ -60,6 +60,9 @@ type RemotePeer struct {
 
 	op sync.Mutex // serializes dial, reconnect, openSession, resume, disconnect
 
+	dialMu     sync.Mutex
+	dialCancel context.CancelFunc
+
 	mu             sync.Mutex
 	owner          string
 	name           string
@@ -72,6 +75,8 @@ type RemotePeer struct {
 	socket         *transport.Client
 	ownsSocket     bool
 	peer           transport.Peer
+	connectedAt    time.Time
+	synced         chan struct{}
 	wantReconnect  bool
 	connState      string
 	connPath       string
@@ -139,7 +144,32 @@ func (rp *RemotePeer) Info() PeerInfo {
 	return info
 }
 
+func (rp *RemotePeer) beginDialCtx(parent context.Context) (context.Context, func()) {
+	dctx, cancel := context.WithCancel(parent)
+	stopParent := context.AfterFunc(rp.ctx, cancel)
+	rp.dialMu.Lock()
+	rp.dialCancel = cancel
+	rp.dialMu.Unlock()
+	return dctx, func() {
+		stopParent()
+		rp.dialMu.Lock()
+		rp.dialCancel = nil
+		rp.dialMu.Unlock()
+		cancel()
+	}
+}
+
+func (rp *RemotePeer) interruptDial() {
+	rp.dialMu.Lock()
+	cancel := rp.dialCancel
+	rp.dialMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (rp *RemotePeer) pairLAN(ctx context.Context, target lan.Target) error {
+	rp.interruptDial()
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	rp.dropLinkLocked()
@@ -161,6 +191,7 @@ func (rp *RemotePeer) pairLAN(ctx context.Context, target lan.Target) error {
 }
 
 func (rp *RemotePeer) pairSelf(ctx context.Context, target selfrelay.Target) error {
+	rp.interruptDial()
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	rp.dropLinkLocked()
@@ -182,6 +213,7 @@ func (rp *RemotePeer) pairSelf(ctx context.Context, target selfrelay.Target) err
 }
 
 func (rp *RemotePeer) pairOfficial(ctx context.Context, target pairing.Official) error {
+	rp.interruptDial()
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	rp.dropLinkLocked()
@@ -229,6 +261,7 @@ func (rp *RemotePeer) ConnectExisting(ctx context.Context) error {
 // Reconnect drops the active link and immediately redials while keeping
 // subscribed session cursors.
 func (rp *RemotePeer) Reconnect(ctx context.Context) error {
+	rp.interruptDial()
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	rp.dropLinkLocked()
@@ -248,6 +281,7 @@ func (rp *RemotePeer) Reconnect(ctx context.Context) error {
 
 // Disconnect closes the connection and stops background reconnection.
 func (rp *RemotePeer) Disconnect() {
+	rp.interruptDial()
 	rp.op.Lock()
 	defer rp.op.Unlock()
 	rp.disconnectLocked()
@@ -298,11 +332,9 @@ func (rp *RemotePeer) dropLinkLocked() {
 }
 
 func (rp *RemotePeer) connectLocked(ctx context.Context) error {
-	dialCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(rp.ctx, cancel)
-	p, start, group, err := rp.dialPeer(dialCtx)
-	stop()
-	cancel()
+	dialCtx, finishDial := rp.beginDialCtx(ctx)
+	p, start, group, invited, err := rp.dialPeer(dialCtx)
+	finishDial()
 	if err != nil {
 		rp.mu.Lock()
 		if rp.wantReconnect {
@@ -313,6 +345,10 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 		rp.mu.Unlock()
 		return err
 	}
+	var synced chan struct{}
+	if invited && group != nil {
+		synced = make(chan struct{})
+	}
 	rp.mu.Lock()
 	if !p.Allows(true) {
 		rp.setStateLocked("reconnecting", "", "desktop authorization expired")
@@ -321,6 +357,8 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 		return errors.New("desktop authorization expired")
 	}
 	rp.peer = p
+	rp.connectedAt = time.Now()
+	rp.synced = synced
 	rp.generation.Add(1)
 	rp.group = group
 	activePath := peerPath(p)
@@ -345,6 +383,21 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 			p.Close()
 			return err
 		}
+		if synced != nil {
+			wait := time.NewTimer(2 * time.Second)
+			select {
+			case <-synced:
+			case <-wait.C:
+			case <-ctx.Done():
+			case <-rp.ctx.Done():
+			}
+			wait.Stop()
+			rp.mu.Lock()
+			if rp.synced == synced {
+				rp.synced = nil
+			}
+			rp.mu.Unlock()
+		}
 	}
 	for id, seq := range resume {
 		if _, err := rp.subscribe(ctx, p, id, seq); err != nil {
@@ -362,7 +415,7 @@ func (rp *RemotePeer) connectLocked(ctx context.Context) error {
 	return nil
 }
 
-func (rp *RemotePeer) dialPeer(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+func (rp *RemotePeer) dialPeer(ctx context.Context) (transport.Peer, func(), *pairnet.Group, bool, error) {
 	switch rp.channel {
 	case ChannelLAN:
 		return rp.dialLAN(ctx)
@@ -371,17 +424,17 @@ func (rp *RemotePeer) dialPeer(ctx context.Context) (transport.Peer, func(), *pa
 	case ChannelCN, ChannelGlobal:
 		return rp.dialOfficial(ctx)
 	default:
-		return nil, nil, nil, fmt.Errorf("remote: unsupported channel %q", rp.channel)
+		return nil, nil, nil, false, fmt.Errorf("remote: unsupported channel %q", rp.channel)
 	}
 }
 
-func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pairnet.Group, bool, error) {
 	lanCh, err := rp.manager.provider.LAN()
 	if err != nil || lanCh == nil || lanCh.Server == nil {
 		if err == nil {
 			err = errors.New("remote: LAN channel unavailable")
 		}
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	group := lanCh.Server.Network()
 	rp.mu.Lock()
@@ -395,7 +448,7 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 	var learnedAddr string
 	if mem, ok := group.Get(rp.peerID); ok {
 		if target.Token == "" && !group.Allows(rp.peerID) {
-			return nil, nil, nil, lan.ErrUnpaired
+			return nil, nil, nil, false, lan.ErrUnpaired
 		}
 		if mem.Address != "" {
 			learnedAddr = mem.Address
@@ -405,7 +458,7 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 		}
 	}
 	if target.Pin == "" {
-		return nil, nil, nil, lan.ErrUnpaired
+		return nil, nil, nil, false, lan.ErrUnpaired
 	}
 
 	localName := rp.manager.desktopName()
@@ -415,14 +468,14 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 	var p transport.Peer
 	var start func()
 	if invited {
-		p, start, err = lan.DialWithOptions(rp.ctx, target, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
+		p, start, err = lan.DialWithOptionsFor(ctx, rp.ctx, target, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 	} else {
 		entries := routes.MergeOrdered(target.Address, alt, learnedAddr)
 		if len(entries) == 0 {
-			return nil, nil, nil, lan.ErrUnpaired
+			return nil, nil, nil, false, lan.ErrUnpaired
 		}
 		now := time.Now()
 		var filtered []routes.Entry
@@ -438,19 +491,9 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 		for _, cand := range filtered {
 			candTarget := lan.Target{Address: cand.Address, Pin: target.Pin}
 			dctx, cancel := context.WithTimeout(ctx, routes.DialTimeout(cand.Kind))
-			// Bind the persistent peer reader to rp.ctx while bounding the initial dial via dctx:
-			// probe first on dctx when multiple candidates exist so unreachable LAN IPs skip fast.
-			if len(filtered) > 1 {
-				if pErr := lan.ProbeTarget(dctx, candTarget, lanCh.Server.Seed(), routes.DialTimeout(cand.Kind)); pErr != nil {
-					cancel()
-					if errors.Is(pErr, lan.ErrUnpaired) {
-						return nil, nil, nil, pErr
-					}
-					lastErr = pErr
-					continue
-				}
-			}
-			p, start, err = lan.DialWithOptions(rp.ctx, candTarget, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
+			// Bound initial handshake via dctx while attaching the persistent
+			// reader lifetime to rp.ctx in a single mTLS handshake.
+			p, start, err = lan.DialWithOptionsFor(dctx, rp.ctx, candTarget, lanCh.Server.Seed(), localName, "desktop", localAddr, (*peerHandler)(rp))
 			cancel()
 			if err == nil {
 				if target.Address != "" && target.Address != cand.Address && !slices.Contains(alt, target.Address) {
@@ -461,12 +504,12 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 				break
 			}
 			if errors.Is(err, lan.ErrUnpaired) {
-				return nil, nil, nil, err
+				return nil, nil, nil, false, err
 			}
 			lastErr = err
 		}
 		if p == nil {
-			return nil, nil, nil, lastErr
+			return nil, nil, nil, false, lastErr
 		}
 	}
 
@@ -474,7 +517,7 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop", Address: target.Address}
 	if err := group.Admit(localMem, remoteMem, invited); err != nil {
 		p.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	target.Token = ""
 	rp.mu.Lock()
@@ -486,16 +529,16 @@ func (rp *RemotePeer) dialLAN(ctx context.Context) (transport.Peer, func(), *pai
 		rp.name = mem.Name
 	}
 	rp.mu.Unlock()
-	return p, start, group, nil
+	return p, start, group, invited, nil
 }
 
-func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pairnet.Group, bool, error) {
 	selfCh, err := rp.manager.provider.Self()
 	if err != nil || selfCh == nil || selfCh.Server == nil {
 		if err == nil {
 			err = errors.New("remote: self-hosted relay unavailable")
 		}
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	rp.mu.Lock()
 	var target selfrelay.Target
@@ -515,11 +558,11 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 			tok = strings.TrimSpace(prof.Token)
 		}
 		if sig == "" {
-			return nil, nil, nil, selfrelay.ErrUnpaired
+			return nil, nil, nil, false, selfrelay.ErrUnpaired
 		}
 		sig, err = selfrelay.NormalizeSignalURL(sig)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		target.SignalURL = sig
 		target.Token = tok
@@ -533,16 +576,16 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 	}
 	group, localMem, err := selfCh.Server.GroupFor(target.SignalURL, rp.manager.desktopName())
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	if target.Pin == "" {
 		mem, ok := group.Get(rp.peerID)
 		if !ok || mem.Role != "desktop" || !group.Allows(rp.peerID) {
-			return nil, nil, nil, selfrelay.ErrUnpaired
+			return nil, nil, nil, false, selfrelay.ErrUnpaired
 		}
 		target.Pin = mem.Pin
 	} else if target.Pair == "" && !group.Allows(rp.peerID) {
-		return nil, nil, nil, selfrelay.ErrUnpaired
+		return nil, nil, nil, false, selfrelay.ErrUnpaired
 	}
 
 	localName := rp.manager.desktopName()
@@ -572,15 +615,15 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 			return cftunnel.Candidate{Peer: peer, Start: start}, err
 		}
 	}
-	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, target.SignalURL, options.headStart, webRTC, tunnel)
+	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, target.SignalURL+"\x00"+target.Pin, options.headStart, webRTC, tunnel)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	invited := target.Pair != ""
 	remoteMem := pairnet.Member{ID: target.Pin, Pin: target.Pin, Role: "desktop"}
 	if err := group.Admit(localMem, remoteMem, invited); err != nil {
 		winner.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	_ = selfCh.Server.SetProfile(pairnet.Profile{Service: target.SignalURL, Token: target.Token, Name: localName})
 	target.Pair = ""
@@ -592,16 +635,16 @@ func (rp *RemotePeer) dialSelf(ctx context.Context) (transport.Peer, func(), *pa
 		rp.name = mem.Name
 	}
 	rp.mu.Unlock()
-	return winner.Peer, winner.Start, group, nil
+	return winner.Peer, winner.Start, group, invited, nil
 }
 
-func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(), *pairnet.Group, error) {
+func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(), *pairnet.Group, bool, error) {
 	occ, err := rp.manager.provider.Official(rp.channel)
 	if err != nil || occ == nil || occ.Account == nil || occ.SignalURL == "" {
 		if err == nil {
 			err = fmt.Errorf("remote: official channel %s is not configured", rp.channel)
 		}
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	group, localMem := occ.Account.PairingIdentity(occ.SignalURL, "desktop")
 	localMem.Name = rp.manager.desktopName()
@@ -620,7 +663,7 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		if group != nil {
 			if mem, ok := group.Get(rp.peerID); ok {
 				if mem.Role != "desktop" || !group.Allows(rp.peerID) {
-					return nil, nil, nil, pairing.ErrInvalid
+					return nil, nil, nil, false, pairing.ErrInvalid
 				}
 				owner = mem.Owner
 				pinB64 = mem.Pin
@@ -629,14 +672,14 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		if pinB64 == "" {
 			bound, ok := occ.Account.PairedPeer(rp.peerID)
 			if !ok {
-				return nil, nil, nil, pairing.ErrInvalid
+				return nil, nil, nil, false, pairing.ErrInvalid
 			}
 			owner = bound.Owner
 			pinB64 = bound.Pin
 		}
 		pin, err = decodePin32(pinB64)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 	}
 
@@ -692,9 +735,9 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 			return cftunnel.Candidate{Peer: peer, Start: start}, err
 		}
 	}
-	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, occ.SignalURL, options.headStart, webRTC, tunnel)
+	winner, err := cftunnel.DialFallback(ctx, rp.routeTracker, occ.SignalURL+"\x00"+rp.peerID, options.headStart, webRTC, tunnel)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	// Re-fetch PairingIdentity in case enrollment finished during dial.
@@ -702,16 +745,17 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		group, localMem = occ.Account.PairingIdentity(occ.SignalURL, "desktop")
 		localMem.Name = rp.manager.desktopName()
 	}
+	invited := invite != nil
 	if group != nil {
 		remoteMem := pairnet.Member{ID: rp.peerID, Pin: pinB64, Owner: owner, Role: "desktop"}
-		if err := group.Admit(localMem, remoteMem, invite != nil); err != nil {
+		if err := group.Admit(localMem, remoteMem, invited); err != nil {
 			winner.Close()
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 	}
 	if err := occ.Account.BindNetworkPeer(group, rp.peerID, bound); err != nil {
 		winner.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	rp.mu.Lock()
@@ -726,7 +770,7 @@ func (rp *RemotePeer) dialOfficial(ctx context.Context) (transport.Peer, func(),
 		}
 	}
 	rp.mu.Unlock()
-	return winner.Peer, winner.Start, group, nil
+	return winner.Peer, winner.Start, group, invited, nil
 }
 
 func (rp *RemotePeer) acquireOfficialSocket(ctx context.Context, occ *OfficialChannel, source transport.IdentitySource, existing *transport.Client, owns bool) (*transport.Client, bool, error) {
@@ -841,7 +885,12 @@ func (rp *RemotePeer) syncPeer(p transport.Peer, g *pairnet.Group) error {
 
 func (rp *RemotePeer) detachLocked() {
 	rp.peer = nil
+	rp.connectedAt = time.Time{}
 	rp.lastSynced = nil
+	if rp.synced != nil {
+		close(rp.synced)
+		rp.synced = nil
+	}
 	for id, ch := range rp.pending {
 		ch <- rpcReply{err: errors.New("connection lost")}
 		delete(rp.pending, id)
@@ -990,6 +1039,17 @@ func (h *peerHandler) Message(p transport.Peer, b []byte) {
 			}
 			if mem.Address != "" {
 				rp.address = mem.Address
+			}
+			if rp.synced != nil {
+				close(rp.synced)
+				rp.synced = nil
+			}
+			rp.mu.Unlock()
+		} else {
+			rp.mu.Lock()
+			if rp.synced != nil {
+				close(rp.synced)
+				rp.synced = nil
 			}
 			rp.mu.Unlock()
 		}

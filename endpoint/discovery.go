@@ -34,7 +34,11 @@ func (c *Credentials) Online(name string, guests []string) (protocol.Message, er
 }
 
 func VerifyDevice(card protocol.Message, ca ed25519.PublicKey, now time.Time) (Device, error) {
-	p, err := identity.VerifyCertificate(card.Certificate, ca, now)
+	return VerifyDeviceWithKeys(card, []ed25519.PublicKey{ca}, now)
+}
+
+func VerifyDeviceWithKeys(card protocol.Message, keys []ed25519.PublicKey, now time.Time) (Device, error) {
+	p, err := identity.VerifyCertificateWithKeys(card.Certificate, keys, now)
 	if err != nil {
 		return Device{}, err
 	}

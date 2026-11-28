@@ -3,6 +3,7 @@ package pairing
 import (
 	"context"
 	"encoding/base64"
+	"sync"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -22,11 +23,13 @@ func Present(ctx context.Context, relay, device, ticket, link string, expires ti
 	if err := Publish(ctx, relay, device, ticket, record); err != nil {
 		return Display{}, nil, err
 	}
-	retire := func() {
+	retire := sync.OnceFunc(func() {
 		go func() {
-			_ = Publish(context.Background(), relay, device, ticket, Record{Locator: record.Locator})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = Publish(ctx, relay, device, ticket, Record{Locator: record.Locator})
 		}()
-	}
+	})
 	return display, retire, nil
 }
 

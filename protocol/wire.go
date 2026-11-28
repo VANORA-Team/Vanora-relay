@@ -75,13 +75,16 @@ func (m *Message) Sign(key ed25519.PrivateKey, body []byte) error {
 // Verify authenticates the record. Callers must separately match the trusted
 // certificate, expected peer IDs, active connection, direction and sequence.
 func (m Message) Verify(key ed25519.PublicKey) ([]byte, error) {
+	if len(m.Proof) != base64.RawURLEncoding.EncodedLen(ed25519.SignatureSize) || len(key) != ed25519.PublicKeySize {
+		return nil, errors.New("invalid endpoint signature")
+	}
 	data, err := m.bytes()
 	if err != nil {
 		return nil, err
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(m.Proof)
-	if err != nil || len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, data, sig) {
+	sig, err := base64.RawURLEncoding.Strict().DecodeString(m.Proof)
+	if err != nil || !ed25519.Verify(key, data, sig) {
 		return nil, errors.New("invalid endpoint signature")
 	}
-	return base64.RawURLEncoding.DecodeString(m.Body)
+	return base64.RawURLEncoding.Strict().DecodeString(m.Body)
 }

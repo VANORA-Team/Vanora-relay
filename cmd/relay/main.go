@@ -5,11 +5,12 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,14 +30,30 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	maxSlots, err := relayIntConfig("RELAY_MAX_SLOTS", 0, 0)
+	if err != nil {
+		return err
+	}
+	workers, err := relayIntConfig("RELAY_TUNNEL_WORKERS", defaultTunnelWorkers(tunnelCfg.Store), 16)
+	if err != nil {
+		return err
+	}
+	drainTimeout := 3 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("RELAY_SHUTDOWN_DRAIN")); raw != "" {
+		drainTimeout, err = time.ParseDuration(raw)
+		if err != nil || drainTimeout < 0 {
+			return errors.New("RELAY_SHUTDOWN_DRAIN must be a nonnegative duration")
+		}
+	}
 	var (
 		key           ed25519.PublicKey
+		keys          []ed25519.PublicKey
 		allowedIssuer string
 		entitlement   relay.EntitlementVerifier
 		selfToken     string
 	)
 	if channel.IsSelfHosted() {
-		if strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY")) != "" {
+		if strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY")) != "" || strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEYS")) != "" {
 			return errors.New("RELAY_IDENTITY_PUBLIC_KEY must not be set with RELAY_CHANNEL=self (self-hosted nodes authenticate locally with RELAY_SELF_TOKEN and device pairing)")
 		}
 		if strings.TrimSpace(os.Getenv("RELAY_ALLOWED_ISSUER")) != "" {
@@ -50,10 +67,11 @@ func run() error {
 			return err
 		}
 	} else {
-		key, err = identity.ParsePublicKey([]byte(strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY"))))
-		if err != nil || len(key) != ed25519.PublicKeySize {
-			return errors.New("RELAY_IDENTITY_PUBLIC_KEY must contain the Ed25519 public key (hex or base64) of the site's identity authority")
+		keys, err = identityPublicKeysConfig()
+		if err != nil {
+			return err
 		}
+		key = keys[0]
 		allowedIssuer, err = allowedIssuerConfig(channel)
 		if err != nil {
 			return err
@@ -84,31 +102,59 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	member, _ := entitlement.(*membership.Client)
-	handler, closeServer, err := buildServer(ctx, tunnelCfg, relayStartup{
-		key: key, allowedIssuer: allowedIssuer, selfToken: selfToken, membership: member,
+	handler, closeServer, err := buildServer(context.Background(), tunnelCfg, relayStartup{
+		key: key, keys: keys, allowedIssuer: allowedIssuer, selfToken: selfToken, membership: member,
 		pushURL: strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_URL")), pushToken: strings.TrimSpace(os.Getenv("RELAY_PUSH_WEBHOOK_TOKEN")),
+		metricsToken: strings.TrimSpace(os.Getenv("RELAY_METRICS_TOKEN")), maxSlots: maxSlots, workers: workers, startupCtx: ctx,
 	})
 	if err != nil {
 		return err
 	}
 	defer closeServer()
 	server := http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	served := make(chan error, 1)
+	slog.Info("Vanora signaling listening", "channel", channel, "addr", addr)
 	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdown)
+		if cert != "" {
+			served <- server.ListenAndServeTLS(cert, keyfile)
+		} else {
+			served <- server.ListenAndServe()
+		}
 	}()
-	log.Printf("Vanora signaling (%s channel) listening on %s", channel, addr)
-	if cert != "" {
-		err = server.ListenAndServeTLS(cert, keyfile)
-	} else {
-		err = server.ListenAndServe()
+	select {
+	case err = <-served:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
 	}
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+	drain, finishDrain := context.WithTimeout(context.Background(), drainTimeout)
+	handler.drain(drain)
+	finishDrain()
+	handler.cancel()
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdown); err != nil {
+		slog.Warn("HTTP server shutdown timed out", "error", err)
+		_ = server.Close()
 	}
-	return err
+	return nil
+}
+
+func relayIntConfig(name string, fallback, upper int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || upper > 0 && value > upper {
+		if upper > 0 {
+			return 0, fmt.Errorf("%s must be between 1 and %d", name, upper)
+		}
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return value, nil
 }
 
 // selfAccessToken returns the bearer token required on /v1/signal for a
@@ -143,6 +189,39 @@ func allowedIssuerConfig(channel relay.Channel) (string, error) {
 		return "", fmt.Errorf("invalid RELAY_ALLOWED_ISSUER: %w", err)
 	}
 	return issuer, nil
+}
+
+const defaultMembershipCacheTTL = 15 * time.Second
+
+func identityPublicKeysConfig() ([]ed25519.PublicKey, error) {
+	rawMulti := strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEYS"))
+	rawSingle := strings.TrimSpace(os.Getenv("RELAY_IDENTITY_PUBLIC_KEY"))
+	raw := rawMulti
+	if raw == "" {
+		raw = rawSingle
+	} else if rawSingle != "" {
+		raw = rawSingle + "," + rawMulti
+	}
+	keys, err := identity.ParsePublicKeys([]byte(raw))
+	if err != nil || len(keys) == 0 {
+		return nil, errors.New("RELAY_IDENTITY_PUBLIC_KEY (or RELAY_IDENTITY_PUBLIC_KEYS) must contain one or more Ed25519 public keys (hex or base64) of the site's identity authority")
+	}
+	return keys, nil
+}
+
+func membershipCacheTTLConfig() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("RELAY_MEMBERSHIP_CACHE_TTL"))
+	if raw == "" {
+		return defaultMembershipCacheTTL, nil
+	}
+	if raw == "0" {
+		return 0, nil
+	}
+	ttl, err := time.ParseDuration(raw)
+	if err != nil || ttl < 0 || ttl > 5*time.Minute {
+		return 0, errors.New("RELAY_MEMBERSHIP_CACHE_TTL must be 0 or a duration up to 5m")
+	}
+	return ttl, nil
 }
 
 // entitlementVerifier builds the single-site entitlement check for an official
@@ -188,11 +267,16 @@ func entitlementVerifier(channel relay.Channel) (relay.EntitlementVerifier, erro
 	if rawURL == "" || len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
 		return nil, fmt.Errorf("%s and %s must both be set; the token needs at least 32 bytes without whitespace", urlVar, tokenVar)
 	}
-	return &membership.Client{URL: rawURL, Token: token}, nil
+	cacheTTL, err := membershipCacheTTLConfig()
+	if err != nil {
+		return nil, err
+	}
+	return &membership.Client{URL: rawURL, Token: token, CacheTTL: cacheTTL}, nil
 }
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("relay stopped", "error", err)
+		os.Exit(1)
 	}
 }

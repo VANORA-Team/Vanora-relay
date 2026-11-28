@@ -24,16 +24,33 @@ func (c *Client) ListWorkspaces() (string, error) {
 // CreateSession creates a new Vanora session inside an allowlisted desktop workspace.
 // Reuse the same requestID and title when retrying after a disconnect.
 func (c *Client) CreateSession(workspaceID, requestID, title string) (string, error) {
+	return c.CreateSessionWithOptions(workspaceID, requestID, title, "", "")
+}
+
+// CreateSessionWithOptions creates a session with optional link_origin fence
+// tag and mode_limit JSON narrowing.
+func (c *Client) CreateSessionWithOptions(workspaceID, requestID, title, linkOrigin, modeLimitJSON string) (string, error) {
 	p, err := c.currentPeer()
 	if err != nil {
 		return "", err
 	}
-	return c.request(p, map[string]any{
+	req := map[string]any{
 		"type":         "session.create",
 		"request_id":   requestID,
 		"workspace_id": workspaceID,
 		"title":        title,
-	}, true)
+	}
+	if linkOrigin != "" {
+		req["link_origin"] = linkOrigin
+	}
+	if modeLimitJSON != "" {
+		limit, err := decodeModeLimit(modeLimitJSON)
+		if err != nil {
+			return "", err
+		}
+		req["mode_limit"] = limit
+	}
+	return c.request(p, req, true)
 }
 
 func (c *Client) ListSessions() (string, error) {
@@ -46,13 +63,23 @@ func (c *Client) ListSessions() (string, error) {
 
 // OpenSession returns the desktop snapshot and subscribes starting at its last_seq.
 func (c *Client) OpenSession(sessionID string) (string, error) {
+	return c.OpenSessionWithOptions(sessionID, false)
+}
+
+// OpenSessionWithOptions returns the desktop snapshot and subscribes starting
+// at its last_seq, optionally enabling live presence.updated events.
+func (c *Client) OpenSessionWithOptions(sessionID string, watchPresence bool) (string, error) {
 	c.op.Lock()
 	defer c.op.Unlock()
 	p, err := c.currentPeer()
 	if err != nil {
 		return "", err
 	}
-	data, err := c.request(p, map[string]any{"type": "session.open", "request_id": NewRequestID(), "session_id": sessionID}, false)
+	req := map[string]any{"type": "session.open", "request_id": NewRequestID(), "session_id": sessionID}
+	if watchPresence {
+		req["watch_presence"] = true
+	}
+	data, err := c.request(p, req, false)
 	if err != nil {
 		return "", err
 	}
@@ -61,6 +88,15 @@ func (c *Client) OpenSession(sessionID string) (string, error) {
 	}
 	if json.Unmarshal([]byte(data), &snapshot) != nil || snapshot.Last == nil || *snapshot.Last < 0 {
 		return "", errors.New("invalid desktop snapshot")
+	}
+	if watchPresence {
+		c.mu.Lock()
+		if cur := c.subscriptions[sessionID]; cur != nil {
+			cur.watchPresence = true
+		} else {
+			c.subscriptions[sessionID] = &cursor{applied: *snapshot.Last, delivered: *snapshot.Last, queued: *snapshot.Last, watchPresence: true}
+		}
+		c.mu.Unlock()
 	}
 	if _, err = c.subscribe(p, sessionID, *snapshot.Last); err != nil {
 		return "", err
@@ -134,6 +170,12 @@ func (c *Client) StartRun(sessionID, requestID, text string) (string, error) {
 // StartRunWithPolicy starts or enqueues a run on sessionID. queuePolicy may be
 // "" / "enqueue" (default FIFO turn queue) or "reject" (fail with session_busy).
 func (c *Client) StartRunWithPolicy(sessionID, requestID, text, queuePolicy string) (string, error) {
+	return c.StartRunWithOptions(sessionID, requestID, text, queuePolicy, "", "")
+}
+
+// StartRunWithOptions starts or enqueues a run with optional queue policy,
+// link_origin fence tag, and mode_limit JSON narrowing.
+func (c *Client) StartRunWithOptions(sessionID, requestID, text, queuePolicy, linkOrigin, modeLimitJSON string) (string, error) {
 	p, err := c.currentPeer()
 	if err != nil {
 		return "", err
@@ -146,6 +188,16 @@ func (c *Client) StartRunWithPolicy(sessionID, requestID, text, queuePolicy stri
 	}
 	if queuePolicy != "" {
 		req["queue_policy"] = queuePolicy
+	}
+	if linkOrigin != "" {
+		req["link_origin"] = linkOrigin
+	}
+	if modeLimitJSON != "" {
+		limit, err := decodeModeLimit(modeLimitJSON)
+		if err != nil {
+			return "", err
+		}
+		req["mode_limit"] = limit
 	}
 	return c.request(p, req, true)
 }
@@ -248,21 +300,31 @@ func (c *Client) RespondGuestRequestWithOptions(sessionID, guestRequestID, actio
 		req["text"] = text
 	}
 	if modeLimitJSON != "" {
-		var limit struct {
-			ReadOnly bool     `json:"read_only,omitempty"`
-			NoTools  bool     `json:"no_tools,omitempty"`
-			Tools    []string `json:"tools,omitempty"`
-		}
-		dec := json.NewDecoder(bytes.NewReader([]byte(modeLimitJSON)))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&limit); err != nil {
-			return "", errors.New("invalid mode_limit payload")
-		}
-		var extra any
-		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-			return "", errors.New("invalid mode_limit payload")
+		limit, err := decodeModeLimit(modeLimitJSON)
+		if err != nil {
+			return "", err
 		}
 		req["mode_limit"] = limit
 	}
 	return c.request(p, req, action == "approve")
+}
+
+type modeLimitPayload struct {
+	ReadOnly bool     `json:"read_only,omitempty"`
+	NoTools  bool     `json:"no_tools,omitempty"`
+	Tools    []string `json:"tools,omitempty"`
+}
+
+func decodeModeLimit(raw string) (modeLimitPayload, error) {
+	var limit modeLimitPayload
+	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&limit); err != nil {
+		return modeLimitPayload{}, errors.New("invalid mode_limit payload")
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return modeLimitPayload{}, errors.New("invalid mode_limit payload")
+	}
+	return limit, nil
 }

@@ -1,6 +1,7 @@
 package cftunnel
 
 import (
+	"container/list"
 	"net"
 	"net/http"
 	"net/netip"
@@ -50,12 +51,15 @@ func (cfg Config) trustsProxy(addr netip.Addr) bool {
 type httpLimit struct {
 	mu      sync.Mutex
 	entries map[string]*httpLimitEntry
-	swept   time.Time
+	recent  list.List
 }
+
+const httpLimitMaxEntries = 8192
 
 type httpLimitEntry struct {
 	challenges *rate.Limiter
-	seen       time.Time
+	requests   *rate.Limiter
+	recent     *list.Element
 	failureAt  time.Time
 	failures   int
 	locked     time.Time
@@ -64,26 +68,20 @@ type httpLimitEntry struct {
 func (g *httpLimit) check(ip string, now time.Time, challenge, badBearer bool) time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if now.Sub(g.swept) >= time.Minute {
-		for key, entry := range g.entries {
-			if now.Sub(entry.seen) >= 10*time.Minute {
-				delete(g.entries, key)
-			}
-		}
-		g.swept = now
-	}
 	entry := g.entries[ip]
 	if entry == nil {
-		if !challenge && !badBearer {
-			return 0
+		if len(g.entries) >= httpLimitMaxEntries {
+			delete(g.entries, g.recent.Remove(g.recent.Back()).(string))
 		}
-		if len(g.entries) >= 8192 {
-			return time.Second
+		entry = &httpLimitEntry{
+			challenges: rate.NewLimiter(8, 32),
+			requests:   rate.NewLimiter(32, 64),
+			recent:     g.recent.PushFront(ip),
 		}
-		entry = &httpLimitEntry{challenges: rate.NewLimiter(8, 32)}
 		g.entries[ip] = entry
+	} else {
+		g.recent.MoveToFront(entry.recent)
 	}
-	entry.seen = now
 	if now.Before(entry.locked) {
 		return entry.locked.Sub(now)
 	}
@@ -98,7 +96,11 @@ func (g *httpLimit) check(ip string, now time.Time, challenge, badBearer bool) t
 			return entry.locked.Sub(now)
 		}
 	}
-	if challenge && !entry.challenges.AllowN(now, 1) {
+	limiter := entry.requests
+	if challenge {
+		limiter = entry.challenges
+	}
+	if !limiter.AllowN(now, 1) {
 		return time.Second
 	}
 	return 0

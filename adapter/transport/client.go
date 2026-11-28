@@ -143,6 +143,7 @@ type Client struct {
 	mu               sync.Mutex
 	creds            *endpoint.Credentials
 	proof            endpoint.LeaseProof
+	appliedProof     endpoint.LeaseProof
 	proofUntil       time.Time
 	fetchedAt        time.Time
 	refreshAt        time.Time
@@ -165,6 +166,7 @@ type Client struct {
 	devicesMu sync.Mutex
 
 	refreshWake chan struct{}
+	acceptSem   chan struct{}
 }
 
 type waiter struct {
@@ -236,9 +238,13 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 	var ws *websocket.Conn
 	var resp *http.Response
 	var err error
+	headers := make(http.Header)
+	if role == RoleDesktop && desktop == "" {
+		headers.Set("X-Vanora-Tunnel-Ack-Seq", "1")
+	}
 	err = dialretry.Dial(dctx, func() error {
 		var derr error
-		ws, resp, derr = websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: client})
+		ws, resp, derr = websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers})
 		if derr != nil && resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -267,6 +273,7 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 		links:       make(map[string]*link),
 		waiters:     make(map[string][]*waiter),
 		refreshWake: make(chan struct{}, 1),
+		acceptSem:   make(chan struct{}, 16),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	fail := func(err error) (*Client, error) {
@@ -317,6 +324,9 @@ func dial(ctx context.Context, url, role string, source IdentitySource, h Handle
 		return fail(fmt.Errorf("%w: relay accepted a different endpoint identity", ErrMalformedResponse))
 	}
 	c.tunnelScope = accepted.TunnelScope
+	c.mu.Lock()
+	c.appliedProof = proof
+	c.mu.Unlock()
 
 	if provider, ok := source.(interface {
 		PairingIdentity(string, string) (*pairnet.Group, pairnet.Member)
@@ -791,17 +801,32 @@ func (c *Client) loadCredentials(ctx context.Context) (*endpoint.Credentials, en
 	return creds, proof, until, nil
 }
 
-// current refreshes the signaling lease and every established peer before
-// returning identity material for a new operation.
+// current refreshes the signaling lease and every established peer when the
+// local proof changed, before returning identity material for a new operation.
 func (c *Client) current(ctx context.Context) (*endpoint.Credentials, endpoint.LeaseProof, time.Time, error) {
+	return c.currentWithForce(ctx, false)
+}
+
+func (c *Client) currentWithForce(ctx context.Context, forceSignal bool) (*endpoint.Credentials, endpoint.LeaseProof, time.Time, error) {
 	creds, proof, until, err := c.loadCredentials(ctx)
 	if err != nil {
 		return nil, endpoint.LeaseProof{}, time.Time{}, err
 	}
+	c.mu.Lock()
+	unchanged := c.appliedProof == proof && proof.Lease != ""
+	c.mu.Unlock()
+	if unchanged && !forceSignal {
+		return creds, proof, until, nil
+	}
 	if err := c.leaseUpdateMessage(proof); err != nil {
 		return nil, endpoint.LeaseProof{}, time.Time{}, err
 	}
-	c.applyProof(proof, until)
+	if !unchanged {
+		c.mu.Lock()
+		c.appliedProof = proof
+		c.mu.Unlock()
+		c.applyProof(proof, until)
+	}
 	return creds, proof, until, nil
 }
 
@@ -916,7 +941,7 @@ func (c *Client) refreshLoop() {
 // for accepted mobile links. The lease update is written first, so the relay
 // processes it before the refresh that depends on a live, current lease.
 func (c *Client) renew(ctx context.Context, now time.Time) error {
-	if _, _, _, err := c.current(ctx); err != nil {
+	if _, _, _, err := c.currentWithForce(ctx, true); err != nil {
 		return err
 	}
 	c.refreshICE(now)
@@ -986,7 +1011,14 @@ func (c *Client) dispatch(m protocol.Message) {
 		c.notifyWaiters(m)
 	case "connect.request":
 		if c.role == RoleDesktop && c.desktop == "" {
-			go c.acceptRequest(m)
+			select {
+			case c.acceptSem <- struct{}{}:
+				go func() {
+					defer func() { <-c.acceptSem }()
+					c.acceptRequest(m)
+				}()
+			default:
+			}
 		}
 	case "connect.accept", "connect.closed", "rtc.offer", "rtc.answer", "rtc.candidate":
 		if l := c.link(m.Connection); l != nil {

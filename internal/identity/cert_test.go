@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,6 +110,9 @@ func TestCertificateRejectsWrongClaims(t *testing.T) {
 		"issuer":   func(c map[string]any) { c["iss"] = "http://evil.example.com" },
 		"version":  func(c map[string]any) { c["v"] = 2 },
 		"device":   func(c map[string]any) { c["dev"] = "dev_short" },
+		"uppercase device": func(c map[string]any) {
+			c["dev"] = "dev_" + strings.ToUpper(strings.TrimPrefix(deviceID, "dev_"))
+		},
 		"lifetime": func(c map[string]any) { c["exp"] = now.Add(identity.MaxCertificateLifetime + time.Second).Unix() },
 		"subject":  func(c map[string]any) { c["sub"] = "" },
 	}
@@ -124,6 +128,16 @@ func TestCertificateRejectsWrongClaims(t *testing.T) {
 				t.Fatalf("certificate with bad %s was accepted", name)
 			}
 		})
+	}
+	for _, typ := range []string{"", "vanl+v1"} {
+		cert, err := auth.SignRaw(identity.CertificatePrefix, map[string]string{"alg": "EdDSA", "typ": typ}, makeBase())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = identity.VerifyCertificate(cert, auth.PublicKey(), now)
+		if typ == "" && err != nil || typ != "" && !errors.Is(err, identity.ErrCertificateMalformed) {
+			t.Fatalf("VerifyCertificate with typ %q = %v", typ, err)
+		}
 	}
 }
 
@@ -144,6 +158,35 @@ func TestParsePublicKeyFormats(t *testing.T) {
 	}
 	if _, err := identity.ParsePublicKey([]byte(hex.EncodeToString(priv))); err == nil {
 		t.Fatal("private key was accepted as public key")
+	}
+}
+
+func TestCertificateKeyRotation(t *testing.T) {
+	previous, current := identitytest.NewAuthority(time.Minute), identitytest.NewAuthority(time.Minute)
+	bundle := "\n" + hex.EncodeToString(current.PublicKey()) + ", \t" +
+		base64.RawURLEncoding.EncodeToString(previous.PublicKey()) + "\n"
+	keys, err := identity.ParsePublicKeys([]byte(bundle))
+	if err != nil || len(keys) != 2 || !keys[0].Equal(current.PublicKey()) || !keys[1].Equal(previous.PublicKey()) {
+		t.Fatalf("ParsePublicKeys = %v, %v", keys, err)
+	}
+	if _, err := identity.ParsePublicKeys([]byte(bundle + "broken")); !errors.Is(err, identity.ErrPublicKey) {
+		t.Fatalf("ParsePublicKeys accepted an invalid entry: %v", err)
+	}
+	now := time.Now()
+	publicKey, _ := testEndpointKey(t)
+	for _, authority := range []*identitytest.Authority{previous, current} {
+		cert, err := authority.IssueWithKey(testIssuer, "subject-1", publicKey, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := identity.VerifyCertificateWithKeys(cert, keys, now); err != nil {
+			t.Fatal(err)
+		}
+		if authority == previous {
+			if _, err := identity.VerifyCertificateWithKeys(cert, keys[:1], now); !errors.Is(err, identity.ErrCertificateSignature) {
+				t.Fatalf("verification with retired key = %v", err)
+			}
+		}
 	}
 }
 

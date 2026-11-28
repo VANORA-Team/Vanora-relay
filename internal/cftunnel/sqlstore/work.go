@@ -48,7 +48,8 @@ func (s *Store) AcquireWork(ctx context.Context, scopeID, workerID string, now t
 			WHERE scope_id = ? AND completed_at = 0 AND lease_until <= ? AND created_at <= ? AND next_attempt_at <= ?
 			AND EXISTS (SELECT 1 FROM cf_allocation a WHERE a.scope_id = op.scope_id
 				AND a.id = op.allocation_id AND a.generation = op.generation)
-			ORDER BY created_at, id LIMIT 1`
+			ORDER BY CASE WHEN operation_type IN ('disconnect', 'deprovision') THEN 0
+				WHEN protect_presence = 0 AND operation_type <> 'repair' THEN 1 ELSE 2 END, created_at, id LIMIT 1`
 		if s.postgres {
 			query += " FOR UPDATE SKIP LOCKED"
 		}

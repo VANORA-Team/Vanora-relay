@@ -9,12 +9,14 @@ import (
 	"time"
 
 	"github.com/pion/turn/v4"
+	"golang.org/x/time/rate"
 )
 
 // errRelayPeerDenied is returned when a relay socket is asked to reach an
 // address it must not reach: another connection's relay socket, or a service
 // on the server's own advertised address.
 var errRelayPeerDenied = errors.New("ice: peer is not a relayed socket of this connection")
+var errRelayBandwidthExceeded = errors.New("ice: relay bandwidth exceeded")
 
 // relayStats counts relayed payload bytes at the peer-facing relay socket:
 // every datagram the server reads from a peer and every datagram it writes to a
@@ -60,21 +62,33 @@ func (r *relayConn) Close() error {
 }
 
 func (r *relayConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, addr, err := r.PacketConn.ReadFrom(p)
-	if n > 0 {
-		r.stats.fromPeers.Add(uint64(n))
-	}
+	for {
+		n, addr, err := r.PacketConn.ReadFrom(p)
+		if n > 0 {
+			if err == nil && !r.allowRelayBytes(n) {
+				continue
+			}
+			r.stats.fromPeers.Add(uint64(n))
+		}
 
-	return n, addr, err
+		return n, addr, err
+	}
 }
 
 func (r *relayConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if key, ok := relayAddrPort(addr); ok {
+	key, ok := relayAddrPort(addr)
+	if !ok && !r.srv.allowUnsafePeers {
+		return 0, errRelayPeerDenied
+	}
+	if ok {
 		if key.Addr() == r.srv.publicIP {
 			if dst := r.srv.localRelay(key); dst != nil {
 				owner := r.ownerGrant()
 				if owner == nil || dst.ownerGrant() != owner {
 					return 0, errRelayPeerDenied
+				}
+				if !r.allowRelayBytes(len(p)) {
+					return 0, errRelayBandwidthExceeded
 				}
 
 				// Hairpin within one connection: the receiving allocation counts
@@ -91,6 +105,9 @@ func (r *relayConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 			return 0, errRelayPeerDenied
 		}
 	}
+	if !r.allowRelayBytes(len(p)) {
+		return 0, errRelayBandwidthExceeded
+	}
 
 	n, err := r.PacketConn.WriteTo(p, addr)
 	if n > 0 {
@@ -98,6 +115,38 @@ func (r *relayConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 
 	return n, err
+}
+
+func newBandwidthLimiter(bytesPerSecond int) *rate.Limiter {
+	if bytesPerSecond <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(bytesPerSecond), max(bytesPerSecond, 1<<16))
+}
+
+func (r *relayConn) allowRelayBytes(size int) bool {
+	if r.srv == nil || r.srv.maxBytesPerSec == 0 && r.srv.maxVisitorBytesPerSec == 0 {
+		return true
+	}
+	g := r.ownerGrant()
+	if g == nil {
+		return false
+	}
+	visitor := g.visitorLimit
+	if visitor.bandwidth == nil {
+		return g.bandwidth.AllowN(time.Now(), size)
+	}
+
+	visitor.bandwidthMu.Lock()
+	defer visitor.bandwidthMu.Unlock()
+	now := time.Now()
+	if visitor.bandwidth.TokensAt(now) < float64(size) {
+		return false
+	}
+	if g.bandwidth != nil && !g.bandwidth.AllowN(now, size) {
+		return false
+	}
+	return visitor.bandwidth.AllowN(now, size)
 }
 
 func (r *relayConn) ownerGrant() *grant {
@@ -192,9 +241,11 @@ func relayAddrPort(addr net.Addr) (netip.AddrPort, bool) {
 	}
 
 	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		if udpAddr == nil || udpAddr.Port < 1 || udpAddr.Port > 65535 {
+			return netip.AddrPort{}, false
+		}
 		ap := udpAddr.AddrPort()
-
-		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), true
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), ap.IsValid()
 	}
 
 	ap, err := netip.ParseAddrPort(addr.String())
@@ -202,12 +253,12 @@ func relayAddrPort(addr net.Addr) (netip.AddrPort, bool) {
 		return netip.AddrPort{}, false
 	}
 
-	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), true
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), ap.Port() != 0
 }
 
 func (s *Server) authenticate(username, _ string, _ net.Addr) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	g := s.byUsername[username]
 	if g == nil || s.closed || !time.Now().Before(g.until) {

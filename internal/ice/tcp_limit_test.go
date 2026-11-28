@@ -1,9 +1,13 @@
 package ice
 
 import (
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/pion/stun/v4"
 )
 
 func TestAllocationKeyDistinguishesTransports(t *testing.T) {
@@ -136,46 +140,104 @@ func TestLimitedListenerEnforcesTotalCap(t *testing.T) {
 	}
 }
 
-func TestFirstReadConnClearsIdleDeadline(t *testing.T) {
+func TestFirstReadConnClosesSlowlorisAndReleasesSlot(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-
-	limited := newLimitedListener(ln, 8, 8)
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := limited.Accept()
-		if err == nil {
-			accepted <- conn
-		}
-	}()
+	limited := newLimitedListener(ln, 1, 1)
+	defer limited.Close()
+	limited.firstTimeout = 200 * time.Millisecond
 
 	client, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-
-	server := <-accepted
-	defer server.Close()
-
-	if got, ok := server.(*firstReadConn); !ok {
-		t.Fatalf(
-			"listener must hand out first-read connections, got %T", server)
-	} else if got.cleared.Load() {
-		t.Fatal("idle deadline must still be armed before the peer sends data")
-	}
-
-	if _, err := client.Write([]byte("ping")); err != nil {
+	server, err := limited.Accept()
+	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, 4)
-	if _, err := server.Read(buf); err != nil {
-		t.Fatalf("first read failed: %v", err)
+	if _, err := client.Write([]byte{0}); err != nil {
+		t.Fatal(err)
 	}
-	if !server.(*firstReadConn).cleared.Load() {
-		t.Fatal("first-read deadline was not cleared after data arrived")
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(server, make([]byte, 20))
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("incomplete frame read returned %v, want timeout", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("incomplete frame held the control connection open")
+	}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("client read returned %v, want closed connection", err)
+	}
+
+	replacement, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := limited.Accept()
+	if err != nil {
+		t.Fatalf("replacement connection was not accepted: %v", err)
+	}
+	defer second.Close()
+}
+
+func TestFirstReadConnArmsIdleDeadlineAfterSTUNFrame(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limited := newLimitedListener(ln, 1, 1)
+	defer limited.Close()
+	limited.firstTimeout = 5 * time.Second
+	limited.idleTimeout = 50 * time.Millisecond
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := limited.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	frame := stun.MustBuild(stun.TransactionID, stun.BindingRequest).Raw
+	if _, err := client.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(server, make([]byte, 9)); err != nil {
+		t.Fatal(err)
+	}
+	if server.(*firstReadConn).established {
+		t.Fatal("partial STUN header armed the long idle deadline")
+	}
+	if _, err := io.ReadFull(server, make([]byte, len(frame)-9)); err != nil {
+		t.Fatal(err)
+	}
+	if !server.(*firstReadConn).established {
+		t.Fatal("complete STUN frame did not arm the idle deadline")
+	}
+	start := time.Now()
+	_, err = server.Read(make([]byte, 1))
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() || time.Since(start) > time.Second {
+		t.Fatalf("idle read returned %v after %v, want short timeout", err, time.Since(start))
 	}
 }

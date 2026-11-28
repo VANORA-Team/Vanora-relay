@@ -16,6 +16,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"vanora-relay/adapter/transport"
 	"vanora-relay/internal/dialretry"
+	"vanora-relay/internal/framing"
 	"vanora-relay/protocol"
 )
 
@@ -164,16 +165,12 @@ type peerLink struct {
 	pendingOut      []webrtc.ICECandidateInit
 	pendingIn       []webrtc.ICECandidateInit
 	remoteSet       bool
+	candWake        chan struct{}
+	candOnce        sync.Once
 
-	sendMu sync.Mutex
-	sendID uint32
-
-	recvMu    sync.Mutex
-	recvID    uint32
-	recvNext  uint32
-	recvTotal uint32
-	recvBuf   []byte
-	recvAt    time.Time
+	sendMu    sync.Mutex
+	sender    framing.Sender
+	assembler *framing.Assembler
 
 	cbMu   sync.Mutex
 	cbOpen bool
@@ -208,6 +205,8 @@ func newPeerLink(ctx context.Context, session *selfSession, userID string, deskt
 		deferStart: deferStart,
 		session:    session,
 		accepted:   accepted,
+		assembler:  framing.NewAssembler(selfrelayAssemblyBudget),
+		candWake:   make(chan struct{}, 1),
 		inbox:      make(chan protocol.Message, 64),
 		wake:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
@@ -543,35 +542,59 @@ func (l *peerLink) onLocalCandidate(candidate *webrtc.ICECandidate) {
 	}
 	init := candidate.ToJSON()
 	l.candMu.Lock()
-	if !l.negotiationSent {
-		l.pendingOut = append(l.pendingOut, init)
-		l.candMu.Unlock()
-		return
-	}
-	err := l.sendCandidate(init)
+	l.pendingOut = append(l.pendingOut, init)
+	ready := l.negotiationSent
 	l.candMu.Unlock()
-	if err != nil {
-		l.close(err, false)
+	if ready {
+		select {
+		case l.candWake <- struct{}{}:
+		default:
+		}
 	}
 }
 
 func (l *peerLink) flushCandidates() {
 	l.candMu.Lock()
 	l.negotiationSent = true
-	pending := l.pendingOut
-	l.pendingOut = nil
-	var err error
-	for _, c := range pending {
-		if l.closed.Load() {
-			break
-		}
-		if err = l.sendCandidate(c); err != nil {
-			break
-		}
-	}
 	l.candMu.Unlock()
-	if err != nil {
-		l.close(err, false)
+	l.candOnce.Do(func() {
+		go l.candidateSender()
+	})
+	select {
+	case l.candWake <- struct{}{}:
+	default:
+	}
+}
+
+func (l *peerLink) candidateSender() {
+	for {
+		select {
+		case <-l.done:
+			return
+		case <-l.candWake:
+		}
+		for {
+			if l.closed.Load() {
+				return
+			}
+			l.candMu.Lock()
+			if !l.negotiationSent || len(l.pendingOut) == 0 {
+				l.candMu.Unlock()
+				break
+			}
+			batch := l.pendingOut
+			l.pendingOut = nil
+			l.candMu.Unlock()
+			for _, c := range batch {
+				if l.closed.Load() {
+					return
+				}
+				if err := l.sendCandidate(c); err != nil {
+					l.close(err, false)
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -619,6 +642,7 @@ func (l *peerLink) attachDataChannel(dc *webrtc.DataChannel) bool {
 	}
 	l.dc = dc
 	l.dcMu.Unlock()
+	l.sender.Attach(dc)
 
 	dc.OnOpen(func() {
 		if l.closed.Load() {
@@ -692,6 +716,9 @@ func (l *peerLink) close(err error, notifyRemote bool) {
 		l.onClose(l)
 	}
 	close(l.done)
+	if l.assembler != nil {
+		l.assembler.Close()
+	}
 	l.dcMu.Lock()
 	dc, pc := l.dc, l.pc
 	l.dcMu.Unlock()
@@ -857,6 +884,9 @@ func dialSignalFor(ctx context.Context, rawURL, relayToken, role string, priv ed
 		return http.ErrUseLastResponse
 	}}
 	header := http.Header{"Authorization": []string{"Bearer " + relayToken}}
+	if role == "desktop" && desktop == "" {
+		header.Set("X-Vanora-Tunnel-Ack-Seq", "1")
+	}
 	var ws *websocket.Conn
 	var resp *http.Response
 	err = dialretry.Dial(dctx, func() error {

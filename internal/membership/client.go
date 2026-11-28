@@ -17,17 +17,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
 	// entitlementPath is the fixed internal endpoint on the Vanora backend.
 	entitlementPath = "/internal/v1/relay/entitlement"
 
-	// requestTimeout bounds one entitlement check. Callers may already hold a
-	// shorter deadline; context.WithTimeout keeps the earlier one.
-	requestTimeout = 8 * time.Second
+	// requestTimeout bounds a shared entitlement request independently of
+	// each caller's deadline.
+	requestTimeout        = 8 * time.Second
+	maxCachedEntitlements = 8192
 
 	// maxResponseBytes caps how much of an error or success payload is read.
 	maxResponseBytes = 64 << 10
@@ -87,6 +92,31 @@ type Client struct {
 	URL   string
 	Token string
 	HTTP  *http.Client
+
+	// CacheTTL is the maximum lifetime of a cached grant. Zero disables caching.
+	CacheTTL time.Duration
+
+	mu          sync.Mutex
+	lookupState *lookupState
+}
+
+type lookupConfig struct {
+	endpoint string
+	token    string
+	http     *http.Client
+	ttl      time.Duration
+}
+
+type lookupState struct {
+	config  lookupConfig
+	flights singleflight.Group
+	mu      sync.Mutex
+	cache   map[string]cachedEntitlement
+}
+
+type cachedEntitlement struct {
+	data  entitlementData
+	until time.Time
 }
 
 type entitlementRequest struct {
@@ -147,6 +177,10 @@ func (c *Client) Lookup(ctx context.Context, issuer, subject string) (Entitlemen
 	if err != nil {
 		return Entitlement{}, err
 	}
+	return data.entitlement(), nil
+}
+
+func (data entitlementData) entitlement() Entitlement {
 	ent := Entitlement{RelayAllowed: data.RelayAllowed, ValidUntil: data.relayEnd()}
 	ent.TunnelAllowed = tunnelField[bool](data.TunnelAllowed, &ent.TunnelFieldsInvalid)
 	ent.TunnelConnectAllowed = tunnelField[bool](data.TunnelConnectAllowed, &ent.TunnelFieldsInvalid)
@@ -158,7 +192,7 @@ func (c *Client) Lookup(ctx context.Context, issuer, subject string) (Entitlemen
 	if ent.TunnelAllowed != nil && *ent.TunnelAllowed && ent.TunnelValidUntil != nil && *ent.TunnelValidUntil <= 0 {
 		ent.TunnelFieldsInvalid = true
 	}
-	return ent, nil
+	return ent
 }
 
 func tunnelField[T any](raw json.RawMessage, invalid *bool) *T {
@@ -199,6 +233,96 @@ func (c *Client) lookup(ctx context.Context, issuer, subject string) (entitlemen
 	if err != nil {
 		return zero, err
 	}
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+	config := lookupConfig{endpoint: endpoint, token: c.Token, http: c.HTTP, ttl: c.CacheTTL}
+	c.mu.Lock()
+	state := c.lookupState
+	if state == nil || state.config != config {
+		state = &lookupState{config: config}
+		c.lookupState = state
+	}
+	c.mu.Unlock()
+
+	key := strconv.Itoa(len(issuer)) + ":" + issuer + subject
+	if data, ok := state.cached(key); ok {
+		return data, nil
+	}
+	result := state.flights.DoChan(key, func() (any, error) {
+		if data, ok := state.cached(key); ok {
+			return data, nil
+		}
+		data, err := config.fetch(context.WithoutCancel(ctx), issuer, subject)
+		if err == nil {
+			state.remember(key, data)
+		}
+		return data, err
+	})
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case res := <-result:
+		return res.Val.(entitlementData), res.Err
+	}
+}
+
+func (s *lookupState) cached(key string) (entitlementData, bool) {
+	if s.config.ttl <= 0 {
+		return entitlementData{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.cache[key]
+	return entry.data, ok && time.Now().Before(entry.until)
+}
+
+func (s *lookupState) remember(key string, data entitlementData) {
+	if s.config.ttl <= 0 {
+		return
+	}
+	ent := data.entitlement()
+	if ent.TunnelFieldsInvalid {
+		return
+	}
+	now := time.Now()
+	expiry := now.Add(s.config.ttl)
+	relayActive := ent.RelayAllowed && ent.ValidUntil.After(now)
+	if relayActive && ent.ValidUntil.Before(expiry) {
+		expiry = ent.ValidUntil
+	}
+	tunnelActive := ent.TunnelAllowed != nil && *ent.TunnelAllowed ||
+		ent.TunnelConnectAllowed != nil && *ent.TunnelConnectAllowed
+	if ent.TunnelValidUntil != nil {
+		tunnelEnd := time.Unix(*ent.TunnelValidUntil, 0)
+		tunnelActive = (tunnelActive || ent.MaxTunnels != nil && *ent.MaxTunnels > 0) && tunnelEnd.After(now)
+		if tunnelActive && tunnelEnd.Before(expiry) {
+			expiry = tunnelEnd
+		}
+	}
+	if !relayActive && !tunnelActive {
+		expiry = now.Add(min(s.config.ttl/2, 5*time.Second))
+	}
+	if !expiry.After(now) {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache == nil {
+		s.cache = make(map[string]cachedEntitlement)
+	}
+	if _, exists := s.cache[key]; !exists && len(s.cache) >= maxCachedEntitlements {
+		for evictedKey := range s.cache {
+			delete(s.cache, evictedKey)
+			break
+		}
+	}
+	s.cache[key] = cachedEntitlement{data: data, until: expiry}
+}
+
+func (c lookupConfig) fetch(ctx context.Context, issuer, subject string) (entitlementData, error) {
+	var zero entitlementData
 	body, err := json.Marshal(entitlementRequest{Issuer: issuer, Subject: subject})
 	if err != nil {
 		return zero, fmt.Errorf("membership: encode entitlement request: %w", err)
@@ -207,16 +331,16 @@ func (c *Client) lookup(ctx context.Context, issuer, subject string) (entitlemen
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return zero, fmt.Errorf("membership: build entitlement request: %w", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+c.Token)
+	request.Header.Set("Authorization", "Bearer "+c.token)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "vanora-relay-membership/1")
 
-	httpClient := c.HTTP
+	httpClient := c.http
 	if httpClient == nil {
 		httpClient = defaultHTTPClient
 	} else {

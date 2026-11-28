@@ -389,6 +389,7 @@ func (s *Server) RemoveDevice(id string) error {
 func (s *Server) closeRemoved() {
 	s.mu.Lock()
 	var tunnelRevoked []string
+	hooks := s.tunnelHooks.Load()
 	if s.group != nil {
 		next := s.state
 		next.Clients = maps.Clone(next.Clients)
@@ -398,7 +399,7 @@ func (s *Server) closeRemoved() {
 		if len(next.Clients) < len(s.state.Clients) && saveState(s.store, next) == nil {
 			s.state = next
 		}
-		if s.tunnelHooks.Load() != nil {
+		if hooks != nil && hooks.OnNetworkChange == nil {
 			for id := range s.group.Snapshot() {
 				if id != s.pin && !s.group.Allows(id) {
 					tunnelRevoked = append(tunnelRevoked, id)
@@ -419,8 +420,12 @@ func (s *Server) closeRemoved() {
 	}
 	netObs := s.netObserver
 	s.mu.Unlock()
-	for _, id := range tunnelRevoked {
-		s.revokeTunnelClient(id)
+	if hooks != nil && hooks.OnNetworkChange != nil {
+		hooks.OnNetworkChange()
+	} else {
+		for _, id := range tunnelRevoked {
+			s.revokeTunnelClient(id)
+		}
 	}
 	for _, l := range closed {
 		l.close(ErrUnpaired, true)
@@ -906,8 +911,12 @@ func (s *Server) runOnce(entry *runningConn) error {
 	var writeMu sync.Mutex
 	send := func(m protocol.Message) error {
 		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeSignal(entry.ctx, ws, m)
+		err := writeSignal(entry.ctx, ws, m)
+		writeMu.Unlock()
+		if err != nil {
+			_ = ws.CloseNow()
+		}
+		return err
 	}
 
 	publishOnline := func() error {
@@ -954,14 +963,23 @@ func (s *Server) runOnce(entry *runningConn) error {
 		hooks.OnSessionStart(sessionCtx, scope, entry.signalURL, entry.relayToken, send)
 	}
 
-	for {
-		select {
-		case <-entry.guestRefresh:
-			if err := publishOnline(); err != nil {
-				return err
+	// Republish device.online immediately when guest ACL changes instead of
+	// waiting for the next inbound signaling message to unblock readSignal.
+	go func() {
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case <-entry.guestRefresh:
+				if err := publishOnline(); err != nil {
+					return
+				}
 			}
-		default:
 		}
+	}()
+
+	acceptSem := make(chan struct{}, 16)
+	for {
 		m, err := readSignal(sessionCtx, ws)
 		if err != nil {
 			return err
@@ -972,7 +990,14 @@ func (s *Server) runOnce(entry *runningConn) error {
 				hooks.OnMessage(m)
 			}
 		case "connect.request":
-			go s.handleConnectRequest(sessionCtx, entry, send, m)
+			select {
+			case acceptSem <- struct{}{}:
+				go func(msg protocol.Message) {
+					defer func() { <-acceptSem }()
+					s.handleConnectRequest(sessionCtx, entry, send, msg)
+				}(m)
+			default:
+			}
 		case "ice.config":
 			if l := s.getLink(m.Connection); l != nil {
 				var servers []iceServer

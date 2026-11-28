@@ -16,6 +16,7 @@ import (
 
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
+	"vanora-relay/internal/dialretry"
 	"vanora-relay/internal/identity"
 )
 
@@ -29,6 +30,7 @@ type DialOptions struct {
 	Handler            transport.Handler
 	AssemblyBudget     *AssemblyBudget
 	DialURL            string
+	HTTPClient         *http.Client
 	EdgeTicket         string
 	CA                 ed25519.PublicKey
 	LocalPrincipal     identity.Principal
@@ -93,13 +95,33 @@ func DialDeferred(ctx context.Context, opts DialOptions) (transport.Peer, func()
 		Transport:     outerTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+	if opts.HTTPClient != nil {
+		cp := *opts.HTTPClient
+		if cp.Transport == nil {
+			cp.Transport = outerTransport
+		}
+		cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &cp
+	}
 	handshake, stop := context.WithTimeout(ctx, handshakeTimeout)
 	defer stop()
-	ws, response, err := websocket.Dial(handshake, target, &websocket.DialOptions{
-		HTTPClient: client, Host: binding.Hostname, HTTPHeader: headers, Subprotocols: []string{Subprotocol},
+	var ws *websocket.Conn
+	var response *http.Response
+	err = dialretry.Dial(handshake, func() error {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		var dialErr error
+		ws, response, dialErr = websocket.Dial(handshake, target, &websocket.DialOptions{
+			HTTPClient: client, Host: binding.Hostname, HTTPHeader: headers, Subprotocols: []string{Subprotocol},
+		})
+		return dialErr
 	})
 	if err != nil {
 		if response != nil {
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
 			return nil, nil, fmt.Errorf("cftunnel: WebSocket upgrade failed (HTTP %d)", response.StatusCode)
 		}
 		if handshake.Err() != nil {
@@ -126,7 +148,7 @@ func DialDeferred(ctx context.Context, opts DialOptions) (transport.Peer, func()
 		return nil, nil, transport.ErrUnauthorized
 	}
 	if opts.AssemblyBudget == nil {
-		opts.AssemblyBudget = processAssemblyBudget
+		opts.AssemblyBudget = NewAssemblyBudget(DefaultAssemblyBudget)
 	}
 	context.AfterFunc(lifetime, func() { _ = ws.CloseNow() })
 	peer := newPeer(lifetime, cancel, conn, opts.UserID, opts.Allows, opts.AccessUntil, access, opts.Handler, opts.AssemblyBudget)

@@ -34,6 +34,7 @@ const (
 	NearbyDialTimeout        = 2500 * time.Millisecond
 	TailnetDialTimeout       = 8 * time.Second
 	CFTunnelHeadStart        = 4 * time.Second
+	CFTunnelFastHeadStart    = 500 * time.Millisecond
 )
 
 var tailnetPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -161,6 +162,7 @@ type Tracker struct {
 	mu          sync.Mutex
 	silent      map[string]silentState
 	tunnels     map[string]silentState
+	tunnelWins  map[string]int
 	cooldowns   map[string]time.Time
 	relayStalls int
 	lastRelayAt time.Time
@@ -168,9 +170,10 @@ type Tracker struct {
 
 func NewTracker() *Tracker {
 	return &Tracker{
-		silent:    make(map[string]silentState),
-		tunnels:   make(map[string]silentState),
-		cooldowns: make(map[string]time.Time),
+		silent:     make(map[string]silentState),
+		tunnels:    make(map[string]silentState),
+		tunnelWins: make(map[string]int),
+		cooldowns:  make(map[string]time.Time),
 	}
 }
 
@@ -179,6 +182,7 @@ func (t *Tracker) Reset() {
 	t.mu.Lock()
 	clear(t.silent)
 	clear(t.tunnels)
+	clear(t.tunnelWins)
 	t.mu.Unlock()
 }
 
@@ -231,7 +235,31 @@ func (t *Tracker) RecordTunnelUnavailable(key string, now time.Time) {
 func (t *Tracker) RecordTunnelSuccess(key string) {
 	t.mu.Lock()
 	delete(t.tunnels, key)
+	t.tunnelWins[key]++
 	t.mu.Unlock()
+}
+
+// RecordWebRTCSuccess clears consecutive tunnel-win head-start adaptation for key.
+func (t *Tracker) RecordWebRTCSuccess(key string) {
+	t.mu.Lock()
+	delete(t.tunnelWins, key)
+	t.mu.Unlock()
+}
+
+// TunnelHeadStart returns an adapted WebRTC head-start duration. After repeated
+// consecutive tunnel wins on the current network (e.g. UDP/TURN blocked), it
+// shortens the wait so reconnects and wakeups do not pay the full 4s penalty.
+func (t *Tracker) TunnelHeadStart(key string, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = CFTunnelHeadStart
+	}
+	t.mu.Lock()
+	wins := t.tunnelWins[key]
+	t.mu.Unlock()
+	if wins >= 2 && base > CFTunnelFastHeadStart {
+		return CFTunnelFastHeadStart
+	}
+	return base
 }
 
 // RecordProbeSuccess clears silent-route backoff for addr.
@@ -254,7 +282,7 @@ func (t *Tracker) RecordActivePath(path string, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch path {
-	case "relay":
+	case "relay", "cf_tunnel":
 		t.relayStalls++
 		t.lastRelayAt = now
 	case "direct", "lan", "tailnet":

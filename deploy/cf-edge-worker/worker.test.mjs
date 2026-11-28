@@ -51,6 +51,24 @@ test("supports both keys during rotation and retires the previous key", async ()
   assert.equal(await verifyTicket(request(), { EDGE_PREV_KEY: key }, seconds), false);
 });
 
+test("reuses imported HMAC keys and bounds the isolate cache", async t => {
+  const imports = t.mock.method(crypto.subtle, "importKey");
+  async function verify(secret) {
+    const upgrade = request({ headers: { "Vanora-Edge-Ticket": ticket(secret) } });
+    assert.equal(await verifyTicket(upgrade, { EDGE_KEY: secret }, seconds), true);
+  }
+  const first = `${key}-cache-0`;
+  await verify(first);
+  await verify(first);
+  assert.equal(imports.mock.callCount(), 1);
+  for (let index = 1; index <= 4; index++) {
+    await verify(`${key}-cache-${index}`);
+  }
+  assert.equal(imports.mock.callCount(), 5);
+  await verify(first);
+  assert.equal(imports.mock.callCount(), 6);
+});
+
 test("rejects aliased paths and hosts and ignores spoofed routing headers", async () => {
   for (const alias of [
     `${url}?`, `${url}#`, `${url}?a=1`, `${url}#fragment`, `${url}/`, `${url}\n`,

@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,16 +15,19 @@ import (
 	"vanora-relay/adapter/lan"
 	"vanora-relay/adapter/selfrelay"
 	"vanora-relay/adapter/transport"
+	"vanora-relay/internal/pairnet"
 	"vanora-relay/internal/routes"
 )
 
 const (
-	silentSocketCheckAfter  = 300 * time.Millisecond
-	silentSocketRecheck     = 400 * time.Millisecond
-	remoteSilentSocketAfter = 1400 * time.Millisecond
-	longResumeProbeTimeout  = 1500 * time.Millisecond
-	quickProbeTimeout       = 3000 * time.Millisecond
-	remoteProbeTimeout      = 6000 * time.Millisecond
+	silentSocketCheckAfter        = 300 * time.Millisecond
+	silentSocketRecheck           = 400 * time.Millisecond
+	remoteSilentSocketAfter       = 1400 * time.Millisecond
+	longResumeRelaySilentFloor    = 900 * time.Millisecond
+	longResumeProbeTimeout        = 1500 * time.Millisecond
+	quickProbeTimeout             = 3000 * time.Millisecond
+	remoteProbeTimeout            = 6000 * time.Millisecond
+	tunnelWebRTCFailbackMinUptime = routes.BetterRouteCheckInterval
 )
 
 // Wakeup notifies the client that the app returned to the foreground or the
@@ -42,11 +46,13 @@ func (c *Client) Wakeup(longResume bool) error {
 		return errors.New("no desktop selected")
 	}
 	if p == nil {
+		c.interruptDial()
 		c.op.Lock()
 		defer c.op.Unlock()
 		c.mu.Lock()
 		stillNil := c.peer == nil && c.device != ""
 		if stillNil {
+			c.wantReconnect = true
 			c.setStateLocked("reconnecting", "", "")
 		}
 		c.mu.Unlock()
@@ -60,12 +66,16 @@ func (c *Client) Wakeup(longResume bool) error {
 		return err
 	}
 
+	if live := peerPath(p); live != "" && live != "unknown" {
+		path = live
+	}
 	alive := c.probeWithSilentCheck(p, path, longResume)
 	if alive {
 		signal(c.betterWake)
 		return nil
 	}
 
+	c.interruptDial()
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.mu.Lock()
@@ -78,6 +88,7 @@ func (c *Client) Wakeup(longResume bool) error {
 		c.mu.Unlock()
 		return nil
 	}
+	c.wantReconnect = true
 	c.detachLocked()
 	c.setStateLocked("reconnecting", "", "silent or unresponsive socket")
 	c.mu.Unlock()
@@ -102,12 +113,12 @@ func (c *Client) Probe(timeoutMillis int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return c.pingPeer(p, time.Duration(timeoutMillis)*time.Millisecond), nil
+	return c.pingPeer(c.ctx, p, time.Duration(timeoutMillis)*time.Millisecond), nil
 }
 
-func (c *Client) pingPeer(p transport.Peer, timeout time.Duration) bool {
+func (c *Client) pingPeer(ctx context.Context, p transport.Peer, timeout time.Duration) bool {
 	framesBefore := c.inboundFrames.Load()
-	_, err := c.requestWithTimeout(p, map[string]any{
+	_, err := c.requestWithContext(ctx, p, map[string]any{
 		"type":       "ping",
 		"request_id": NewRequestID(),
 	}, false, timeout)
@@ -139,7 +150,7 @@ func (c *Client) probeWithSilentCheck(p transport.Peer, path string, longResume 
 	}
 	probeCh := make(chan outcome, 1)
 	go func() {
-		ok := c.pingPeer(p, timeout)
+		ok := c.pingPeer(pctx, p, timeout)
 		probeCh <- outcome{alive: ok}
 	}()
 
@@ -157,11 +168,14 @@ func (c *Client) probeWithSilentCheck(p transport.Peer, path string, longResume 
 			silentCh <- "alive"
 			return
 		}
+		var isDirectHostProbe bool
 		for {
 			if pctx.Err() != nil {
 				return
 			}
-			if c.checkHostReachable(pctx) {
+			var ok bool
+			ok, isDirectHostProbe = c.checkHostReachable(pctx)
+			if ok {
 				break
 			}
 			wait := time.NewTimer(silentSocketRecheck)
@@ -172,21 +186,28 @@ func (c *Client) probeWithSilentCheck(p transport.Peer, path string, longResume 
 			case <-wait.C:
 			}
 		}
+		minWait := time.Duration(0)
 		if !longResume && path != "lan" && path != "direct" {
-			if rem := remoteSilentSocketAfter - time.Since(started); rem > 0 {
-				deadline := time.Now().Add(rem)
-				for time.Now().Before(deadline) {
-					if c.inboundFrames.Load() > framesBefore {
-						silentCh <- "alive"
-						return
-					}
-					sleep := time.NewTimer(50 * time.Millisecond)
-					select {
-					case <-pctx.Done():
-						sleep.Stop()
-						return
-					case <-sleep.C:
-					}
+			minWait = remoteSilentSocketAfter
+		} else if longResume && !isDirectHostProbe {
+			// A relay HTTP probe confirms the relay is reachable, not the desktop
+			// round-trip; give high-latency cellular links a minimum window before
+			// declaring the existing tunnel or WebRTC link dead.
+			minWait = longResumeRelaySilentFloor
+		}
+		if rem := minWait - time.Since(started); rem > 0 {
+			deadline := time.Now().Add(rem)
+			for time.Now().Before(deadline) {
+				if c.inboundFrames.Load() > framesBefore {
+					silentCh <- "alive"
+					return
+				}
+				sleep := time.NewTimer(50 * time.Millisecond)
+				select {
+				case <-pctx.Done():
+					sleep.Stop()
+					return
+				case <-sleep.C:
 				}
 			}
 		}
@@ -213,7 +234,7 @@ func (c *Client) probeWithSilentCheck(p transport.Peer, path string, longResume 
 	}
 }
 
-func (c *Client) checkHostReachable(ctx context.Context) bool {
+func (c *Client) checkHostReachable(ctx context.Context) (reachable bool, directHost bool) {
 	c.mu.Lock()
 	var lanT *lan.Target
 	if c.lanTarget != nil {
@@ -229,13 +250,13 @@ func (c *Client) checkHostReachable(ctx context.Context) bool {
 
 	switch {
 	case lanT != nil:
-		return lan.ProbeTarget(ctx, *lanT, c.lanKey, 1200*time.Millisecond) == nil
+		return lan.ProbeTarget(ctx, *lanT, c.lanKey, 1200*time.Millisecond) == nil, true
 	case selfURL != "":
-		return routes.ProbeSignalHTTP(ctx, selfURL, selfTok, 1500*time.Millisecond) == nil
+		return routes.ProbeSignalHTTP(ctx, selfURL, selfTok, 1500*time.Millisecond) == nil, false
 	case sigURL != "":
-		return routes.ProbeSignalHTTP(ctx, sigURL, "", 1500*time.Millisecond) == nil
+		return routes.ProbeSignalHTTP(ctx, sigURL, "", 1500*time.Millisecond) == nil, false
 	default:
-		return false
+		return false, false
 	}
 }
 
@@ -331,7 +352,7 @@ func (c *Client) lanCandidateEntriesLocked() []routes.Entry {
 	return routes.MergeOrdered(c.lanTarget.Address, c.altLANRoutes, learned)
 }
 
-func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
+func (c *Client) dialLANPeer(dialCtx context.Context) (transport.Peer, func(), error) {
 	c.mu.Lock()
 	base := *c.lanTarget
 	lanName := c.lanName
@@ -342,7 +363,7 @@ func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
 	}
 	// First-time pairing with a one-time token must only go to the exact invited address.
 	if base.Token != "" {
-		p, start, err := lan.Dial(c.ctx, base, c.lanKey, lanName, (*handler)(c))
+		p, start, err := lan.DialWithOptionsFor(dialCtx, c.ctx, base, c.lanKey, lanName, "mobile", "", (*handler)(c))
 		if err == nil {
 			c.mu.Lock()
 			c.lanTarget.Token = ""
@@ -365,19 +386,9 @@ func (c *Client) dialLANPeer() (transport.Peer, func(), error) {
 	var lastErr error
 	for _, cand := range filtered {
 		t := lan.Target{Address: cand.Address, Pin: base.Pin}
-		if len(filtered) > 1 {
-			dctx, cancel := context.WithTimeout(c.ctx, routes.DialTimeout(cand.Kind))
-			pErr := lan.ProbeTarget(dctx, t, c.lanKey, routes.DialTimeout(cand.Kind))
-			cancel()
-			if pErr != nil {
-				if errors.Is(pErr, lan.ErrUnpaired) {
-					return nil, nil, pErr
-				}
-				lastErr = pErr
-				continue
-			}
-		}
-		p, start, err := lan.Dial(c.ctx, t, c.lanKey, lanName, (*handler)(c))
+		candCtx, cancel := context.WithTimeout(dialCtx, routes.DialTimeout(cand.Kind))
+		p, start, err := lan.DialWithOptionsFor(candCtx, c.ctx, t, c.lanKey, lanName, "mobile", "", (*handler)(c))
+		cancel()
 		if err == nil {
 			c.mu.Lock()
 			if c.lanTarget != nil && c.lanTarget.Pin == base.Pin {
@@ -406,7 +417,13 @@ func (c *Client) maintainRoutes() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
+			if c.background.Load() {
+				continue
+			}
 		case <-c.betterWake:
+			if c.background.Load() {
+				continue
+			}
 		}
 		c.checkBetterRoutes()
 	}
@@ -414,67 +431,219 @@ func (c *Client) maintainRoutes() {
 
 func (c *Client) checkBetterRoutes() {
 	c.mu.Lock()
-	if c.lanTarget == nil || c.peer == nil || c.lanTarget.Token != "" {
+	p := c.peer
+	if p == nil {
 		c.mu.Unlock()
 		return
 	}
-	activeAddr := c.lanTarget.Address
-	pin := c.lanTarget.Pin
-	entries := c.lanCandidateEntriesLocked()
+	lanTarget := c.lanTarget
+	var activeAddr, pin, lanName string
+	var entries []routes.Entry
+	if lanTarget != nil && lanTarget.Token == "" {
+		activeAddr = lanTarget.Address
+		pin = lanTarget.Pin
+		lanName = c.lanName
+		entries = c.lanCandidateEntriesLocked()
+	}
+	connectedAt := c.connectedAt
 	c.mu.Unlock()
 
-	_, activeKind, err := routes.ClassifyAddress(activeAddr)
-	if err != nil {
+	if activeAddr != "" {
+		_, activeKind, err := routes.ClassifyAddress(activeAddr)
+		if err != nil {
+			return
+		}
+		now := time.Now()
+		for _, cand := range entries {
+			if cand.Address == activeAddr || routes.Rank(cand.Kind) >= routes.Rank(activeKind) {
+				continue
+			}
+			if !c.routeTracker.ShouldProbe(cand.Address, now) {
+				continue
+			}
+			// Make-before-break: dial the better route directly before dropping
+			// the active session so a flaky route never causes a disconnect.
+			dctx, cancel := context.WithTimeout(c.ctx, routes.DialTimeout(cand.Kind))
+			nextPeer, start, err := lan.DialWithOptionsFor(dctx, c.ctx, lan.Target{Address: cand.Address, Pin: pin}, c.lanKey, lanName, "mobile", "", (*handler)(c))
+			cancel()
+			if err != nil {
+				if errors.Is(err, lan.ErrUnpaired) {
+					return
+				}
+				c.routeTracker.RecordProbeMiss(cand.Address, now)
+				continue
+			}
+			c.routeTracker.RecordProbeSuccess(cand.Address)
+			c.adoptBetterLANPeer(p, nextPeer, start, pin, activeAddr, cand.Address)
+			return
+		}
 		return
 	}
-	now := time.Now()
-	for _, cand := range entries {
-		if cand.Address == activeAddr || routes.Rank(cand.Kind) >= routes.Rank(activeKind) {
-			continue
-		}
-		if !c.routeTracker.ShouldProbe(cand.Address, now) {
-			continue
-		}
-		err := lan.ProbeTarget(c.ctx, lan.Target{Address: cand.Address, Pin: pin}, c.lanKey, 2*time.Second)
-		if err != nil {
-			c.routeTracker.RecordProbeMiss(cand.Address, now)
-			continue
-		}
-		c.routeTracker.RecordProbeSuccess(cand.Address)
-		c.switchToBetterLANRoute(pin, activeAddr, cand.Address)
-		return
+
+	// Periodic make-before-break failback from cf_tunnel back to direct/TURN WebRTC.
+	if peerPath(p) == "cf_tunnel" && time.Since(connectedAt) >= tunnelWebRTCFailbackMinUptime {
+		c.tryFailbackToWebRTC(p)
 	}
 }
 
-func (c *Client) switchToBetterLANRoute(pin, prevAddr, betterAddr string) {
+func (c *Client) adoptBetterLANPeer(oldPeer, nextPeer transport.Peer, start func(), pin, prevAddr, betterAddr string) {
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.mu.Lock()
-	if c.lanTarget == nil || c.lanTarget.Pin != pin || c.lanTarget.Address == betterAddr {
+	if c.peer != oldPeer || c.lanTarget == nil || c.lanTarget.Pin != pin || c.lanTarget.Address == betterAddr {
 		c.mu.Unlock()
+		nextPeer.Close()
 		return
 	}
 	if !slices.Contains(c.altLANRoutes, prevAddr) {
 		c.altLANRoutes = append(c.altLANRoutes, prevAddr)
 	}
 	c.lanTarget.Address = betterAddr
-	oldPeer := c.peer
-	c.detachLocked()
-	c.setStateLocked("reconnecting", "", "")
+	group := c.group
+	c.swapPeerLocked(nextPeer)
+	resume := c.resumeSnapshotLocked()
 	c.mu.Unlock()
-	if oldPeer != nil {
-		oldPeer.Close()
+	oldPeer.Close()
+	c.finishSwappedPeer(nextPeer, start, group, resume, betterAddr)
+}
+
+func (c *Client) tryFailbackToWebRTC(oldPeer transport.Peer) {
+	c.mu.Lock()
+	device, owner := c.device, c.owner
+	var selfT *selfrelay.Target
+	if c.selfTarget != nil {
+		cp := *c.selfTarget
+		selfT = &cp
 	}
-	if err := c.connectLocked(); err != nil {
-		// Better route answered probe but failed setup; cool it down for 5 minutes.
-		c.routeTracker.RecordSwitchFailure(betterAddr, time.Now())
-		c.mu.Lock()
-		if c.lanTarget != nil && c.lanTarget.Pin == pin {
-			c.lanTarget.Address = prevAddr
+	selfName := c.selfName
+	invite := c.officialInvite
+	c.mu.Unlock()
+	if device == "" || invite != nil {
+		return
+	}
+
+	probeKey := "webrtc:" + c.url + "\x00" + device
+	if selfT != nil {
+		probeKey = "webrtc:" + selfT.SignalURL + "\x00" + selfT.Pin
+	}
+	now := time.Now()
+	if !c.routeTracker.ShouldProbe(probeKey, now) {
+		return
+	}
+
+	dctx, cancel := context.WithTimeout(c.ctx, 8*time.Second)
+	defer cancel()
+
+	var nextPeer transport.Peer
+	var start func()
+	var nextSock *transport.Client
+	var err error
+	if selfT != nil {
+		nextPeer, start, err = selfrelay.DialWithRoleFor(dctx, c.ctx, *selfT, c.selfKey, selfName, "mobile", (*handler)(c))
+	} else if c.identity != nil && c.url != "" {
+		bound, ok := c.desktopBinding(device)
+		if !ok || bound.Owner != owner {
+			return
 		}
+		pin, decErr := base64.RawURLEncoding.Strict().DecodeString(bound.Pin)
+		if decErr != nil {
+			return
+		}
+		nextSock, err = transport.DialMobileFor(dctx, c.url, c.scopeTarget, c.source, (*handler)(c))
+		if err == nil {
+			nextPeer, start, err = nextSock.ConnectPairedDeferred(dctx, device, owner, transport.ConnectOptions{Pin: pin})
+			if err != nil {
+				nextSock.Close()
+				nextSock = nil
+			}
+		}
+	} else {
+		return
+	}
+	if err != nil || nextPeer == nil || !nextPeer.Allows(true) {
+		if nextPeer != nil {
+			nextPeer.Close()
+		}
+		if nextSock != nil {
+			nextSock.Close()
+		}
+		c.routeTracker.RecordProbeMiss(probeKey, now)
+		return
+	}
+	c.routeTracker.RecordProbeSuccess(probeKey)
+
+	c.op.Lock()
+	defer c.op.Unlock()
+	c.mu.Lock()
+	if c.peer != oldPeer {
 		c.mu.Unlock()
-		if err2 := c.connectLocked(); err2 != nil && !c.handleAuthError(err2) {
-			signal(c.retryNow)
+		nextPeer.Close()
+		if nextSock != nil {
+			nextSock.Close()
+		}
+		return
+	}
+	oldSock := c.socket
+	c.socket = nextSock
+	group := c.group
+	c.swapPeerLocked(nextPeer)
+	resume := c.resumeSnapshotLocked()
+	c.mu.Unlock()
+	oldPeer.Close()
+	if oldSock != nil && oldSock != nextSock {
+		oldSock.Close()
+	}
+	c.finishSwappedPeer(nextPeer, start, group, resume, probeKey)
+}
+
+func (c *Client) swapPeerLocked(nextPeer transport.Peer) {
+	c.detachLocked()
+	c.peer = nextPeer
+	c.connectedAt = time.Now()
+	c.lastSynced = nil
+	c.generation.Add(1)
+	activePath := peerPath(nextPeer)
+	c.routeTracker.RecordActivePath(activePath, time.Now())
+	c.setStateLocked("connected", activePath, "")
+}
+
+func (c *Client) resumeSnapshotLocked() map[string]int64 {
+	resume := make(map[string]int64, len(c.subscriptions))
+	for id, cur := range c.subscriptions {
+		resume[id] = cur.applied
+	}
+	return resume
+}
+
+func (c *Client) finishSwappedPeer(p transport.Peer, start func(), group *pairnet.Group, resume map[string]int64, routeKey string) {
+	if start != nil {
+		start()
+	}
+	if !p.Allows(false) {
+		c.routeTracker.RecordSwitchFailure(routeKey, time.Now())
+		p.Close()
+		(*handler)(c).Closed(p)
+		return
+	}
+	if group != nil {
+		if err := c.syncPeer(p, group); err != nil {
+			c.routeTracker.RecordSwitchFailure(routeKey, time.Now())
+			p.Close()
+			return
+		}
+	}
+	for id, seq := range resume {
+		if _, err := c.subscribe(p, id, seq); err != nil {
+			if errors.Is(err, errSnapshot) || errors.Is(err, errUnavailable) || p.Allows(false) {
+				c.mu.Lock()
+				delete(c.subscriptions, id)
+				c.enqueueControlLocked(event{kind: "subscription.error", payload: controlEvent(id, err.Error())})
+				c.mu.Unlock()
+				continue
+			}
+			c.routeTracker.RecordSwitchFailure(routeKey, time.Now())
+			p.Close()
+			return
 		}
 	}
 }

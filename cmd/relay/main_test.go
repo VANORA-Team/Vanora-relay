@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,7 +83,8 @@ func TestTunnelServerProcessModes(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(closeServer)
-			for path, want := range map[string]int{"/v1/signal?probe=1": test.signal, "/v1/tunnels/challenge": test.api, "/healthz": 200} {
+			for path, want := range map[string]int{"/v1/signal?probe=1": test.signal, "/v1/probe": test.signal,
+				"/v1/tunnels/challenge": test.api, "/healthz": 200, "/readyz": 200} {
 				req := httptest.NewRequest(http.MethodGet, path, nil)
 				req.Header.Set("Authorization", "Bearer "+strings.Repeat("s", 40))
 				res := httptest.NewRecorder()
@@ -90,6 +92,12 @@ func TestTunnelServerProcessModes(t *testing.T) {
 				if res.Code != want {
 					t.Errorf("%s returned %d, want %d", path, res.Code, want)
 				}
+			}
+			handler.drain(t.Context())
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if res.Code != http.StatusServiceUnavailable || res.Body.String() != "draining\n" {
+				t.Fatalf("readiness after drain = %d, %q", res.Code, res.Body.String())
 			}
 			enabled := cfg.Mode != cftunnel.ModeOff
 			if storeOpened != enabled || cfCreated != enabled || networkStarted != (cfg.Process == cftunnel.ProcessAll) {
@@ -100,6 +108,47 @@ func TestTunnelServerProcessModes(t *testing.T) {
 				t.Fatal("network lifecycle differs from process configuration")
 			}
 		})
+	}
+}
+
+func TestMetricsAccess(t *testing.T) {
+	cfg := cftunnel.Config{Mode: cftunnel.ModeOff, Channel: cftunnel.ChannelSelf,
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}}
+	handler, closeServer, err := buildServer(t.Context(), cfg, relayStartup{
+		metricsToken: "metrics-token",
+		newNetwork:   func() (relayNetwork, error) { return new(startupNetwork), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeServer()
+	for _, test := range []struct {
+		remote, forwarded, token string
+		want                     int
+	}{
+		{"127.0.0.1:1234", "", "", 200},
+		{"127.0.0.1:1234", "192.0.2.1", "", 401},
+		{"192.0.2.1:1234", "127.0.0.1", "", 401},
+		{"192.0.2.1:1234", "", "wrong", 401},
+		{"192.0.2.1:1234", "", "metrics-token", 200},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.RemoteAddr = test.remote
+		if test.forwarded != "" {
+			req.Header.Set("X-Forwarded-For", test.forwarded)
+		}
+		if test.token != "" {
+			req.Header.Set("Authorization", "Bearer "+test.token)
+		}
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != test.want {
+			t.Fatalf("metrics from %s via %q = %d, want %d", test.remote, test.forwarded, res.Code, test.want)
+		}
+		if res.Code == 200 && (!strings.Contains(res.Body.String(), `"active_peers":0`) ||
+			!strings.Contains(res.Body.String(), `"cf_api_requests_total":{}`)) {
+			t.Fatalf("missing metrics in %s", res.Body)
+		}
 	}
 }
 
@@ -369,6 +418,7 @@ func TestAllowedIssuerConfig(t *testing.T) {
 func TestRunSelfHostedRejectsOfficialIdentityKey(t *testing.T) {
 	t.Setenv("RELAY_CHANNEL", "self")
 	t.Setenv("RELAY_IDENTITY_PUBLIC_KEY", strings.Repeat("aa", 32))
+	t.Setenv("RELAY_IDENTITY_PUBLIC_KEYS", "")
 	t.Setenv("RELAY_SELF_TOKEN", strings.Repeat("b", 40))
 	t.Setenv("RELAY_ALLOWED_ISSUER", "")
 	t.Setenv("RELAY_MEMBERSHIP_URL", "")
@@ -380,5 +430,33 @@ func TestRunSelfHostedRejectsOfficialIdentityKey(t *testing.T) {
 	err := run()
 	if err == nil || !strings.Contains(err.Error(), "RELAY_IDENTITY_PUBLIC_KEY must not be set") {
 		t.Fatalf("expected self-hosted identity key rejection, got %v", err)
+	}
+}
+
+func TestIdentityPublicKeysAndMembershipCacheTTL(t *testing.T) {
+	keyA := strings.Repeat("11", 32)
+	keyB := strings.Repeat("22", 32)
+	t.Setenv("RELAY_IDENTITY_PUBLIC_KEY", keyA)
+	t.Setenv("RELAY_IDENTITY_PUBLIC_KEYS", keyB)
+	keys, err := identityPublicKeysConfig()
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("expected 2 trusted keys, got %d, err=%v", len(keys), err)
+	}
+
+	t.Setenv("RELAY_MEMBERSHIP_CACHE_TTL", "")
+	if ttl, err := membershipCacheTTLConfig(); err != nil || ttl != defaultMembershipCacheTTL {
+		t.Fatalf("default cache ttl = (%v, %v), want %v", ttl, err, defaultMembershipCacheTTL)
+	}
+	t.Setenv("RELAY_MEMBERSHIP_CACHE_TTL", "0")
+	if ttl, err := membershipCacheTTLConfig(); err != nil || ttl != 0 {
+		t.Fatalf("disabled cache ttl = (%v, %v), want 0", ttl, err)
+	}
+	t.Setenv("RELAY_MEMBERSHIP_CACHE_TTL", "30s")
+	if ttl, err := membershipCacheTTLConfig(); err != nil || ttl != 30*time.Second {
+		t.Fatalf("custom cache ttl = (%v, %v), want 30s", ttl, err)
+	}
+	t.Setenv("RELAY_MEMBERSHIP_CACHE_TTL", "-5s")
+	if _, err := membershipCacheTTLConfig(); err == nil {
+		t.Fatal("negative cache ttl accepted")
 	}
 }

@@ -146,8 +146,123 @@ func openOfficialSlot(dir, vaultChannel, name, identityURL, caFile, caHexFlag, s
 	}, nil
 }
 
+type channelFlags struct {
+	identityURL       *string
+	caFile            *string
+	caHexFlag         *string
+	signalURL         *string
+	signalToken       *string
+	cnIdentityURL     *string
+	cnCAFile          *string
+	cnCAHex           *string
+	cnSignalURL       *string
+	globalIdentityURL *string
+	globalCAFile      *string
+	globalCAHex       *string
+	globalSignalURL   *string
+	selfSignalURL     *string
+	selfToken         *string
+	selfTokenStdin    *bool
+}
+
+func registerChannelFlags(fs *flag.FlagSet, selfSignalDesc string) *channelFlags {
+	return &channelFlags{
+		// Legacy single-channel flags (retained for standalone CLI compatibility).
+		identityURL: fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL"),
+		caFile:      fs.String("ca", "", "pinned identity public key file"),
+		caHexFlag:   fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)"),
+		signalURL:   fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL"),
+		signalToken: fs.String("signal-token", envOrDefault("VANORA_RELAY_SIGNAL_TOKEN", ""), "bearer token for a self-hosted relay (alias for -self-token)"),
+
+		// Per-site official channel flags for simultaneous CN and GLOBAL slots.
+		cnIdentityURL: fs.String("cn-identity", envOrDefault("VANORA_RELAY_CN_IDENTITY_URL", defaultCNIdentityURL), "CN site identity authority URL"),
+		cnCAFile:      fs.String("cn-ca", "", "CN site pinned identity public key file"),
+		cnCAHex:       fs.String("cn-ca-hex", envOrDefault("VANORA_RELAY_CN_CA_PUBLIC_KEY", defaultCNCAHex), "CN site pinned identity public key (hex or base64)"),
+		cnSignalURL:   fs.String("cn-signal", envOrDefault("VANORA_RELAY_CN_SIGNAL_URL", defaultCNSignalURL), "CN site official relay WebSocket URL"),
+
+		globalIdentityURL: fs.String("global-identity", envOrDefault("VANORA_RELAY_GLOBAL_IDENTITY_URL", defaultGlobalIdentityURL), "GLOBAL site identity authority URL"),
+		globalCAFile:      fs.String("global-ca", "", "GLOBAL site pinned identity public key file"),
+		globalCAHex:       fs.String("global-ca-hex", envOrDefault("VANORA_RELAY_GLOBAL_CA_PUBLIC_KEY", defaultGlobalCAHex), "GLOBAL site pinned identity public key (hex or base64)"),
+		globalSignalURL:   fs.String("global-signal", envOrDefault("VANORA_RELAY_GLOBAL_SIGNAL_URL", defaultGlobalSignalURL), "GLOBAL site official relay WebSocket URL"),
+
+		// Account-free self-hosted relay flags.
+		selfSignalURL:  fs.String("self-signal", envOrDefault("VANORA_RELAY_SELF_SIGNAL_URL", ""), selfSignalDesc),
+		selfToken:      fs.String("self-token", envOrDefault("VANORA_RELAY_SELF_TOKEN", ""), "bearer token for a self-hosted relay (RELAY_SELF_TOKEN)"),
+		selfTokenStdin: fs.Bool("self-token-stdin", false, "read self-hosted relay bearer token from stdin"),
+	}
+}
+
+func (cf *channelFlags) resolve(dir, channel string, strictLegacyConflict bool, in io.Reader) (map[string]*officialSlotConfig, string, string, error) {
+	resolvedSelfSignal := strings.TrimSpace(*cf.selfSignalURL)
+	resolvedSelfToken := strings.TrimSpace(*cf.selfToken)
+	if resolvedSelfToken == "" {
+		resolvedSelfToken = strings.TrimSpace(*cf.signalToken)
+	}
+	if *cf.selfTokenStdin {
+		tok, err := readTokenInput("", true, in)
+		if err != nil {
+			return nil, "", "", errors.New("self-hosted relay token required (-self-token, -self-token-stdin, or VANORA_RELAY_SELF_TOKEN)")
+		}
+		resolvedSelfToken = tok
+	}
+	legacyID := strings.TrimSpace(*cf.identityURL)
+	legacyCAFile := strings.TrimSpace(*cf.caFile)
+	legacyCAHex := strings.TrimSpace(*cf.caHexFlag)
+	legacySig := strings.TrimSpace(*cf.signalURL)
+
+	if channel == "self" {
+		if resolvedSelfSignal == "" {
+			resolvedSelfSignal = legacySig
+		}
+		legacySig = ""
+	}
+
+	slots := make(map[string]*officialSlotConfig, 2)
+	cnSlot, err := openOfficialSlot(dir, "cn", "cn", *cf.cnIdentityURL, *cf.cnCAFile, *cf.cnCAHex, *cf.cnSignalURL)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if cnSlot != nil {
+		slots["cn"] = cnSlot
+	}
+	globalSlot, err := openOfficialSlot(dir, "global", "global", *cf.globalIdentityURL, *cf.globalCAFile, *cf.globalCAHex, *cf.globalSignalURL)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if globalSlot != nil {
+		slots["global"] = globalSlot
+	}
+
+	hasLegacy := legacyID != "" || legacyCAFile != "" || legacyCAHex != "" || legacySig != ""
+	if hasLegacy {
+		slotName := "cn"
+		vaultChannel := ""
+		if channel == "global" {
+			slotName = "global"
+			vaultChannel = "global"
+		} else if channel == "cn" {
+			slotName = "cn"
+			vaultChannel = "cn"
+		}
+		if _, exists := slots[slotName]; exists {
+			if strictLegacyConflict {
+				return nil, "", "", fmt.Errorf("channel %s cannot be configured with both legacy flags and -%s-* flags", slotName, slotName)
+			}
+		} else {
+			legacySlot, err := openOfficialSlot(dir, vaultChannel, slotName, legacyID, legacyCAFile, legacyCAHex, legacySig)
+			if err != nil {
+				return nil, "", "", err
+			}
+			if legacySlot != nil {
+				slots[slotName] = legacySlot
+			}
+		}
+	}
+	return slots, resolvedSelfSignal, resolvedSelfToken, nil
+}
+
 func run(args []string) error {
-	const usage = "usage: vanora-desktop login|serve|whoami|status|logout|ctl [-channel cn|global|self -identity URL -ca FILE|-ca-hex HEX -signal WSS_URL -cn-identity URL -cn-ca FILE|-cn-ca-hex HEX -cn-signal WSS_URL -global-identity URL -global-ca FILE|-global-ca-hex HEX -global-signal WSS_URL -self-signal WSS_URL -self-token TOKEN -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
+	const usage = "usage: vanora-desktop login|serve|whoami|status|logout|ctl [-channel cn|global|self -identity URL -ca FILE|-ca-hex HEX -signal WSS_URL -cn-identity URL -cn-ca FILE|-cn-ca-hex HEX -cn-signal WSS_URL -global-identity URL -global-ca FILE|-global-ca-hex HEX -global-signal WSS_URL -self-signal WSS_URL -self-token TOKEN|-self-token-stdin -lan-listen IP:PORT -relay=false -config FILE -name NAME -state-dir DIR -token TOKEN|-token-stdin -sidecar -json]"
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
@@ -162,28 +277,7 @@ func run(args []string) error {
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	channelFlag := fs.String("channel", envOrDefault("VANORA_RELAY_CHANNEL", ""), "relay channel: cn, global, or self")
-
-	// Legacy single-channel flags (retained for standalone CLI compatibility).
-	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
-	caFile := fs.String("ca", "", "pinned identity public key file")
-	caHexFlag := fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)")
-	signalURL := fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL")
-	signalToken := fs.String("signal-token", envOrDefault("VANORA_RELAY_SIGNAL_TOKEN", ""), "bearer token for a self-hosted relay (alias for -self-token)")
-
-	// Per-site official channel flags for simultaneous CN and GLOBAL slots.
-	cnIdentityURL := fs.String("cn-identity", envOrDefault("VANORA_RELAY_CN_IDENTITY_URL", defaultCNIdentityURL), "CN site identity authority URL")
-	cnCAFile := fs.String("cn-ca", "", "CN site pinned identity public key file")
-	cnCAHex := fs.String("cn-ca-hex", envOrDefault("VANORA_RELAY_CN_CA_PUBLIC_KEY", defaultCNCAHex), "CN site pinned identity public key (hex or base64)")
-	cnSignalURL := fs.String("cn-signal", envOrDefault("VANORA_RELAY_CN_SIGNAL_URL", defaultCNSignalURL), "CN site official relay WebSocket URL")
-
-	globalIdentityURL := fs.String("global-identity", envOrDefault("VANORA_RELAY_GLOBAL_IDENTITY_URL", defaultGlobalIdentityURL), "GLOBAL site identity authority URL")
-	globalCAFile := fs.String("global-ca", "", "GLOBAL site pinned identity public key file")
-	globalCAHex := fs.String("global-ca-hex", envOrDefault("VANORA_RELAY_GLOBAL_CA_PUBLIC_KEY", defaultGlobalCAHex), "GLOBAL site pinned identity public key (hex or base64)")
-	globalSignalURL := fs.String("global-signal", envOrDefault("VANORA_RELAY_GLOBAL_SIGNAL_URL", defaultGlobalSignalURL), "GLOBAL site official relay WebSocket URL")
-
-	// Account-free self-hosted relay flags.
-	selfSignalURL := fs.String("self-signal", envOrDefault("VANORA_RELAY_SELF_SIGNAL_URL", ""), "self-hosted relay WebSocket URL")
-	selfToken := fs.String("self-token", envOrDefault("VANORA_RELAY_SELF_TOKEN", ""), "bearer token for a self-hosted relay (RELAY_SELF_TOKEN)")
+	chFlags := registerChannelFlags(fs, "self-hosted relay WebSocket URL")
 
 	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	lanListen := fs.String("lan-listen", "", "listen for paired LAN clients on a private IP address and port")
@@ -206,6 +300,12 @@ func run(args []string) error {
 	}
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
+	}
+	if *tokenStdin && *chFlags.selfTokenStdin {
+		return errors.New("-token-stdin and -self-token-stdin cannot be combined")
+	}
+	if *chFlags.selfTokenStdin && *sidecar {
+		return errors.New("-self-token-stdin cannot be combined with -sidecar; send access.relay.set on stdin or set VANORA_RELAY_SELF_TOKEN")
 	}
 
 	channel, err := parseChannelFlag(*channelFlag)
@@ -243,60 +343,9 @@ func run(args []string) error {
 	}
 	defer lock.Unlock()
 
-	resolvedSelfSignal := strings.TrimSpace(*selfSignalURL)
-	resolvedSelfToken := strings.TrimSpace(*selfToken)
-	if resolvedSelfToken == "" {
-		resolvedSelfToken = strings.TrimSpace(*signalToken)
-	}
-	legacyID := strings.TrimSpace(*identityURL)
-	legacyCAFile := strings.TrimSpace(*caFile)
-	legacyCAHex := strings.TrimSpace(*caHexFlag)
-	legacySig := strings.TrimSpace(*signalURL)
-
-	if channel == "self" {
-		if resolvedSelfSignal == "" {
-			resolvedSelfSignal = legacySig
-		}
-		legacySig = ""
-	}
-
-	slots := make(map[string]*officialSlotConfig, 2)
-	cnSlot, err := openOfficialSlot(dir, "cn", "cn", *cnIdentityURL, *cnCAFile, *cnCAHex, *cnSignalURL)
+	slots, resolvedSelfSignal, resolvedSelfToken, err := chFlags.resolve(dir, channel, true, os.Stdin)
 	if err != nil {
 		return err
-	}
-	if cnSlot != nil {
-		slots["cn"] = cnSlot
-	}
-	globalSlot, err := openOfficialSlot(dir, "global", "global", *globalIdentityURL, *globalCAFile, *globalCAHex, *globalSignalURL)
-	if err != nil {
-		return err
-	}
-	if globalSlot != nil {
-		slots["global"] = globalSlot
-	}
-
-	hasLegacy := legacyID != "" || legacyCAFile != "" || legacyCAHex != "" || legacySig != ""
-	if hasLegacy {
-		slotName := "cn"
-		vaultChannel := ""
-		if channel == "global" {
-			slotName = "global"
-			vaultChannel = "global"
-		} else if channel == "cn" {
-			slotName = "cn"
-			vaultChannel = "cn"
-		}
-		if _, exists := slots[slotName]; exists {
-			return fmt.Errorf("channel %s cannot be configured with both legacy flags and -%s-* flags", slotName, slotName)
-		}
-		legacySlot, err := openOfficialSlot(dir, vaultChannel, slotName, legacyID, legacyCAFile, legacyCAHex, legacySig)
-		if err != nil {
-			return err
-		}
-		if legacySlot != nil {
-			slots[slotName] = legacySlot
-		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -579,8 +628,31 @@ func serve(ctx context.Context, a *account.Account, ca ed25519.PublicKey, url, n
 	return serveMulti(ctx, slots, name, path, dir, sidecar, emitter, options)
 }
 
+const maxSidecarLineBytes = 2 << 20
+
+func readCommandLine(r *bufio.Reader, limit int) (line []byte, tooLong bool, err error) {
+	for {
+		frag, isPrefix, readErr := r.ReadLine()
+		if !tooLong {
+			if len(line)+len(frag) > limit {
+				tooLong = true
+				line = nil
+			} else {
+				line = append(line, frag...)
+			}
+		}
+		if !isPrefix || readErr != nil {
+			return line, tooLong, readErr
+		}
+	}
+}
+
 func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig, name, path, dir string, sidecar bool, emitter *jsonEmitter, options accessOptions) error {
-	cfg, err := desktop.LoadConfig(path)
+	initBytes, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	cfg, err := desktop.ParseConfig(initBytes)
 	if err != nil {
 		return err
 	}
@@ -662,7 +734,7 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		defer workers.Done()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		var prev []byte
+		prev := bytes.Clone(initBytes)
 		for {
 			select {
 			case <-ctx.Done():
@@ -671,13 +743,34 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 				prev = nil
 			case <-ticker.C:
 			}
-			b, e := os.ReadFile(path)
+			var (
+				b    []byte
+				next *desktop.Config
+				e    error
+			)
+			for attempt := 0; attempt < 3; attempt++ {
+				b, e = os.ReadFile(path)
+				if e == nil && prev != nil && bytes.Equal(b, prev) {
+					break
+				}
+				if e == nil {
+					next, e = desktop.ParseConfig(b)
+				}
+				if e == nil || ctx.Err() != nil {
+					break
+				}
+				if attempt < 2 {
+					retryTimer := time.NewTimer(80 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						retryTimer.Stop()
+						return
+					case <-retryTimer.C:
+					}
+				}
+			}
 			if e == nil && prev != nil && bytes.Equal(b, prev) {
 				continue
-			}
-			var next *desktop.Config
-			if e == nil {
-				next, e = desktop.ParseConfig(b)
 			}
 			if e == nil {
 				e = service.ReloadACL(next)
@@ -704,6 +797,26 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		}
 	}()
 
+	cmdCh := make(chan accessCommand, 64)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case cmd, ok := <-cmdCh:
+				if !ok {
+					if sidecar {
+						cancel()
+					}
+					return
+				}
+				access.command(cmd)
+			}
+		}
+	}()
+
 	if sidecar {
 		ready := map[string]any{
 			"type":           "ready",
@@ -715,56 +828,68 @@ func serveMulti(ctx context.Context, slotConfigs map[string]*officialSlotConfig,
 		emitter.Emit(ready)
 	}
 	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 0, 4096), 64<<10)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			var cmd accessCommand
-			if json.Unmarshal([]byte(line), &cmd) != nil {
-				continue
-			}
-			if !sidecar &&
-				!strings.HasPrefix(cmd.Type, "access.relay.invite.") &&
-				!strings.HasPrefix(cmd.Type, "access.relay.client") &&
-				!strings.HasPrefix(cmd.Type, "access.network.") &&
-				!strings.HasPrefix(cmd.Type, "access.invite.") &&
-				!strings.HasPrefix(cmd.Type, "access.tunnel.") &&
-				cmd.Type != "access.client.access.set" &&
-				cmd.Type != "access.activity.set" &&
-				cmd.Type != "session.guest.respond" &&
-				cmd.Type != "session.guest.list" &&
-				cmd.Type != "session.collaborators" &&
-				!strings.HasPrefix(cmd.Type, "remote.") {
-				continue
-			}
-			switch {
-			case cmd.Type == "shutdown":
-				cancel()
-				return
-			case cmd.Type == "reload":
-				select {
-				case reloadNow <- struct{}{}:
-				default:
+		defer close(cmdCh)
+		reader := bufio.NewReaderSize(os.Stdin, 64<<10)
+		for {
+			raw, tooLong, readErr := readCommandLine(reader, maxSidecarLineBytes)
+			if tooLong {
+				if emitter != nil {
+					emitter.Emit(map[string]any{"type": "error", "error": "command line exceeds 2 MiB"})
 				}
-			case cmd.Type == "status":
-				emitter.Emit(map[string]any{
-					"type":           "status",
-					"active_channel": access.currentChannel(),
-					"online":         access.isOnline(),
-					"user_id":        access.userID(),
-					"device_id":      access.deviceID(),
-				})
-			case strings.HasPrefix(cmd.Type, "remote."):
-				go access.remoteCommand(cmd)
-			default:
-				access.command(cmd)
+				if readErr != nil {
+					break
+				}
+				continue
 			}
-		}
-		if sidecar {
-			cancel()
+			line := strings.TrimSpace(string(raw))
+			if line != "" {
+				var cmd accessCommand
+				if json.Unmarshal([]byte(line), &cmd) == nil {
+					allowed := sidecar ||
+						strings.HasPrefix(cmd.Type, "access.relay.invite.") ||
+						strings.HasPrefix(cmd.Type, "access.relay.client") ||
+						strings.HasPrefix(cmd.Type, "access.network.") ||
+						strings.HasPrefix(cmd.Type, "access.invite.") ||
+						strings.HasPrefix(cmd.Type, "access.tunnel.") ||
+						cmd.Type == "access.client.access.set" ||
+						cmd.Type == "access.activity.set" ||
+						cmd.Type == "session.guest.respond" ||
+						cmd.Type == "session.guest.list" ||
+						cmd.Type == "session.collaborators" ||
+						strings.HasPrefix(cmd.Type, "remote.")
+					if allowed {
+						switch {
+						case cmd.Type == "shutdown":
+							cancel()
+							return
+						case cmd.Type == "reload":
+							select {
+							case reloadNow <- struct{}{}:
+							default:
+							}
+						case cmd.Type == "status":
+							emitter.Emit(map[string]any{
+								"type":           "status",
+								"active_channel": access.currentChannel(),
+								"online":         access.isOnline(),
+								"user_id":        access.userID(),
+								"device_id":      access.deviceID(),
+							})
+						case strings.HasPrefix(cmd.Type, "remote."):
+							access.dispatchRemoteCommand(cmd)
+						default:
+							select {
+							case cmdCh <- cmd:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+				}
+			}
+			if readErr != nil {
+				break
+			}
 		}
 	}()
 	access.mu.Lock()

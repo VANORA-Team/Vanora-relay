@@ -20,14 +20,28 @@ const managementPrefix = "/v1/tunnels/"
 
 type httpHandler struct {
 	s         *Service
-	caKey     ed25519.PublicKey
+	caKeys    []ed25519.PublicKey
 	hasToken  bool
 	selfToken [sha256.Size]byte
 	limit     httpLimit
 }
 
 func NewHTTPHandler(service *Service, caKey ed25519.PublicKey, selfToken string) http.Handler {
-	return &httpHandler{s: service, caKey: append(ed25519.PublicKey(nil), caKey...),
+	var keys []ed25519.PublicKey
+	if len(caKey) > 0 {
+		keys = []ed25519.PublicKey{caKey}
+	}
+	return NewHTTPHandlerWithKeys(service, keys, selfToken)
+}
+
+func NewHTTPHandlerWithKeys(service *Service, caKeys []ed25519.PublicKey, selfToken string) http.Handler {
+	copied := make([]ed25519.PublicKey, 0, len(caKeys))
+	for _, k := range caKeys {
+		if len(k) > 0 {
+			copied = append(copied, append(ed25519.PublicKey(nil), k...))
+		}
+	}
+	return &httpHandler{s: service, caKeys: copied,
 		hasToken: selfToken != "", selfToken: sha256.Sum256([]byte(selfToken)),
 		limit: httpLimit{entries: make(map[string]*httpLimitEntry)}}
 }
@@ -316,7 +330,7 @@ func writeManagementError(w http.ResponseWriter, requestID string, err error) {
 	case ErrCFRateLimited:
 		status = http.StatusTooManyRequests
 		delay, _ = cfRateDelay(err)
-	case errMembershipUnavailable, ErrCFTransient, ErrCFAuthorization, ErrCFRejected, ErrCFConfigNotFound, ErrCFNotFound:
+	case ErrMembershipUnavailable, ErrCFTransient, ErrCFAuthorization, ErrCFRejected, ErrCFConfigNotFound, ErrCFNotFound:
 		status, delay = http.StatusServiceUnavailable, time.Second
 	}
 	writeHTTPError(w, status, code, requestID, delay, inProgress.OperationID)

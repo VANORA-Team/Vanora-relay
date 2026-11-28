@@ -11,10 +11,11 @@ import (
 )
 
 type TunnelHooks struct {
-	OnSessionStart func(ctx context.Context, scope, signalURL, relayToken string, send func(protocol.Message) error)
-	OnMessage      func(protocol.Message)
-	OnRevokeClient func(clientID string)
-	OnRevokeAll    func()
+	OnSessionStart  func(ctx context.Context, scope, signalURL, relayToken string, send func(protocol.Message) error)
+	OnMessage       func(protocol.Message)
+	OnRevokeClient  func(clientID string)
+	OnRevokeAll     func()
+	OnNetworkChange func()
 }
 
 func (s *Server) SetTunnelHooks(hooks TunnelHooks) { s.tunnelHooks.Store(&hooks) }

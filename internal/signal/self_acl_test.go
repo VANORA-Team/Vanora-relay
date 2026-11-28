@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -45,6 +46,72 @@ func newSelfDesktopPeer(t *testing.T, name string) (*peer, ed25519.PublicKey) {
 		pairTicket: "tkt-" + devID,
 	}
 	return p, pub
+}
+
+func TestActivityPollConcurrentWithDeviceOnline(t *testing.T) {
+	h := NewSelfHosted("", nil)
+	host, _ := newSelfDesktopPeer(t, "desk")
+	h.peers[host.id.DeviceID] = host
+	tr := h.ensureActivityTracker()
+	tr.devices[host.id.DeviceID] = &deviceActivityBook{updatedAt: time.Now()}
+	guestPub, guestPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guestID := mustSelfDeviceID(t, guestPub)
+	pub, proof := selfPollProof(t, guestPub, guestPriv, host.id.DeviceID, time.Now())
+	online := protocol.Message{Type: "device.online", Data: protocol.Encode(map[string]any{
+		"card": host.card, "guests": []string{guestID},
+	})}
+	if err := h.handle(host, online); err != nil {
+		t.Fatal(err)
+	}
+	<-host.out
+
+	const attempts = 1000
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	go func() {
+		<-start
+		for range attempts {
+			if err := h.handle(host, online); err != nil {
+				done <- err
+				return
+			}
+			<-host.out
+		}
+		done <- nil
+	}()
+	go func() {
+		<-start
+		path := "/v1/signal?activity=" + host.id.DeviceID
+		for attempt := range attempts {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.RemoteAddr = fmt.Sprintf("[2001:db8::%x]:1234", attempt+1)
+			req.Header.Set("X-Vanora-Public-Key", pub)
+			req.Header.Set("X-Vanora-Activity-Proof", proof)
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, req)
+			if response.Code != http.StatusOK {
+				done <- fmt.Errorf("activity poll returned %d: %s", response.Code, response.Body)
+				return
+			}
+		}
+		done <- nil
+	}()
+	close(start)
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-timeout.C:
+			t.Fatal("concurrent device registration and activity polls stalled")
+		}
+	}
 }
 
 // selfPollProof builds the signed activity.poll proof headers for a

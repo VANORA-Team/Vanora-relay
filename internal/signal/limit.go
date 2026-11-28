@@ -1,6 +1,7 @@
 package signal
 
 import (
+	"container/list"
 	"net/http"
 	"strconv"
 	"sync"
@@ -29,7 +30,6 @@ const (
 	tokenLockoutMax = 5 * time.Minute
 
 	gateMaxEntries = 8192
-	gateIdleTTL    = 10 * time.Minute
 )
 
 type gateState struct {
@@ -38,7 +38,8 @@ type gateState struct {
 	fails   int
 	failAt  time.Time
 	locked  time.Time
-	lockNum int
+	lockout time.Duration
+	recent  *list.Element
 }
 
 // unauthGate throttles tokenless HTTP surfaces per client IP and locks out
@@ -46,35 +47,26 @@ type gateState struct {
 // deliberately cheap: one mutex, one map lookup and a couple of float adds
 // per request, taken before any hub-level lock.
 type unauthGate struct {
-	mu   sync.Mutex
-	byIP map[string]*gateState
+	mu     sync.Mutex
+	byIP   map[string]*gateState
+	recent list.List
 }
 
-func newUnauthGate() unauthGate {
-	return unauthGate{byIP: make(map[string]*gateState)}
+func newUnauthGate() *unauthGate {
+	return &unauthGate{byIP: make(map[string]*gateState)}
 }
 
 func (g *unauthGate) stateFor(ip string, now time.Time) *gateState {
 	st, ok := g.byIP[ip]
 	if !ok {
 		if len(g.byIP) >= gateMaxEntries {
-			for key, cand := range g.byIP {
-				if now.Sub(cand.last) > gateIdleTTL && now.After(cand.locked) {
-					delete(g.byIP, key)
-				}
-			}
-			if len(g.byIP) >= gateMaxEntries {
-				// Still full of hot entries: drop cold locked ones. If even
-				// that fails the map keeps a bounded 2x overshoot at most.
-				for key, cand := range g.byIP {
-					if now.After(cand.locked) {
-						delete(g.byIP, key)
-					}
-				}
-			}
+			oldest := g.recent.Back()
+			delete(g.byIP, g.recent.Remove(oldest).(string))
 		}
-		st = &gateState{tokens: unauthBurst}
+		st = &gateState{tokens: unauthBurst, last: now, recent: g.recent.PushFront(ip)}
 		g.byIP[ip] = st
+	} else {
+		g.recent.MoveToFront(st.recent)
 	}
 	return st
 }
@@ -109,7 +101,11 @@ func (g *unauthGate) tokenLocked(ip string, now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st, ok := g.byIP[ip]
-	return ok && now.Before(st.locked)
+	if ok {
+		g.recent.MoveToFront(st.recent)
+		return now.Before(st.locked)
+	}
+	return false
 }
 
 // recordTokenFailure registers a failed bearer-token attempt for ip. It
@@ -131,14 +127,9 @@ func (g *unauthGate) recordTokenFailure(ip string, now time.Time) bool {
 	st.failAt = now
 	st.fails++
 	if st.fails >= tokenFailThreshold {
-		st.lockNum++
-		d := tokenLockout << (st.lockNum - 1)
-		if d > tokenLockoutMax {
-			d = tokenLockoutMax
-		}
-		st.locked = now.Add(d)
+		st.lockout = min(tokenLockoutMax, max(tokenLockout, 2*st.lockout))
+		st.locked = now.Add(st.lockout)
 		st.fails = 0
-		st.lockNum = st.lockNum % 4
 		return true
 	}
 	return false

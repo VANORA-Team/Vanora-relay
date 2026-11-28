@@ -4,6 +4,25 @@ const labelPattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const jtiPattern = /^[A-Za-z0-9_-]{1,128}(?![\s\S])/;
 const ticketPattern = /^[0-9]{10}-[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const utf8 = new TextEncoder();
+const verificationKeys = new Map();
+const maxVerificationKeys = 4;
+
+async function verificationKey(secret) {
+  const cached = verificationKeys.get(secret);
+  if (cached) {
+    return cached;
+  }
+  const bytes = utf8.encode(secret);
+  if (bytes.length < 32) {
+    return null;
+  }
+  const key = await crypto.subtle.importKey("raw", bytes, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!verificationKeys.has(secret) && verificationKeys.size >= maxVerificationKeys) {
+    verificationKeys.delete(verificationKeys.keys().next().value);
+  }
+  verificationKeys.set(secret, key);
+  return key;
+}
 
 export async function verifyTicket(request, env, now = Math.floor(Date.now() / 1000)) {
   if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
@@ -35,12 +54,8 @@ export async function verifyTicket(request, env, now = Math.floor(Date.now() / 1
   const input = utf8.encode(`${hostname}|${path}|${jti}|${timestamp}`);
   const secrets = env.EDGE_PREV_KEY ? [env.EDGE_KEY, env.EDGE_PREV_KEY] : [env.EDGE_KEY];
   const matches = await Promise.all(secrets.map(async secret => {
-    const bytes = utf8.encode(secret);
-    if (bytes.length < 32) {
-      return false;
-    }
-    const key = await crypto.subtle.importKey("raw", bytes, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-    return crypto.subtle.verify("HMAC", key, signature, input);
+    const key = await verificationKey(secret);
+    return key !== null && crypto.subtle.verify("HMAC", key, signature, input);
   }));
   return matches.includes(true);
 }

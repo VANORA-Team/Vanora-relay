@@ -177,9 +177,37 @@ func runStoreTests(t *testing.T, store *Store) {
 	t.Run("same device", func(t *testing.T) { testConcurrentDevice(t, store) })
 	t.Run("quota", func(t *testing.T) { testConcurrentQuota(t, store) })
 	t.Run("work fence and lifecycle", func(t *testing.T) { testWorkAndLifecycle(t, store) })
+	t.Run("work priority", func(t *testing.T) { testWorkPriority(t, store) })
 	t.Run("reconcile repair and recovery", func(t *testing.T) { testRecovery(t, store) })
 	t.Run("proof idempotency and pruning", func(t *testing.T) { testProofAndPrune(t, store) })
 	t.Run("observations", func(t *testing.T) { testObservations(t, store) })
+}
+
+func testWorkPriority(t *testing.T, store *Store) {
+	scope := ensureTestScope(t, store, 0)
+	var ready []cftunnel.Allocation
+	for _, device := range []string{"release", "repair", "disconnect"} {
+		create := provision(scope, device, device)
+		claim(t, store, create, basePolicy)
+		complete(t, store, scope, testNow, cftunnel.StateReady, &cftunnel.Resources{
+			TunnelID: device + "-tunnel", DNSRecordID: device + "-dns",
+		})
+		ready = append(ready, allocation(t, store, create.AllocationKey))
+	}
+	release := transition(ready[0], cftunnel.OpRelease, testNow.Add(time.Second))
+	release.ProtectPresence = true
+	releaseOp := claim(t, store, release, basePolicy)
+	repairOp := claim(t, store, transition(ready[1], cftunnel.OpRepair, testNow.Add(2*time.Second)), basePolicy)
+	create := provision(scope, "new", "new")
+	create.Now = testNow.Add(3 * time.Second)
+	provisionOp := claim(t, store, create, basePolicy)
+	disconnectOp := claim(t, store, transition(ready[2], cftunnel.OpDisconnect, testNow.Add(4*time.Second)), basePolicy)
+	for _, want := range []cftunnel.Operation{disconnectOp, provisionOp, releaseOp, repairOp} {
+		got := acquire(t, store, scope, "worker", testNow.Add(5*time.Second), time.Minute)
+		if got.ID != want.ID {
+			t.Fatalf("work item %s acquired before %s", got.Type, want.Type)
+		}
+	}
 }
 
 func testSchemaAndScope(t *testing.T, store *Store) {

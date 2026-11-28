@@ -129,10 +129,11 @@ func ResolveAt(ctx context.Context, client *http.Client, u *url.URL, code string
 	if err != nil {
 		return "", err
 	}
-	query := u.Query()
+	target := *u
+	query := target.Query()
 	query.Set("pairing", locator)
-	u.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	target.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return "", err
 	}

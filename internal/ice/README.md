@@ -109,7 +109,7 @@ hook.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `STUN_URLS` | `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478` | Comma-separated `stun:host[:port]` URLs. Use `local` to advertise the in-process STUN server. |
+| `STUN_URLS` | Channel-specific | Comma-separated `stun:host[:port]` URLs. Use `local` to advertise the in-process STUN server. |
 | `TURN_PUBLIC_IP` | *(required)* | Public IPv4 advertised in TURN URLs and relay addresses, and in the STUN URL when `STUN_URLS=local`. |
 | `TURN_BIND_IP` | `0.0.0.0` | Local IPv4 for the UDP/TCP control listeners. |
 | `TURN_RELAY_BIND_IP` | `TURN_BIND_IP` | Local IPv4 the relay sockets bind to. |
@@ -122,12 +122,19 @@ hook.
 | `TURN_MAX_GRANTS` | `4096` | Maximum concurrent grants globally (`1..1000000`). |
 | `TURN_MAX_GRANTS_PER_VISITOR` | `min(32, max(1, TURN_MAX_GRANTS/2))` | Maximum concurrent active grants per visitor (`1..TURN_MAX_GRANTS`). |
 | `TURN_MAX_ALLOCATIONS_PER_GRANT` | `8` | Maximum allocations per credential (desktop + phone + retries, `1..1024`). |
+| `TURN_MAX_BYTES_PER_SEC` | `0` | Combined ingress and egress byte rate across a grant's relay sockets. `0` is unlimited. |
+| `TURN_MAX_VISITOR_BYTES_PER_SEC` | `0` | Combined ingress and egress byte rate across all active grants for a visitor. `0` is unlimited. |
 | `TURN_LOG_LEVEL` | `error` | `disabled`, `error`, `warn`, `info`, `debug`, or `trace`. Pion's `PION_LOG_*` variables may add per-package detail. |
 
 The STUN list goes to both endpoints in `ice.config`. Clients gather candidates
-from the configured servers in parallel. To use overseas public STUN, set
-`STUN_URLS=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302`.
-Domestic and overseas URLs can also be combined in one list.
+from the configured servers in parallel. Without `STUN_URLS`, `RELAY_CHANNEL=cn`
+and an unset channel use `stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478`.
+The `global` channel uses `stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302`.
+The `self` channel uses the in-process STUN server.
+
+When bandwidth limits are enabled, the server drops datagrams that exceed
+either limit. Each bucket permits a burst of at least 64 KiB so it can admit
+a full-size datagram.
 
 TURN URLs advertise `TURN_PUBLIC_IP:TURN_PORT`. Deployments behind NAT must
 forward the control port and relay range to this instance.

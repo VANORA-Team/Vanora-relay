@@ -16,9 +16,12 @@ import (
 )
 
 const (
-	protocolQUIC  = "quic"
-	protocolHTTP2 = "http2"
-	readyMessage  = "Registered tunnel connection"
+	protocolQUIC            = "quic"
+	protocolHTTP2           = "http2"
+	readyMessage            = "Registered tunnel connection"
+	maxConsecutiveFailures  = 5
+	quicProbeAfterHealthy   = 5 * time.Minute
+	http2FailuresBeforeQUIC = 3
 )
 
 type ConnectorOptions struct {
@@ -40,10 +43,11 @@ type ConnectorEvent struct {
 }
 
 type Connector struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	events chan ConnectorEvent
-	ready  atomic.Bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	stateEvents chan ConnectorEvent
+	logEvents   chan ConnectorEvent
+	ready       atomic.Bool
 }
 
 type processControl struct {
@@ -104,7 +108,8 @@ func startConnector(ctx context.Context, opts ConnectorOptions, argsPrefix []str
 	ctx, cancel := context.WithCancel(ctx)
 	connector := &Connector{cancel: cancel, done: make(chan struct{})}
 	if opts.Observe != nil {
-		connector.events = make(chan ConnectorEvent, 128)
+		connector.stateEvents = make(chan ConnectorEvent, 64)
+		connector.logEvents = make(chan ConnectorEvent, 128)
 	}
 	child, err := connector.launch(binary, opts, argsPrefix, protocolQUIC)
 	if err != nil {
@@ -112,14 +117,43 @@ func startConnector(ctx context.Context, opts ConnectorOptions, argsPrefix []str
 		return nil, err
 	}
 	if opts.Observe != nil {
-		go func() {
-			for event := range connector.events {
-				opts.Observe(event)
-			}
-		}()
+		go connector.deliverEvents(opts.Observe)
 	}
 	go connector.supervise(ctx, binary, opts, argsPrefix, child)
 	return connector, nil
+}
+
+func (c *Connector) deliverEvents(observe func(ConnectorEvent)) {
+	stateCh, logCh := c.stateEvents, c.logEvents
+	for stateCh != nil || logCh != nil {
+		// Always prioritize lifecycle state transitions over diagnostic log bursts.
+		if stateCh != nil {
+			select {
+			case event, ok := <-stateCh:
+				if !ok {
+					stateCh = nil
+					continue
+				}
+				observe(event)
+				continue
+			default:
+			}
+		}
+		select {
+		case event, ok := <-stateCh:
+			if !ok {
+				stateCh = nil
+				continue
+			}
+			observe(event)
+		case event, ok := <-logCh:
+			if !ok {
+				logCh = nil
+				continue
+			}
+			observe(event)
+		}
+	}
 }
 
 func (c *Connector) Ready() bool { return c.ready.Load() }
@@ -129,9 +163,22 @@ func (c *Connector) Stop() {
 	<-c.done
 }
 
-func (c *Connector) emit(event ConnectorEvent) {
+func (c *Connector) emitState(event ConnectorEvent) {
+	if c.stateEvents == nil {
+		return
+	}
 	select {
-	case c.events <- event:
+	case c.stateEvents <- event:
+	default:
+	}
+}
+
+func (c *Connector) emitLog(event ConnectorEvent) {
+	if c.logEvents == nil {
+		return
+	}
+	select {
+	case c.logEvents <- event:
 	default:
 	}
 }
@@ -165,7 +212,7 @@ func (c *Connector) launch(binary string, opts ConnectorOptions, prefix []string
 		processControl: process, output: output, exited: make(chan struct{}),
 		ready: make(chan struct{}, 1), logs: make(chan struct{}),
 	}
-	c.emit(ConnectorEvent{Protocol: protocol, State: "starting"})
+	c.emitState(ConnectorEvent{Protocol: protocol, State: "starting"})
 	go func() {
 		child.wait()
 		close(child.exited)
@@ -179,22 +226,44 @@ func (c *Connector) launch(binary string, opts ConnectorOptions, prefix []string
 
 func (c *Connector) supervise(ctx context.Context, binary string, opts ConnectorOptions, prefix []string, child *connectorChild) {
 	defer close(c.done)
-	if c.events != nil {
-		defer close(c.events)
+	if c.stateEvents != nil {
+		defer close(c.stateEvents)
+	}
+	if c.logEvents != nil {
+		defer close(c.logEvents)
 	}
 	protocol, backoff := protocolQUIC, opts.BackoffMin
+	consecutiveFailures, http2Failures := 0, 0
 	for {
 		if child != nil {
-			state, wasReady := c.watch(ctx, child, opts.StartupTimeout, protocol)
+			state, wasReady, readyDuration := c.watch(ctx, child, opts.StartupTimeout, protocol)
 			c.ready.Store(false)
 			child.stop(child.exited, opts.StopGrace)
 			<-child.exited
 			child.drainLogs()
-			c.emit(ConnectorEvent{Protocol: protocol, State: state})
+			c.emitState(ConnectorEvent{Protocol: protocol, State: state})
 			if wasReady {
 				backoff = opts.BackoffMin
-			} else if protocol == protocolQUIC {
-				protocol = protocolHTTP2
+				consecutiveFailures = 0
+				http2Failures = 0
+				if protocol == protocolHTTP2 && readyDuration >= quicProbeAfterHealthy {
+					protocol = protocolQUIC
+				}
+			} else if ctx.Err() == nil {
+				consecutiveFailures++
+				if protocol == protocolQUIC {
+					protocol = protocolHTTP2
+				} else {
+					http2Failures++
+					if http2Failures >= http2FailuresBeforeQUIC {
+						protocol = protocolQUIC
+						http2Failures = 0
+					}
+				}
+				if consecutiveFailures >= maxConsecutiveFailures {
+					c.emitState(ConnectorEvent{Protocol: protocol, State: "failed"})
+					return
+				}
 			}
 		}
 		if ctx.Err() != nil {
@@ -211,7 +280,12 @@ func (c *Connector) supervise(ctx context.Context, binary string, opts Connector
 		var err error
 		child, err = c.launch(binary, opts, prefix, protocol)
 		if err != nil {
-			c.emit(ConnectorEvent{Protocol: protocol, State: "start_failed"})
+			consecutiveFailures++
+			c.emitState(ConnectorEvent{Protocol: protocol, State: "start_failed"})
+			if consecutiveFailures >= maxConsecutiveFailures {
+				c.emitState(ConnectorEvent{Protocol: protocol, State: "failed"})
+				return
+			}
 		}
 	}
 }
@@ -228,25 +302,26 @@ func (child *connectorChild) drainLogs() {
 	}
 }
 
-func (c *Connector) watch(ctx context.Context, child *connectorChild, timeout time.Duration, protocol string) (string, bool) {
+func (c *Connector) watch(ctx context.Context, child *connectorChild, timeout time.Duration, protocol string) (string, bool, time.Duration) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-child.ready:
 		c.ready.Store(true)
-		c.emit(ConnectorEvent{Protocol: protocol, State: "ready"})
+		c.emitState(ConnectorEvent{Protocol: protocol, State: "ready"})
 	case <-child.exited:
-		return "exited", false
+		return "exited", false, 0
 	case <-timer.C:
-		return "startup_timeout", false
+		return "startup_timeout", false, 0
 	case <-ctx.Done():
-		return "stopped", false
+		return "stopped", false, 0
 	}
+	readyAt := time.Now()
 	select {
 	case <-child.exited:
-		return "exited", true
+		return "exited", true, time.Since(readyAt)
 	case <-ctx.Done():
-		return "stopped", true
+		return "stopped", true, time.Since(readyAt)
 	}
 }
 
@@ -276,7 +351,7 @@ func (c *Connector) readLogs(child *connectorChild, opts ConnectorOptions, proto
 			if sensitiveLog.MatchString(line) {
 				line = "[redacted connector diagnostic]"
 			}
-			c.emit(ConnectorEvent{Protocol: protocol, State: "log", Line: line})
+			c.emitLog(ConnectorEvent{Protocol: protocol, State: "log", Line: line})
 		}
 		discard = false
 		if err != nil {

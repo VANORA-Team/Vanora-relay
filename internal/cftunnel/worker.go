@@ -23,6 +23,13 @@ type operationFailure struct {
 func (e operationFailure) Error() string { return e.cause.Error() }
 func (e operationFailure) Unwrap() error { return e.cause }
 
+func (s *Service) WakeWorker() {
+	select {
+	case s.workWake <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Service) RunWorker(ctx context.Context, workerID string) error {
 	if workerID == "" {
 		return ErrInvalidClaim

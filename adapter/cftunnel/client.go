@@ -14,12 +14,20 @@ import (
 
 	"vanora-relay/adapter/transport"
 	"vanora-relay/endpoint"
+	"vanora-relay/internal/dialretry"
 	"vanora-relay/internal/identity"
 	"vanora-relay/internal/strictjson"
 	"vanora-relay/protocol"
 )
 
 var ErrTunnelUnavailable = errors.New("cftunnel: managed tunnel unavailable")
+
+const (
+	maintainMinInterval    = 11 * time.Second
+	maintainMaxInterval    = 20 * time.Second
+	maintainRefreshMargin  = 15 * time.Second
+	maintainTransientRetry = 5 * time.Second
+)
 
 type SelfConnectOptions struct {
 	SignalURL     string
@@ -67,11 +75,15 @@ type visitorSession struct {
 	httpClient   *http.Client
 	credentials  *endpoint.Credentials
 	proof        endpoint.LeaseProof
+	leaseUntil   time.Time
 	domain       signalDomain
 	connectionID string
 	nonce        string
 	ws           *websocket.Conn
 	writeMu      sync.Mutex
+	expiryMu     sync.Mutex
+	accessUntil  time.Time
+	expiryWake   chan struct{}
 }
 
 func ConnectSelf(ctx context.Context, opts SelfConnectOptions) (transport.Peer, error) {
@@ -97,7 +109,8 @@ func ConnectSelfDeferred(ctx context.Context, opts SelfConnectOptions) (transpor
 	session := &visitorSession{signalURL: opts.SignalURL, selfToken: opts.SelfToken, privateKey: key,
 		local: identity.Principal{DeviceID: device, Subject: device, PublicKey: pub}, channel: "self",
 		hostID: host, hostKey: slices.Clone(opts.HostPublicKey), owner: host, role: opts.Role,
-		allows: opts.Allows, handler: opts.Handler, dialURL: opts.DialURL, httpClient: opts.HTTPClient}
+		allows: opts.Allows, handler: opts.Handler, dialURL: opts.DialURL, httpClient: opts.HTTPClient,
+		expiryWake: make(chan struct{}, 1)}
 	return session.connect(ctx)
 }
 
@@ -118,32 +131,39 @@ func ConnectOfficialDeferred(ctx context.Context, opts OfficialConnectOptions) (
 	defer cancel()
 	session := &visitorSession{signalURL: opts.SignalURL, channel: opts.Channel, hostID: opts.HostDeviceID,
 		hostKey: slices.Clone(opts.HostPublicKey), owner: opts.OwnerID, role: opts.Role, ca: slices.Clone(opts.CA),
-		source: opts.LeaseSource, allows: opts.Allows, handler: opts.Handler, dialURL: opts.DialURL, httpClient: opts.HTTPClient}
-	creds, proof, principal, err := session.current(ctx)
+		source: opts.LeaseSource, allows: opts.Allows, handler: opts.Handler, dialURL: opts.DialURL,
+		httpClient: opts.HTTPClient, expiryWake: make(chan struct{}, 1)}
+	creds, proof, principal, leaseUntil, err := session.current(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	session.credentials, session.proof, session.local = creds, proof, principal
+	session.credentials, session.proof, session.local, session.leaseUntil = creds, proof, principal, leaseUntil
 	session.privateKey = creds.PrivateKey()
 	return session.connect(ctx)
 }
 
-func (s *visitorSession) current(ctx context.Context) (*endpoint.Credentials, endpoint.LeaseProof, identity.Principal, error) {
+func (s *visitorSession) current(ctx context.Context) (*endpoint.Credentials, endpoint.LeaseProof, identity.Principal, time.Time, error) {
 	creds, proof, err := s.source.Current(ctx)
 	if err != nil || creds == nil || !s.ca.Equal(creds.CA()) || creds.Certificate() != proof.Certificate {
-		return nil, endpoint.LeaseProof{}, identity.Principal{}, errors.New("cftunnel: visitor authority unavailable")
+		return nil, endpoint.LeaseProof{}, identity.Principal{}, time.Time{}, errors.New("cftunnel: visitor authority unavailable")
 	}
 	now := time.Now()
 	p, err := identity.VerifyCertificate(proof.Certificate, s.ca, now)
-	if err != nil || !p.Expires.After(now) || p.DeviceID != creds.DeviceID() || !p.PublicKey.Equal(creds.PublicKey()) ||
-		proof.Lease == "" || !validPresentedLease(s.ca, proof.Certificate, proof.Lease, p, now) {
-		return nil, endpoint.LeaseProof{}, identity.Principal{}, errors.New("cftunnel: visitor lease rejected")
+	if err != nil || !p.Expires.After(now) || p.DeviceID != creds.DeviceID() || !p.PublicKey.Equal(creds.PublicKey()) || proof.Lease == "" {
+		return nil, endpoint.LeaseProof{}, identity.Principal{}, time.Time{}, errors.New("cftunnel: visitor lease rejected")
+	}
+	leaseUntil, err := identity.VerifyEndpointLease(proof.Lease, s.ca, now, proof.Certificate, p)
+	if err != nil || !leaseUntil.After(now) {
+		return nil, endpoint.LeaseProof{}, identity.Principal{}, time.Time{}, errors.New("cftunnel: visitor lease rejected")
+	}
+	if p.Expires.Before(leaseUntil) {
+		leaseUntil = p.Expires
 	}
 	if s.local.DeviceID != "" && (p.DeviceID != s.local.DeviceID || p.RemoteUserID() != s.local.RemoteUserID() ||
 		!p.PublicKey.Equal(s.local.PublicKey)) {
-		return nil, endpoint.LeaseProof{}, identity.Principal{}, transport.ErrIdentityChanged
+		return nil, endpoint.LeaseProof{}, identity.Principal{}, time.Time{}, transport.ErrIdentityChanged
 	}
-	return creds, proof, p, nil
+	return creds, proof, p, leaseUntil, nil
 }
 
 func (s *visitorSession) connect(ctx context.Context) (transport.Peer, func(), error) {
@@ -191,6 +211,7 @@ func (s *visitorSession) connect(ctx context.Context) (transport.Peer, func(), e
 	if err != nil {
 		return nil, nil, err
 	}
+	s.setAccessUntil(options.AccessUntil)
 	dialCtx, stop := context.WithDeadline(setup, options.AccessUntil)
 	defer stop()
 	conn, start, err := DialDeferred(dialCtx, options)
@@ -198,7 +219,8 @@ func (s *visitorSession) connect(ctx context.Context) (transport.Peer, func(), e
 		return nil, nil, err
 	}
 	peer := conn.(*Peer)
-	context.AfterFunc(peer.ctx, func() { _ = s.ws.CloseNow() })
+	peer.setOnClose(func() { _ = s.ws.CloseNow() })
+	context.AfterFunc(peer.ctx, func() { peer.Close() })
 	ready = true
 	return peer, sync.OnceFunc(func() {
 		if peer.ctx.Err() == nil {
@@ -209,21 +231,47 @@ func (s *visitorSession) connect(ctx context.Context) (transport.Peer, func(), e
 }
 
 func (s *visitorSession) login(ctx context.Context) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		retry, err := s.loginOnce(ctx)
+		if err == nil || !retry || attempt > 0 {
+			return err
+		}
+		timer := time.NewTimer(1300 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return errors.New("cftunnel: signaling authentication failed")
+}
+
+func (s *visitorSession) loginOnce(ctx context.Context) (bool, error) {
 	var client http.Client
 	if s.httpClient != nil {
 		client = *s.httpClient
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	headers := make(http.Header)
+	headers.Set("X-Vanora-Tunnel-Availability", "1")
 	if s.channel == "self" {
 		headers.Set("Authorization", "Bearer "+s.selfToken)
 	}
-	ws, response, err := websocket.Dial(ctx, s.signalURL, &websocket.DialOptions{HTTPClient: &client, HTTPHeader: headers})
-	if err != nil {
-		if response != nil {
-			_ = response.Body.Close()
+	var ws *websocket.Conn
+	err := dialretry.Dial(ctx, func() error {
+		conn, response, dialErr := websocket.Dial(ctx, s.signalURL, &websocket.DialOptions{HTTPClient: &client, HTTPHeader: headers})
+		if dialErr != nil {
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			return dialErr
 		}
-		return errors.New("cftunnel: signaling connection failed")
+		ws = conn
+		return nil
+	})
+	if err != nil {
+		return false, errors.New("cftunnel: signaling connection failed")
 	}
 	ok := false
 	defer func() {
@@ -235,7 +283,7 @@ func (s *visitorSession) login(ctx context.Context) error {
 	ws.SetReadLimit(64 << 10)
 	challenge, err := s.read(ctx)
 	if err != nil || challenge.Type != "auth.challenge" || !protocol.ValidID(challenge.Connection) {
-		return errors.New("cftunnel: invalid signaling challenge")
+		return false, errors.New("cftunnel: invalid signaling challenge")
 	}
 	var login protocol.Message
 	if s.channel == "self" {
@@ -248,14 +296,22 @@ func (s *visitorSession) login(ctx context.Context) error {
 		login, err = s.credentials.LoginTunnelFor(challenge, s.role, s.proof.Lease, s.hostID)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := s.write(ctx, login); err != nil {
-		return err
+		return false, err
 	}
 	reply, err := s.read(ctx)
-	if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
-		return transport.SignalError("device_unavailable")
+	var closeErr websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr.Code == websocket.StatusPolicyViolation {
+		switch closeErr.Reason {
+		case "endpoint already connected":
+			return true, transport.SignalError("device_unavailable")
+		case "access_denied", "access_revoked", "authorization_expired", "unauthorized", "invalid_credentials", "device_revoked":
+			return false, transport.ErrUnauthorized
+		default:
+			return false, transport.SignalError("device_unavailable")
+		}
 	}
 	var accepted struct {
 		Device string `json:"device_id"`
@@ -265,18 +321,18 @@ func (s *visitorSession) login(ctx context.Context) error {
 	}
 	if err != nil || reply.Type != "auth.ok" || strictjson.Decode(reply.Data, &accepted) != nil ||
 		accepted.Device != s.local.DeviceID {
-		return errors.New("cftunnel: signaling authentication failed")
+		return false, errors.New("cftunnel: signaling authentication failed")
 	}
 	if s.channel == "self" && accepted.Mode != "self" ||
 		s.channel != "self" && (accepted.Mode != "" || accepted.User != s.local.RemoteUserID()) {
-		return errors.New("cftunnel: signaling identity mismatch")
+		return false, errors.New("cftunnel: signaling identity mismatch")
 	}
 	if !tunnelIdentifier.MatchString(accepted.Scope) {
-		return ErrTunnelUnavailable
+		return false, ErrTunnelUnavailable
 	}
 	s.domain = signalDomain{tunnelAudience, accepted.Scope}
 	ok = true
-	return nil
+	return false, nil
 }
 
 func (s *visitorSession) read(ctx context.Context) (protocol.Message, error) {
@@ -329,7 +385,7 @@ func (s *visitorSession) readTarget(ctx context.Context) (protocol.Message, erro
 				return m, transport.SignalError("tunnel_released")
 			}
 			if string(m.Data) == `"tunnel_unavailable"` {
-				return m, ErrTunnelUnavailable
+				return m, errors.Join(ErrTunnelUnavailable, transport.SignalError("device_unavailable"))
 			}
 			return m, transport.SignalError("device_unavailable")
 		}
@@ -383,7 +439,42 @@ func (s *visitorSession) targetOptions(m protocol.Message) (DialOptions, error) 
 		VisitorKeyHash: body.VisitorKeyHash, VisitorRole: s.role,
 	}, PrivateKey: s.privateKey, HostPublicKey: s.hostKey, UserID: userID,
 		AccessUntil: target.AccessUntil, Allows: s.allows, Handler: s.handler, DialURL: s.dialURL,
-		EdgeTicket: target.EdgeTicket, CA: s.ca, LocalPrincipal: s.local, RemotePrincipal: remote, LocalLeaseProvider: provider}, nil
+		HTTPClient: s.httpClient, EdgeTicket: target.EdgeTicket, CA: s.ca, LocalPrincipal: s.local,
+		RemotePrincipal: remote, LocalLeaseProvider: provider}, nil
+}
+
+func (s *visitorSession) setAccessUntil(until time.Time) {
+	s.expiryMu.Lock()
+	if until.After(s.accessUntil) {
+		s.accessUntil = until
+	}
+	s.expiryMu.Unlock()
+	if s.expiryWake != nil {
+		select {
+		case s.expiryWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *visitorSession) nextMaintainDelay(now time.Time) time.Duration {
+	s.expiryMu.Lock()
+	earliest := s.accessUntil
+	if !s.leaseUntil.IsZero() && (earliest.IsZero() || s.leaseUntil.Before(earliest)) {
+		earliest = s.leaseUntil
+	}
+	s.expiryMu.Unlock()
+	if earliest.IsZero() {
+		return maintainMaxInterval
+	}
+	delay := earliest.Sub(now) - maintainRefreshMargin
+	if delay < maintainMinInterval {
+		return maintainMinInterval
+	}
+	if delay > maintainMaxInterval {
+		return maintainMaxInterval
+	}
+	return delay
 }
 
 func (s *visitorSession) maintain(peer *Peer, binding ConnectionContext) {
@@ -392,7 +483,7 @@ func (s *visitorSession) maintain(peer *Peer, binding ConnectionContext) {
 		peer.Close()
 		_ = s.ws.CloseNow()
 	}()
-	timer := time.NewTimer(20 * time.Second)
+	timer := time.NewTimer(s.nextMaintainDelay(time.Now()))
 	defer timer.Stop()
 	seq := uint64(1)
 	for {
@@ -401,22 +492,33 @@ func (s *visitorSession) maintain(peer *Peer, binding ConnectionContext) {
 			return
 		case <-timer.C:
 		}
+		var proof endpoint.LeaseProof
 		if s.channel != "self" {
 			ctx, cancel := context.WithTimeout(peer.ctx, 8*time.Second)
-			_, proof, _, err := s.current(ctx)
+			_, nextProof, _, leaseUntil, err := s.current(ctx)
 			cancel()
 			if err != nil {
-				peer.AuthorityLost()
-				timer.Reset(20 * time.Second)
+				now := time.Now()
+				s.expiryMu.Lock()
+				expiring := s.leaseUntil.IsZero() || !now.Add(maintainTransientRetry).Before(s.leaseUntil)
+				s.expiryMu.Unlock()
+				if errors.Is(err, transport.ErrIdentityChanged) || expiring {
+					peer.AuthorityLost()
+					return
+				}
+				timer.Reset(maintainTransientRetry)
 				continue
 			}
+			proof = nextProof
+			s.expiryMu.Lock()
+			s.leaseUntil = leaseUntil
+			s.expiryMu.Unlock()
 			if err := s.write(peer.ctx, protocol.Message{Type: "auth.lease", Data: protocol.Encode(proof)}); err != nil {
 				return
 			}
-			if err := peer.UpdateLocalLease(proof); err != nil {
-				return
-			}
 		}
+		// Refresh signaling access before pushing the data-plane lease update so edge
+		// backpressure cannot starve signaling access renewal.
 		seq++
 		body := struct {
 			signalDomain
@@ -426,7 +528,12 @@ func (s *visitorSession) maintain(peer *Peer, binding ConnectionContext) {
 		if err := s.signAndSend(peer.ctx, "tunnel.refresh", seq, body); err != nil {
 			return
 		}
-		timer.Reset(20 * time.Second)
+		if s.channel != "self" {
+			if err := peer.UpdateLocalLease(proof); err != nil {
+				return
+			}
+		}
+		timer.Reset(s.nextMaintainDelay(time.Now()))
 	}
 }
 
@@ -449,6 +556,7 @@ func (s *visitorSession) readUpdates(peer *Peer, binding ConnectionContext) {
 				access.Incarnation == binding.Incarnation && access.RuntimeID == binding.RuntimeID &&
 				access.JTI == binding.JTI {
 				if until := boundedAccessUntil(access.AccessUntil, time.Now()); !until.IsZero() {
+					s.setAccessUntil(until)
 					peer.UpdateAccessUntil(until)
 				}
 			}

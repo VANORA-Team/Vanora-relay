@@ -3,12 +3,18 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vanora-relay/internal/cftunnel"
@@ -27,13 +33,73 @@ type relayNetwork interface {
 
 type relayStartup struct {
 	key                      ed25519.PublicKey
+	keys                     []ed25519.PublicKey
 	allowedIssuer, selfToken string
 	membership               *membership.Client
 	pushURL, pushToken       string
+	metricsToken             string
+	maxSlots, workers        int
+	startupCtx               context.Context
 	openStore                func(context.Context, cftunnel.Config) (cftunnel.Store, error)
 	newCloudflare            func(cftunnel.Config) (cftunnel.Cloudflare, error)
 	newNetwork               func() (relayNetwork, error)
 	canaryClient             *http.Client
+}
+
+type relayServer struct {
+	http.Handler
+	hub      *relay.Hub
+	cancel   context.CancelFunc
+	draining atomic.Bool
+}
+
+func (s *relayServer) drain(ctx context.Context) {
+	s.draining.Store(true)
+	if s.hub != nil {
+		s.hub.Drain(ctx)
+	}
+}
+
+func (s *relayServer) ready(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if s.draining.Load() {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintln(w, "ok")
+}
+
+func (s *relayServer) metricsHandler(metrics *cftunnel.Metrics, token string) http.HandlerFunc {
+	tokenHash := sha256.Sum256([]byte(token))
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		remote, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			remote = r.RemoteAddr
+		}
+		addr, _ := netip.ParseAddr(remote)
+		local := addr.Unmap().IsLoopback() &&
+			len(r.Header.Values("X-Forwarded-For")) == 0 && len(r.Header.Values("Forwarded")) == 0 &&
+			len(r.Header.Values("X-Real-IP")) == 0 && len(r.Header.Values("CF-Connecting-IP")) == 0
+		if !local {
+			raw, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			presented := sha256.Sum256([]byte(raw))
+			if token == "" || !bearer || subtle.ConstantTimeCompare(tokenHash[:], presented[:]) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		data := struct {
+			Tunnel cftunnel.MetricsSnapshot `json:"tunnel"`
+			Signal relay.MetricsSnapshot    `json:"signal"`
+		}{Tunnel: metrics.Snapshot()}
+		if s.hub != nil {
+			data.Signal = s.hub.Metrics()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(data)
+	}
 }
 
 func openTunnelStore(ctx context.Context, cfg cftunnel.Config) (cftunnel.Store, error) {
@@ -43,11 +109,16 @@ func openTunnelStore(ctx context.Context, cfg cftunnel.Config) (cftunnel.Store, 
 	return sqlstore.OpenSQLite(ctx, cfg.SQLitePath, sqlstore.Options{})
 }
 
-func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup) (http.Handler, func(), error) {
+func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup) (*relayServer, func(), error) {
 	if cfg.Process == cftunnel.ProcessControl && (cfg.Mode == cftunnel.ModeOff || cfg.Store != cftunnel.StorePostgres) {
 		return nil, nil, errors.New("RELAY_TUNNEL_PROCESS=control requires enabled tunnels and PostgreSQL")
 	}
 	ctx, cancel := context.WithCancel(parent)
+	startupCtx := opts.startupCtx
+	if startupCtx == nil {
+		startupCtx = ctx
+	}
+	server := &relayServer{cancel: cancel}
 	var tasks sync.WaitGroup
 	var store cftunnel.Store
 	var network relayNetwork
@@ -72,6 +143,7 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 	}()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /readyz", server.ready)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintln(w, "ok")
@@ -91,12 +163,12 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 		if opts.openStore == nil {
 			opts.openStore = openTunnelStore
 		}
-		opened, err := opts.openStore(ctx, cfg)
+		opened, err := opts.openStore(startupCtx, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("open tunnel store: %w", err)
 		}
 		store = opened
-		if err := store.EnsureScope(ctx, scope); err != nil {
+		if err := store.EnsureScope(startupCtx, scope); err != nil {
 			return nil, nil, fmt.Errorf("verify stored tunnel scope: %w", err)
 		}
 		crypto, err := cftunnel.NewCrypto(cfg.MasterKey, cfg.EdgeKey, cfg.EdgePrevKey)
@@ -126,17 +198,21 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := service.PreflightZone(ctx); err != nil {
+		if err := service.PreflightZone(startupCtx); err != nil {
 			return nil, nil, fmt.Errorf("verify Cloudflare zone: %w", err)
 		}
-		if err := service.PreflightEdgeCanary(ctx, opts.canaryClient); err != nil {
+		if err := service.PreflightEdgeCanary(startupCtx, opts.canaryClient); err != nil {
 			return nil, nil, err
 		}
 	}
 
+	caKeys := opts.keys
+	if len(caKeys) == 0 && len(opts.key) > 0 {
+		caKeys = []ed25519.PublicKey{opts.key}
+	}
 	if cfg.Process != cftunnel.ProcessControl {
 		if opts.newNetwork == nil {
-			opts.newNetwork = func() (relayNetwork, error) { return ice.FromEnv() }
+			opts.newNetwork = func() (relayNetwork, error) { return ice.FromEnvForChannel(string(cfg.Channel)) }
 		}
 		opened, err := opts.newNetwork()
 		if err != nil {
@@ -147,10 +223,15 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 			hub = relay.NewSelfHosted(opts.selfToken, network)
 		} else {
 			hub = relay.New(opts.key, opts.membership, network)
+			if len(caKeys) > 0 {
+				hub.ConfigureTrustedKeys(caKeys)
+			}
 			if opts.allowedIssuer != "" {
 				hub.RequireIssuer(opts.allowedIssuer)
 			}
 		}
+		hub.ConfigureClientIP(cfg.ClientIP)
+		hub.ConfigureMaxSlots(opts.maxSlots)
 		if opts.pushURL != "" {
 			if err := hub.ConfigurePushWebhook(opts.pushURL, opts.pushToken, false); err != nil {
 				return nil, nil, err
@@ -158,15 +239,21 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 		}
 		mux.Handle("GET /v1/signal", hub)
 		mux.Handle("POST /v1/signal", hub)
+		mux.HandleFunc("GET /v1/probe", hub.ServeProbe)
+		mux.HandleFunc("GET /v1/pairing", hub.ServePairing)
+		mux.HandleFunc("POST /v1/pairing", hub.ServePairing)
+		mux.HandleFunc("GET /v1/activity", hub.ServeActivity)
+		mux.HandleFunc("POST /v1/activity", hub.ServeActivity)
 	}
 
 	var handler http.Handler = mux
+	metrics := new(cftunnel.Metrics)
 	if service != nil {
+		metrics = service.Metrics()
 		if hub != nil {
-			hub.ConfigureTunnelClientIP(cfg.ClientIP)
 			hub.ConfigureTunnel(tunnelController{service})
 		}
-		api := cftunnel.NewHTTPHandler(service, opts.key, opts.selfToken)
+		api := cftunnel.NewHTTPHandlerWithKeys(service, caKeys, opts.selfToken)
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/v1/tunnels" || strings.HasPrefix(r.URL.Path, "/v1/tunnels/") {
 				api.ServeHTTP(w, r)
@@ -174,7 +261,13 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 			}
 			mux.ServeHTTP(w, r)
 		})
-		tasks.Go(func() { _ = service.RunWorker(ctx, protocol.NewID()) })
+		workers := opts.workers
+		if workers == 0 {
+			workers = defaultTunnelWorkers(cfg.Store)
+		}
+		for range workers {
+			tasks.Go(func() { _ = service.RunWorker(ctx, protocol.NewID()) })
+		}
 		if cfg.Reaper.Mode != cftunnel.ReaperOff {
 			reaper := cftunnel.NewReaper(service)
 			tasks.Go(func() { _ = reaper.Run(ctx) })
@@ -184,8 +277,17 @@ func buildServer(parent context.Context, cfg cftunnel.Config, opts relayStartup)
 	if hub != nil {
 		tasks.Go(func() { hub.Run(ctx) })
 	}
+	server.Handler, server.hub = handler, hub
+	mux.HandleFunc("GET /metrics", server.metricsHandler(metrics, opts.metricsToken))
 	started = true
-	return handler, closeServer, nil
+	return server, closeServer, nil
+}
+
+func defaultTunnelWorkers(store cftunnel.StoreKind) int {
+	if store == cftunnel.StorePostgres {
+		return 4
+	}
+	return 2
 }
 
 func pruneTunnelStore(ctx context.Context, store cftunnel.Store, scopeID string) {

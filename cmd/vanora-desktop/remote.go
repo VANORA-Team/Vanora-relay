@@ -17,7 +17,7 @@ import (
 func (m *accessManager) initRemote() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.remote != nil {
+	if m.closed || m.ctx.Err() != nil || m.remote != nil {
 		return
 	}
 	m.remote = remote.NewManager(m.ctx, m, func(ev map[string]any) {
@@ -27,15 +27,30 @@ func (m *accessManager) initRemote() {
 
 func (m *accessManager) remoteManager() *remote.Manager {
 	m.mu.Lock()
-	rm := m.remote
-	if rm == nil {
-		rm = remote.NewManager(m.ctx, m, func(ev map[string]any) {
+	defer m.mu.Unlock()
+	if m.closed || m.ctx.Err() != nil {
+		return nil
+	}
+	if m.remote == nil {
+		m.remote = remote.NewManager(m.ctx, m, func(ev map[string]any) {
 			m.emitter.Emit(ev)
 		})
-		m.remote = rm
 	}
+	return m.remote
+}
+
+func (m *accessManager) dispatchRemoteCommand(cmd accessCommand) {
+	m.mu.Lock()
+	if m.closed || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.remoteWG.Add(1)
 	m.mu.Unlock()
-	return rm
+	go func() {
+		defer m.remoteWG.Done()
+		m.remoteCommand(cmd)
+	}()
 }
 
 func (m *accessManager) onNetworkChanged(channel string) {
@@ -140,6 +155,9 @@ func (m *accessManager) remoteCommand(cmd accessCommand) {
 		return
 	}
 	rm := m.remoteManager()
+	if rm == nil {
+		return
+	}
 	output := m.emitter
 	if output == nil {
 		output = &jsonEmitter{out: os.Stdout}

@@ -11,6 +11,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"vanora-relay/endpoint"
+	"vanora-relay/internal/framing"
 	"vanora-relay/protocol"
 )
 
@@ -58,22 +59,17 @@ type link struct {
 	pendingOut      []webrtc.ICECandidateInit
 	pendingIn       []webrtc.ICECandidateInit
 	remoteSet       bool
+	candWake        chan struct{}
+	candOnce        sync.Once
 
 	msgMu          sync.Mutex
 	remoteVerified bool
 
 	// sendMu makes DataChannel writes safe for the refresh loop, the message
-	// pump and Peer.Send. sendID and chunk assembly state are guarded by it or
-	// by recvMu respectively.
-	sendMu sync.Mutex
-	sendID uint32
-
-	recvMu    sync.Mutex
-	recvID    uint32
-	recvNext  uint32
-	recvTotal uint32
-	recvBuf   []byte
-	recvAt    time.Time
+	// pump and Peer.Send. Framing sender and reassembler handle chunking.
+	sendMu    sync.Mutex
+	sender    framing.Sender
+	assembler *framing.Assembler
 
 	// cbMu serializes Open and Closed for one peer.
 	cbMu   sync.Mutex
@@ -99,16 +95,18 @@ type peer struct {
 
 func newLink(c *Client, id string, session *endpoint.Session, desktop, accepted bool) *link {
 	l := &link{
-		c:        c,
-		id:       id,
-		desktop:  desktop,
-		session:  session,
-		accepted: accepted,
-		inbox:    make(chan protocol.Message, 64),
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		errCh:    make(chan error, 1),
-		ready:    make(chan struct{}),
+		c:         c,
+		id:        id,
+		desktop:   desktop,
+		session:   session,
+		accepted:  accepted,
+		assembler: framing.NewAssembler(transportAssemblyBudget),
+		candWake:  make(chan struct{}, 1),
+		inbox:     make(chan protocol.Message, 64),
+		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		errCh:     make(chan error, 1),
+		ready:     make(chan struct{}),
 	}
 	if accepted {
 		l.acceptedAt = time.Now()
@@ -471,41 +469,63 @@ func (l *link) onLocalCandidate(candidate *webrtc.ICECandidate) {
 }
 
 // queueCandidate buffers a candidate until the offer or answer is on the wire,
-// then seals and sends it. The session sequence is assigned while sealing, so
-// the buffer handoff and the signaling write stay under candMu: a candidate
-// gathered after the flush must not overtake one still in the buffer, or the
-// peer rejects the sequence and closes a healthy link.
+// then wakes the dedicated ordered sender goroutine so Pion's ICE gathering
+// callbacks never stall on WebSocket writes while preserving strict sequence order.
 func (l *link) queueCandidate(init webrtc.ICECandidateInit) {
 	l.candMu.Lock()
-	if !l.negotiationSent {
-		l.pendingOut = append(l.pendingOut, init)
-		l.candMu.Unlock()
-		return
-	}
-	err := l.sendCandidate(init)
+	l.pendingOut = append(l.pendingOut, init)
+	ready := l.negotiationSent
 	l.candMu.Unlock()
-	if err != nil {
-		l.close(err, false)
+	if ready {
+		select {
+		case l.candWake <- struct{}{}:
+		default:
+		}
 	}
 }
 
 func (l *link) flushCandidates() {
 	l.candMu.Lock()
 	l.negotiationSent = true
-	pending := l.pendingOut
-	l.pendingOut = nil
-	var err error
-	for _, candidate := range pending {
-		if l.closed.Load() {
-			break
-		}
-		if err = l.sendCandidate(candidate); err != nil {
-			break
-		}
-	}
 	l.candMu.Unlock()
-	if err != nil {
-		l.close(err, false)
+	l.candOnce.Do(func() {
+		go l.candidateSender()
+	})
+	select {
+	case l.candWake <- struct{}{}:
+	default:
+	}
+}
+
+func (l *link) candidateSender() {
+	for {
+		select {
+		case <-l.done:
+			return
+		case <-l.candWake:
+		}
+		for {
+			if l.closed.Load() {
+				return
+			}
+			l.candMu.Lock()
+			if !l.negotiationSent || len(l.pendingOut) == 0 {
+				l.candMu.Unlock()
+				break
+			}
+			batch := l.pendingOut
+			l.pendingOut = nil
+			l.candMu.Unlock()
+			for _, candidate := range batch {
+				if l.closed.Load() {
+					return
+				}
+				if err := l.sendCandidate(candidate); err != nil {
+					l.close(err, false)
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -580,6 +600,7 @@ func (l *link) attachDataChannel(dc *webrtc.DataChannel) bool {
 	}
 	l.dc = dc
 	l.dcMu.Unlock()
+	l.sender.Attach(dc)
 
 	dc.OnOpen(func() {
 		if l.closed.Load() {
@@ -848,6 +869,9 @@ func (l *link) close(err error, notifyRemote bool) {
 	l.c.mu.Unlock()
 
 	close(l.done)
+	if l.assembler != nil {
+		l.assembler.Close()
+	}
 	l.dcMu.Lock()
 	dc, pc := l.dc, l.pc
 	l.dcMu.Unlock()

@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
+	"sync"
 	"time"
 
 	"vanora-relay/adapter/account"
@@ -15,13 +17,34 @@ import (
 	"vanora-relay/protocol"
 )
 
+type childDialBackoff struct {
+	failures int
+	until    time.Time
+}
+
+type childOpenAttempt struct {
+	done  chan struct{}
+	child *Client
+	err   error
+}
+
 type phoneNetwork struct {
+	mu       sync.Mutex
 	wake     chan struct{}
 	children map[string]*Client
+	opening  map[string]*childOpenAttempt
+	synced   map[string]pairnet.Roster
+	backoff  map[string]childDialBackoff
 }
 
 func (c *Client) startNetwork() {
-	c.mesh = &phoneNetwork{make(chan struct{}, 1), make(map[string]*Client)}
+	c.mesh = &phoneNetwork{
+		wake:     make(chan struct{}, 1),
+		children: make(map[string]*Client),
+		opening:  make(map[string]*childOpenAttempt),
+		synced:   make(map[string]pairnet.Roster),
+		backoff:  make(map[string]childDialBackoff),
+	}
 	switch {
 	case c.identity != nil:
 		c.group, _ = c.identity.PairingIdentity(c.url, "mobile")
@@ -83,7 +106,28 @@ func (c *Client) networkBinding(id string) (*pairnet.Group, pairnet.Member, pair
 }
 
 func (c *Client) syncPeer(p transport.Peer, g *pairnet.Group) error {
-	return p.Send(protocol.Encode(transport.NetworkFrame{Type: "pairnet.sync", Members: g.Snapshot()}), true)
+	snap := g.Snapshot()
+	c.mu.Lock()
+	if c.peer == p && maps.Equal(c.lastSynced, snap) {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+	if err := p.Send(protocol.Encode(transport.NetworkFrame{Type: "pairnet.sync", Members: snap}), true); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.peer == p {
+		c.lastSynced = snap
+	}
+	device := c.device
+	c.mu.Unlock()
+	if c.mesh != nil && device != "" {
+		c.mesh.mu.Lock()
+		c.mesh.synced[device] = snap
+		c.mesh.mu.Unlock()
+	}
+	return nil
 }
 
 func (c *Client) tellRemovedDesktop(p transport.Peer, group *pairnet.Group, id string) {
@@ -92,15 +136,25 @@ func (c *Client) tellRemovedDesktop(p transport.Peer, group *pairnet.Group, id s
 }
 
 func (c *Client) closeChild(id string) {
-	if child := c.mesh.children[id]; child != nil {
-		delete(c.mesh.children, id)
+	c.mesh.mu.Lock()
+	child := c.mesh.children[id]
+	delete(c.mesh.children, id)
+	c.mesh.mu.Unlock()
+	if child != nil {
 		child.Close()
 	}
 }
 
 func (c *Client) closeChildren() {
-	for id := range c.mesh.children {
-		c.closeChild(id)
+	c.mesh.mu.Lock()
+	children := make([]*Client, 0, len(c.mesh.children))
+	for id, child := range c.mesh.children {
+		children = append(children, child)
+		delete(c.mesh.children, id)
+	}
+	c.mesh.mu.Unlock()
+	for _, child := range children {
+		child.Close()
 	}
 }
 
@@ -108,51 +162,121 @@ func (c *Client) maintainNetwork() {
 	ticker := time.NewTicker(12 * time.Second)
 	defer ticker.Stop()
 	for {
+		fromWake := false
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
+			if c.background.Load() {
+				continue
+			}
 		case <-c.mesh.wake:
+			fromWake = true
 		}
-		c.op.Lock()
 		c.mu.Lock()
 		group, primary, current := c.group, c.device, c.peer
 		c.mu.Unlock()
-		if (primary != "" || len(c.mesh.children) != 0) && group != nil {
-			if current != nil {
-				if !group.Allows(primary) {
-					c.tellRemovedDesktop(current, group, primary)
-				} else {
-					_ = c.syncPeer(current, group)
-				}
-			}
-			for id, child := range c.mesh.children {
-				child.mu.Lock()
-				p := child.peer
-				child.mu.Unlock()
-				if !group.Allows(id) {
-					if p != nil {
-						c.tellRemovedDesktop(p, group, id)
-					} else {
-						c.closeChild(id)
-					}
-					continue
-				}
-				if p != nil {
-					_ = c.syncPeer(p, group)
-				}
-			}
-			for _, member := range group.Snapshot().Members() {
-				if member.Role == "desktop" && member.ID != primary && c.mesh.children[member.ID] == nil && group.Allows(member.ID) {
-					_, _ = c.openDesktop(group, member)
-				}
+		if group == nil {
+			continue
+		}
+		c.mesh.mu.Lock()
+		hasChildren := len(c.mesh.children) != 0
+		c.mesh.mu.Unlock()
+		if primary == "" && !hasChildren {
+			continue
+		}
+		snap := group.Snapshot()
+		if current != nil {
+			if !group.Allows(primary) {
+				c.tellRemovedDesktop(current, group, primary)
+			} else {
+				_ = c.syncPeer(current, group)
 			}
 		}
-		c.op.Unlock()
+
+		c.mesh.mu.Lock()
+		children := make(map[string]*Client, len(c.mesh.children))
+		for id, child := range c.mesh.children {
+			children[id] = child
+		}
+		c.mesh.mu.Unlock()
+
+		for id, child := range children {
+			if child.ctx.Err() != nil {
+				c.closeChild(id)
+				continue
+			}
+			child.mu.Lock()
+			p := child.peer
+			child.mu.Unlock()
+			if !group.Allows(id) {
+				if p != nil {
+					c.tellRemovedDesktop(p, group, id)
+				} else {
+					c.closeChild(id)
+				}
+				continue
+			}
+			if p != nil {
+				_ = child.syncPeer(p, group)
+			}
+		}
+
+		// Propagate unsynced roster updates to other desktops off c.op.Lock so
+		// unreachable desktops never block primary user operations and back off
+		// exponentially instead of re-dialing every 12 seconds.
+		now := time.Now()
+		for _, member := range snap.Members() {
+			if member.Role != "desktop" || member.ID == primary || !group.Allows(member.ID) {
+				continue
+			}
+			c.mesh.mu.Lock()
+			alreadyOpen := c.mesh.children[member.ID] != nil
+			inFlight := c.mesh.opening[member.ID] != nil
+			synced := maps.Equal(c.mesh.synced[member.ID], snap)
+			bo := c.mesh.backoff[member.ID]
+			if alreadyOpen || inFlight || synced || (!fromWake && now.Before(bo.until)) {
+				c.mesh.mu.Unlock()
+				continue
+			}
+			c.mesh.mu.Unlock()
+			go func(m pairnet.Member, targetSnap pairnet.Roster) {
+				_, err := c.openDesktop(group, m)
+				c.mesh.mu.Lock()
+				if err == nil {
+					delete(c.mesh.backoff, m.ID)
+					c.mesh.synced[m.ID] = targetSnap
+				} else {
+					prev := c.mesh.backoff[m.ID]
+					failures := min(prev.failures+1, 6)
+					delay := min(5*time.Minute, 15*time.Second*time.Duration(1<<(failures-1)))
+					c.mesh.backoff[m.ID] = childDialBackoff{failures: failures, until: time.Now().Add(delay)}
+				}
+				c.mesh.mu.Unlock()
+			}(member, snap)
+		}
 	}
 }
 
 func (c *Client) openDesktop(group *pairnet.Group, member pairnet.Member) (*Client, error) {
+	c.mesh.mu.Lock()
+	if existing := c.mesh.children[member.ID]; existing != nil && existing.ctx.Err() == nil {
+		c.mesh.mu.Unlock()
+		return existing, nil
+	}
+	if attempt := c.mesh.opening[member.ID]; attempt != nil {
+		c.mesh.mu.Unlock()
+		select {
+		case <-attempt.done:
+			return attempt.child, attempt.err
+		case <-c.ctx.Done():
+			return nil, c.ctx.Err()
+		}
+	}
+	attempt := &childOpenAttempt{done: make(chan struct{})}
+	c.mesh.opening[member.ID] = attempt
+	c.mesh.mu.Unlock()
+
 	child := newClient(c.url, c.source)
 	child.child, child.mesh, child.scopeTarget = true, c.mesh, member.ID
 	child.identity, child.book, child.lanKey, child.selfKey = c.identity, c.book, c.lanKey, c.selfKey
@@ -164,7 +288,7 @@ func (c *Client) openDesktop(group *pairnet.Group, member pairnet.Member) (*Clie
 	child.channel = channel
 	child.tunnel = c.tunnel
 	child.mu.Unlock()
-	c.mesh.children[member.ID] = child
+
 	var err error
 	switch {
 	case c.lanKey != "":
@@ -177,14 +301,40 @@ func (c *Client) openDesktop(group *pairnet.Group, member pairnet.Member) (*Clie
 	default:
 		err = child.Connect(member.ID, member.Owner)
 	}
-	if err != nil || !group.Allows(member.ID) {
-		c.closeChild(member.ID)
-		if err == nil {
-			err = pairnet.ErrRemoved
-		}
-		return nil, err
+	if err == nil && !group.Allows(member.ID) {
+		err = pairnet.ErrRemoved
 	}
-	return child, nil
+	if err == nil && c.ctx.Err() != nil {
+		err = c.ctx.Err()
+	}
+
+	var closeChild bool
+	c.mesh.mu.Lock()
+	delete(c.mesh.opening, member.ID)
+	if err != nil {
+		closeChild = true
+		attempt.err = err
+	} else {
+		c.mu.Lock()
+		isPrimary := c.device == member.ID
+		c.mu.Unlock()
+		if isPrimary {
+			closeChild = true
+			attempt.child = c
+		} else if existing := c.mesh.children[member.ID]; existing != nil && existing.ctx.Err() == nil {
+			closeChild = true
+			attempt.child = existing
+		} else {
+			c.mesh.children[member.ID] = child
+			attempt.child = child
+		}
+	}
+	close(attempt.done)
+	c.mesh.mu.Unlock()
+	if closeChild {
+		child.Close()
+	}
+	return attempt.child, attempt.err
 }
 
 func (c *Client) PairingNetwork() (string, error) {
@@ -216,8 +366,13 @@ func (c *Client) RemoveNetworkDevice(id string) error {
 		}
 	}
 	if !c.child {
-		c.op.Lock()
+		c.mesh.mu.Lock()
+		children := make([]*Client, 0, len(c.mesh.children))
 		for _, child := range c.mesh.children {
+			children = append(children, child)
+		}
+		c.mesh.mu.Unlock()
+		for _, child := range children {
 			child.mu.Lock()
 			other := child.peer
 			child.mu.Unlock()
@@ -229,15 +384,12 @@ func (c *Client) RemoveNetworkDevice(id string) error {
 				}
 			}
 		}
-		c.op.Unlock()
 	}
 	signal(c.mesh.wake)
 	return nil
 }
 
 func (c *Client) OpenNetworkDesktop(id string) (*Client, error) {
-	c.op.Lock()
-	defer c.op.Unlock()
 	c.mu.Lock()
 	group, primary := c.group, c.device
 	c.mu.Unlock()
@@ -254,7 +406,10 @@ func (c *Client) OpenNetworkDesktop(id string) (*Client, error) {
 	if c.child {
 		return nil, errors.New("open desktops on the main client")
 	}
-	if child := c.mesh.children[id]; child != nil && child.ctx.Err() != context.Canceled {
+	c.mesh.mu.Lock()
+	child := c.mesh.children[id]
+	c.mesh.mu.Unlock()
+	if child != nil && child.ctx.Err() != context.Canceled {
 		return child, nil
 	}
 	return c.openDesktop(group, member)

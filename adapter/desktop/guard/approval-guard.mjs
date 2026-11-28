@@ -28,7 +28,12 @@ export default function (vanora) {
 
     const title = `Allow tool "${event.toolName}"?`;
     const message = preview ? `${event.toolName}\n${preview}` : String(event.toolName || "tool");
-    const confirmed = await ctx.ui.confirm(title, message, { timeout: timeoutMs });
+    let confirmed = false;
+    try {
+      confirmed = Boolean(await ctx.ui.confirm(title, message, { timeout: timeoutMs }));
+    } catch {
+      return { block: true, reason: `${event.toolName} approval failed or timed out` };
+    }
     if (!confirmed) {
       return { block: true, reason: `${event.toolName} was not approved` };
     }

@@ -72,7 +72,7 @@ type Listener struct {
 	server *http.Server
 	origin string
 
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	pending     map[string]*pendingPermit
 	spent       map[string]time.Time
 	connections map[string]*connectionSlot
@@ -94,7 +94,7 @@ func NewListener(opts ListenerOptions) (*Listener, error) {
 	}
 	opts.PrivateKey = slices.Clone(opts.PrivateKey)
 	if opts.AssemblyBudget == nil {
-		opts.AssemblyBudget = processAssemblyBudget
+		opts.AssemblyBudget = NewAssemblyBudget(DefaultAssemblyBudget)
 	}
 	setDefault(&opts.MaxPendingPermits, 32)
 	setDefault(&opts.MaxHandshakes, 4)
@@ -252,9 +252,9 @@ func (l *Listener) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		forbidden(w)
 		return
 	}
-	l.mu.Lock()
+	l.mu.RLock()
 	permit := l.pending[jti[0]]
-	l.mu.Unlock()
+	l.mu.RUnlock()
 	if permit == nil || !strings.EqualFold(strings.TrimSuffix(r.Host, ":443"), permit.Hostname) ||
 		!time.Now().Before(permit.ExpiresAt) ||
 		!VerifyClientUpgradeProof(permit.VisitorPublicKey, permit.ConnectionContext, proofs[0]) || !permit.Allows() {
@@ -415,7 +415,7 @@ func (l *Listener) UpdateLocalLease(proof endpoint.LeaseProof) error {
 }
 
 func (l *Listener) updateLocalLease(proof endpoint.LeaseProof, current func() bool) error {
-	l.mu.Lock()
+	l.mu.RLock()
 	revision := l.authority.Load()
 	peers := make([]*Peer, 0, len(l.connections))
 	for _, slot := range l.connections {
@@ -423,16 +423,12 @@ func (l *Listener) updateLocalLease(proof endpoint.LeaseProof, current func() bo
 			peers = append(peers, slot.peer)
 		}
 	}
-	l.mu.Unlock()
-	results := make(chan error, len(peers))
-	for _, peer := range peers {
-		go func() {
-			results <- peer.updateLocalLease(proof, func() bool { return l.authority.Load() == revision && current() })
-		}()
-	}
+	l.mu.RUnlock()
 	var result error
-	for range peers {
-		result = errors.Join(result, <-results)
+	for _, peer := range peers {
+		result = errors.Join(result, peer.enqueueLocalLease(proof, func() bool {
+			return l.authority.Load() == revision && current()
+		}))
 	}
 	return result
 }

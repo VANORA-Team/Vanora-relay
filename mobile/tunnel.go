@@ -20,21 +20,25 @@ type tunnelDialOptions struct {
 	httpClient *http.Client
 }
 
-func (c *Client) dialPeer(device, owner string) (transport.Peer, func(), error) {
+func tunnelRouteKey(signalURL, hostID string) string {
+	return signalURL + "\x00" + hostID
+}
+
+func (c *Client) dialPeer(dialCtx context.Context, device, owner string) (transport.Peer, func(), error) {
 	c.mu.Lock()
 	lanTarget, selfTarget, selfName := c.lanTarget, c.selfTarget, c.selfName
 	invite, channel := c.officialInvite, c.channel
 	c.mu.Unlock()
 	if lanTarget != nil {
-		return c.dialLANPeer()
+		return c.dialLANPeer(dialCtx)
 	}
 	if selfTarget != nil {
-		return c.dialSelfPeer(*selfTarget, selfName)
+		return c.dialSelfPeer(dialCtx, *selfTarget, selfName)
 	}
-	return c.dialOfficialPeer(device, owner, invite, channel)
+	return c.dialOfficialPeer(dialCtx, device, owner, invite, channel)
 }
 
-func (c *Client) dialSelfPeer(target selfrelay.Target, name string) (transport.Peer, func(), error) {
+func (c *Client) dialSelfPeer(dialCtx context.Context, target selfrelay.Target, name string) (transport.Peer, func(), error) {
 	options := c.tunnel
 	webRTC := func(ctx context.Context) (cftunnel.Candidate, error) {
 		peer, start, err := selfrelay.DialWithRoleFor(ctx, c.ctx, target, c.selfKey, name, "mobile", (*handler)(c))
@@ -64,11 +68,11 @@ func (c *Client) dialSelfPeer(target selfrelay.Target, name string) (transport.P
 			return cftunnel.Candidate{Peer: peer, Start: start}, err
 		}
 	}
-	winner, err := cftunnel.DialFallback(c.ctx, c.routeTracker, target.SignalURL, options.headStart, webRTC, tunnel)
+	winner, err := cftunnel.DialFallback(dialCtx, c.routeTracker, tunnelRouteKey(target.SignalURL, target.Pin), options.headStart, webRTC, tunnel)
 	return winner.Peer, winner.Start, err
 }
 
-func (c *Client) dialOfficialPeer(device, owner string, invite *pairing.Official, channel string) (transport.Peer, func(), error) {
+func (c *Client) dialOfficialPeer(dialCtx context.Context, device, owner string, invite *pairing.Official, channel string) (transport.Peer, func(), error) {
 	options := c.tunnel
 	var pin, token []byte
 	var bound account.PeerBinding
@@ -94,9 +98,9 @@ func (c *Client) dialOfficialPeer(device, owner string, invite *pairing.Official
 		if err != nil {
 			return cftunnel.Candidate{}, err
 		}
-		dialCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+		connectCtx, stop := context.WithTimeout(ctx, 30*time.Second)
 		defer stop()
-		peer, start, err := socket.ConnectPairedDeferred(dialCtx, device, owner, transport.ConnectOptions{Pin: pin, Token: token})
+		peer, start, err := socket.ConnectPairedDeferred(connectCtx, device, owner, transport.ConnectOptions{Pin: pin, Token: token})
 		return cftunnel.Candidate{Peer: peer, Start: start, Socket: socket, OwnsSocket: true}, err
 	}
 	var tunnel cftunnel.CandidateDial
@@ -114,7 +118,7 @@ func (c *Client) dialOfficialPeer(device, owner string, invite *pairing.Official
 			return cftunnel.Candidate{Peer: peer, Start: start}, err
 		}
 	}
-	winner, err := cftunnel.DialFallback(c.ctx, c.routeTracker, c.url, options.headStart, webRTC, tunnel)
+	winner, err := cftunnel.DialFallback(dialCtx, c.routeTracker, tunnelRouteKey(c.url, device), options.headStart, webRTC, tunnel)
 	if err != nil {
 		return nil, nil, err
 	}

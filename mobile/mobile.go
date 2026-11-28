@@ -30,6 +30,12 @@ type Store interface {
 	Save(value string) error
 }
 
+// EventListener receives pushed JSON events on Android/Apple hosts without
+// polling NextEvent in a loop.
+type EventListener interface {
+	OnEvent(payload string)
+}
+
 // Client owns one phone identity, one signaling socket and at most one selected desktop.
 type Client struct {
 	mesh           *phoneNetwork
@@ -53,21 +59,30 @@ type Client struct {
 	ctx            context.Context
 	stop           context.CancelFunc
 	op             sync.Mutex // dial, selection, subscription setup and link recovery
+	dialMu         sync.Mutex
+	dialCancel     context.CancelFunc
 	mu             sync.Mutex
 	socket         *transport.Client
 	peer           transport.Peer
+	connectedAt    time.Time
+	lastSynced     pairnet.Roster
 	device, owner  string
+	wantReconnect  bool
 	connState      string
 	connPath       string
 	connErr        string
 	pending        map[string]chan reply
 	subscriptions  map[string]*cursor
+	controlEvents  []event
 	events         []event
+	listener       EventListener
+	listenerActive bool
 	ready          chan struct{}
 	retry          chan struct{}
 	retryNow       chan struct{}
 	generation     atomic.Uint64
 	inboundFrames  atomic.Uint64
+	background     atomic.Bool
 	betterWake     chan struct{}
 	altLANRoutes   []string
 	routeTracker   *routes.Tracker
@@ -86,6 +101,7 @@ type cursor struct {
 type event struct {
 	session string
 	seq     int64
+	kind    string
 	payload string
 }
 
@@ -130,7 +146,13 @@ func (c *Client) SetChannel(channel string) error {
 	c.mu.Unlock()
 	c.routeTracker.Reset()
 	if c.mesh != nil {
+		c.mesh.mu.Lock()
+		children := make([]*Client, 0, len(c.mesh.children))
 		for _, child := range c.mesh.children {
+			children = append(children, child)
+		}
+		c.mesh.mu.Unlock()
+		for _, child := range children {
 			child.mu.Lock()
 			child.channel = channel
 			child.mu.Unlock()
@@ -138,6 +160,85 @@ func (c *Client) SetChannel(channel string) error {
 		}
 	}
 	return nil
+}
+
+// SetBackground pauses periodic background mesh sync and route probes while
+// the mobile app is suspended. Calling SetBackground(false) resumes them.
+func (c *Client) SetBackground(background bool) {
+	prev := c.background.Swap(background)
+	if prev && !background {
+		signal(c.betterWake)
+		if c.mesh != nil {
+			signal(c.mesh.wake)
+		}
+	}
+}
+
+// SetEventListener registers an optional push callback that drains queued
+// control and session events in order so native apps do not need to poll
+// NextEvent. Pass nil to revert to NextEvent pulling.
+func (c *Client) SetEventListener(listener EventListener) {
+	c.mu.Lock()
+	c.listener = listener
+	start := listener != nil && !c.listenerActive
+	if start {
+		c.listenerActive = true
+	}
+	c.mu.Unlock()
+	if start {
+		go c.dispatchEvents()
+	}
+	if listener != nil {
+		signal(c.ready)
+	}
+}
+
+func (c *Client) dispatchEvents() {
+	for {
+		c.mu.Lock()
+		listener := c.listener
+		if listener == nil {
+			c.listenerActive = false
+			c.mu.Unlock()
+			return
+		}
+		payload, ok := c.popEventLocked()
+		c.mu.Unlock()
+		if ok {
+			listener.OnEvent(payload)
+			continue
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.ready:
+		}
+	}
+}
+
+func (c *Client) beginDialCtx() (context.Context, func()) {
+	dialCtx, cancel := context.WithCancel(c.ctx)
+	c.dialMu.Lock()
+	if c.dialCancel != nil {
+		c.dialCancel()
+	}
+	c.dialCancel = cancel
+	c.dialMu.Unlock()
+	return dialCtx, func() {
+		c.dialMu.Lock()
+		c.dialCancel = nil
+		c.dialMu.Unlock()
+		cancel()
+	}
+}
+
+func (c *Client) interruptDial() {
+	c.dialMu.Lock()
+	cancel := c.dialCancel
+	c.dialMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func officialChannel(channel string) bool {
@@ -299,6 +400,7 @@ func (c *Client) ConnectionState() string {
 // when the device switches networks (e.g. Wi-Fi <-> cellular) or returns to the
 // foreground.
 func (c *Client) Reconnect() error {
+	c.interruptDial()
 	c.op.Lock()
 	defer c.op.Unlock()
 	c.mu.Lock()
@@ -307,6 +409,7 @@ func (c *Client) Reconnect() error {
 		return errors.New("no desktop selected")
 	}
 	oldPeer := c.peer
+	c.wantReconnect = true
 	c.detachLocked()
 	c.setStateLocked("reconnecting", "", "")
 	c.mu.Unlock()
@@ -514,12 +617,14 @@ func (c *Client) ConnectLAN(link, clientName string) error {
 
 // LANAddress returns the current paired desktop address with the invitation removed.
 func (c *Client) LANAddress() string {
-	c.op.Lock()
-	defer c.op.Unlock()
 	c.mu.Lock()
-	target := c.lanTarget
+	var target lan.Target
+	has := c.lanTarget != nil
+	if has {
+		target = *c.lanTarget
+	}
 	c.mu.Unlock()
-	if target == nil || target.Token != "" {
+	if !has || target.Token != "" {
 		return ""
 	}
 	return target.Link()
@@ -594,12 +699,14 @@ func (c *Client) ConnectSelfRelayWithToken(link, relayToken, clientName string) 
 // SelfRelayTarget returns the paired self-hosted relay target with the
 // one-time pairing token stripped so the host app can store it for reconnects.
 func (c *Client) SelfRelayTarget() string {
-	c.op.Lock()
-	defer c.op.Unlock()
 	c.mu.Lock()
-	target := c.selfTarget
+	var target selfrelay.Target
+	has := c.selfTarget != nil
+	if has {
+		target = *c.selfTarget
+	}
 	c.mu.Unlock()
-	if target == nil || target.Pair != "" {
+	if !has || target.Pair != "" {
 		return ""
 	}
 	return target.Link()
@@ -625,6 +732,7 @@ func (c *Client) selectDesktop(deviceID, ownerID string, freshInvite bool) error
 		c.subscriptions = make(map[string]*cursor)
 		c.events = nil
 	}
+	c.wantReconnect = true
 	c.mu.Unlock()
 	if same && !freshInvite && old != nil && old.Allows(false) {
 		return nil
@@ -659,7 +767,9 @@ func (c *Client) connectLocked() error {
 			return pairing.ErrInvalid
 		}
 	}
-	p, start, err := c.dialPeer(d, o)
+	dialCtx, finishDial := c.beginDialCtx()
+	p, start, err := c.dialPeer(dialCtx, d, o)
+	finishDial()
 	if err != nil {
 		c.mu.Lock()
 		c.setStateLocked("reconnecting", "", err.Error())
@@ -690,6 +800,8 @@ func (c *Client) connectLocked() error {
 		return errors.New("desktop authorization expired")
 	}
 	c.peer = p
+	c.connectedAt = time.Now()
+	c.lastSynced = nil
 	c.generation.Add(1)
 	c.group = group
 	c.synced = make(chan struct{})
@@ -741,7 +853,7 @@ func (c *Client) connectLocked() error {
 				// of tearing down healthy subscriptions on the same connection.
 				c.mu.Lock()
 				delete(c.subscriptions, id)
-				c.enqueueLocked(event{payload: controlEvent(id, err.Error())})
+				c.enqueueControlLocked(event{kind: "subscription.error", payload: controlEvent(id, err.Error())})
 				c.mu.Unlock()
 				continue
 			}
@@ -773,7 +885,7 @@ func (c *Client) recoverConnection() {
 			}
 			c.op.Lock()
 			c.mu.Lock()
-			want := c.device != "" && c.peer == nil
+			want := c.device != "" && c.peer == nil && c.wantReconnect
 			c.mu.Unlock()
 			var err error
 			if want {
@@ -788,12 +900,13 @@ func (c *Client) recoverConnection() {
 }
 
 // Disconnect forgets the selected desktop and disables automatic reconnect. The identity is retained.
-func (c *Client) Disconnect() { c.op.Lock(); defer c.op.Unlock(); c.disconnect() }
+func (c *Client) Disconnect() { c.interruptDial(); c.op.Lock(); defer c.op.Unlock(); c.disconnect() }
 func (c *Client) disconnect() {
 	if c.mesh != nil && !c.child {
 		c.closeChildren()
 	}
 	c.mu.Lock()
+	c.wantReconnect = false
 	c.lanTarget = nil
 	c.lanName = ""
 	c.selfTarget = nil
@@ -805,6 +918,7 @@ func (c *Client) disconnect() {
 	c.detachLocked()
 	clear(c.subscriptions)
 	c.events = nil
+	c.controlEvents = nil
 	c.setStateLocked("disconnected", "", "")
 	c.mu.Unlock()
 	if p != nil {
@@ -819,6 +933,7 @@ func (c *Client) Close() { c.stop(); c.Disconnect() }
 
 func (c *Client) detachLocked() {
 	c.peer = nil
+	c.lastSynced = nil
 	for id, ch := range c.pending {
 		ch <- reply{err: errors.New("connection lost")}
 		delete(c.pending, id)
@@ -837,9 +952,6 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 	c.connState = state
 	c.connPath = path
 	c.connErr = errMsg
-	if len(c.events) >= 256 {
-		return
-	}
 	payload, _ := json.Marshal(map[string]string{
 		"type":      "connection.state",
 		"state":     state,
@@ -848,7 +960,7 @@ func (c *Client) setStateLocked(state, path, errMsg string) {
 		"path":      path,
 		"error":     errMsg,
 	})
-	c.enqueueLocked(event{payload: string(payload)})
+	c.enqueueControlLocked(event{kind: "connection.state", payload: string(payload)})
 }
 
 func (c *Client) handleAuthError(err error) bool {
@@ -861,21 +973,20 @@ func (c *Client) handleAuthError(err error) bool {
 		return false
 	}
 	c.mu.Lock()
+	c.wantReconnect = false
 	c.setStateLocked("disconnected", "", err.Error())
-	if len(c.events) < 256 {
-		eventType, state := "auth.state", "login_required"
-		if pairingRequired {
-			eventType, state = "access.state", "pairing_required"
-		} else if relayTokenInvalid {
-			eventType, state = "access.state", "relay_token_invalid"
-		}
-		payload, _ := json.Marshal(map[string]string{
-			"type":  eventType,
-			"state": state,
-			"error": err.Error(),
-		})
-		c.enqueueLocked(event{payload: string(payload)})
+	eventType, state := "auth.state", "login_required"
+	if pairingRequired {
+		eventType, state = "access.state", "pairing_required"
+	} else if relayTokenInvalid {
+		eventType, state = "access.state", "relay_token_invalid"
 	}
+	payload, _ := json.Marshal(map[string]string{
+		"type":  eventType,
+		"state": state,
+		"error": err.Error(),
+	})
+	c.enqueueControlLocked(event{kind: eventType, payload: string(payload)})
 	c.mu.Unlock()
 	return true
 }
@@ -908,6 +1019,45 @@ func controlEvent(session, code string) string {
 }
 func (c *Client) enqueueLocked(e event) { c.events = append(c.events, e); signal(c.ready) }
 
+// enqueueControlLocked queues critical connection/auth/subscription control
+// events on a dedicated channel that cannot be drowned by session delta bursts.
+func (c *Client) enqueueControlLocked(e event) {
+	if e.kind == "connection.state" && len(c.controlEvents) > 0 && c.controlEvents[len(c.controlEvents)-1].kind == "connection.state" {
+		c.controlEvents[len(c.controlEvents)-1] = e
+		signal(c.ready)
+		return
+	}
+	const maxControlEvents = 64
+	if len(c.controlEvents) >= maxControlEvents {
+		copy(c.controlEvents, c.controlEvents[1:])
+		c.controlEvents[len(c.controlEvents)-1] = e
+	} else {
+		c.controlEvents = append(c.controlEvents, e)
+	}
+	signal(c.ready)
+}
+
+func (c *Client) popEventLocked() (string, bool) {
+	if len(c.controlEvents) > 0 {
+		e := c.controlEvents[0]
+		c.controlEvents[0] = event{}
+		c.controlEvents = c.controlEvents[1:]
+		return e.payload, true
+	}
+	if len(c.events) > 0 {
+		e := c.events[0]
+		c.events[0] = event{}
+		c.events = c.events[1:]
+		if e.session != "" {
+			if cur := c.subscriptions[e.session]; cur != nil && e.seq > 0 {
+				cur.delivered = e.seq
+			}
+		}
+		return e.payload, true
+	}
+	return "", false
+}
+
 // handler is private so transport types never leak into mobile bindings.
 type handler Client
 
@@ -918,11 +1068,11 @@ func (h *handler) Closed(p transport.Peer) {
 	defer c.mu.Unlock()
 	if c.peer == p {
 		c.detachLocked()
-		if c.device != "" {
+		if c.device != "" && c.wantReconnect && (c.group == nil || (c.group.Allows(c.device) && c.group.Allows(c.group.Self()))) {
 			c.setStateLocked("reconnecting", "", "connection lost")
 			signal(c.retry)
 		} else {
-			c.setStateLocked("disconnected", "", "")
+			c.setStateLocked("disconnected", "", c.connErr)
 		}
 	}
 }
@@ -955,6 +1105,7 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 				signal(c.mesh.wake)
 			}
 		}
+		c.handleAuthError(pairnet.ErrRemoved)
 		p.Close()
 		return
 	}
@@ -968,6 +1119,14 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 		}
 		changed, err := group.Merge(id, frame.Members)
 		if err != nil {
+			p.Close()
+			return
+		}
+		if !group.Allows(id) || !group.Allows(group.Self()) {
+			c.handleAuthError(pairnet.ErrRemoved)
+			if changed {
+				signal(c.mesh.wake)
+			}
 			p.Close()
 			return
 		}
@@ -1015,10 +1174,10 @@ func (h *handler) Message(p transport.Peer, b []byte) {
 				// Keep the connection and the other sessions' cursors usable.
 				delete(c.subscriptions, m.Session)
 				c.events = slices.DeleteFunc(c.events, func(e event) bool { return e.session == m.Session })
-				c.enqueueLocked(event{session: m.Session, payload: controlEvent(m.Session, errSnapshot.Error())})
+				c.enqueueControlLocked(event{session: m.Session, kind: "subscription.error", payload: controlEvent(m.Session, errSnapshot.Error())})
 			} else {
 				cur.queued = m.Seq
-				c.enqueueLocked(event{m.Session, m.Seq, string(b)})
+				c.enqueueLocked(event{session: m.Session, seq: m.Seq, payload: string(b)})
 			}
 		}
 	default:
@@ -1042,17 +1201,9 @@ func (c *Client) NextEvent(timeoutMillis int64) (string, error) {
 	defer timer.Stop()
 	for {
 		c.mu.Lock()
-		if len(c.events) > 0 {
-			e := c.events[0]
-			c.events[0] = event{}
-			c.events = c.events[1:]
-			if e.session != "" {
-				if cur := c.subscriptions[e.session]; cur != nil && e.seq > 0 {
-					cur.delivered = e.seq
-				}
-			}
+		if payload, ok := c.popEventLocked(); ok {
 			c.mu.Unlock()
-			return e.payload, nil
+			return payload, nil
 		}
 		c.mu.Unlock()
 		select {
@@ -1086,10 +1237,14 @@ func (c *Client) currentPeer() (transport.Peer, error) {
 	return c.peer, nil
 }
 func (c *Client) request(p transport.Peer, req map[string]any, online bool) (string, error) {
-	return c.requestWithTimeout(p, req, online, 20*time.Second)
+	return c.requestWithContext(c.ctx, p, req, online, 20*time.Second)
 }
 
 func (c *Client) requestWithTimeout(p transport.Peer, req map[string]any, online bool, timeout time.Duration) (string, error) {
+	return c.requestWithContext(c.ctx, p, req, online, timeout)
+}
+
+func (c *Client) requestWithContext(ctx context.Context, p transport.Peer, req map[string]any, online bool, timeout time.Duration) (string, error) {
 	id := req["request_id"].(string)
 	if id == "" || len(id) > 128 {
 		return "", errors.New("request_id must be 1..128 bytes")
@@ -1122,6 +1277,8 @@ func (c *Client) requestWithTimeout(p transport.Peer, req map[string]any, online
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
 	case <-c.ctx.Done():
 		return "", c.ctx.Err()
 	case <-timer.C:

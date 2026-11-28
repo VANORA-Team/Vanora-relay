@@ -66,6 +66,9 @@ func (a *Access) Update(local bool, proof LeaseProof, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	if p.Expires.Before(until) {
+		until = p.Expires
+	}
 	if a.session != nil {
 		if local {
 			updated := *a.session.local

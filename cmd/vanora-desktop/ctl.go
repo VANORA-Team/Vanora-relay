@@ -129,25 +129,7 @@ func runCtl(args []string) error {
 	}
 	fs := flag.NewFlagSet("ctl "+action, flag.ContinueOnError)
 	channelFlag := fs.String("channel", envOrDefault("VANORA_RELAY_CHANNEL", ""), "channel: cn, global, self, or lan")
-
-	identityURL := fs.String("identity", envOrDefault("VANORA_RELAY_IDENTITY_URL", defaultIdentityURL), "identity authority URL")
-	caFile := fs.String("ca", "", "pinned identity public key file")
-	caHexFlag := fs.String("ca-hex", envOrDefault("VANORA_RELAY_CA_PUBLIC_KEY", defaultCAHex), "pinned identity public key (hex or base64)")
-	signalURL := fs.String("signal", envOrDefault("VANORA_RELAY_SIGNAL_URL", defaultSignalURL), "full relay WebSocket URL")
-	signalToken := fs.String("signal-token", envOrDefault("VANORA_RELAY_SIGNAL_TOKEN", ""), "bearer token for a self-hosted relay")
-
-	cnIdentityURL := fs.String("cn-identity", envOrDefault("VANORA_RELAY_CN_IDENTITY_URL", defaultCNIdentityURL), "CN site identity authority URL")
-	cnCAFile := fs.String("cn-ca", "", "CN site pinned identity public key file")
-	cnCAHex := fs.String("cn-ca-hex", envOrDefault("VANORA_RELAY_CN_CA_PUBLIC_KEY", defaultCNCAHex), "CN site pinned identity public key (hex or base64)")
-	cnSignalURL := fs.String("cn-signal", envOrDefault("VANORA_RELAY_CN_SIGNAL_URL", defaultCNSignalURL), "CN site official relay WebSocket URL")
-
-	globalIdentityURL := fs.String("global-identity", envOrDefault("VANORA_RELAY_GLOBAL_IDENTITY_URL", defaultGlobalIdentityURL), "GLOBAL site identity authority URL")
-	globalCAFile := fs.String("global-ca", "", "GLOBAL site pinned identity public key file")
-	globalCAHex := fs.String("global-ca-hex", envOrDefault("VANORA_RELAY_GLOBAL_CA_PUBLIC_KEY", defaultGlobalCAHex), "GLOBAL site pinned identity public key (hex or base64)")
-	globalSignalURL := fs.String("global-signal", envOrDefault("VANORA_RELAY_GLOBAL_SIGNAL_URL", defaultGlobalSignalURL), "GLOBAL site official relay WebSocket URL")
-
-	selfSignalURL := fs.String("self-signal", envOrDefault("VANORA_RELAY_SELF_SIGNAL_URL", ""), "self-hosted relay WebSocket URL (or LAN IP:PORT for bare LAN pairing code)")
-	selfToken := fs.String("self-token", envOrDefault("VANORA_RELAY_SELF_TOKEN", ""), "bearer token for a self-hosted relay")
+	chFlags := registerChannelFlags(fs, "self-hosted relay WebSocket URL (or LAN IP:PORT for bare LAN pairing code)")
 
 	root := fs.String("state-dir", "", "profile directory (defaults to user config)")
 	hostname, _ := os.Hostname()
@@ -181,6 +163,9 @@ func runCtl(args []string) error {
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
+	if *tokenStdin && *chFlags.selfTokenStdin {
+		return errors.New("-token-stdin and -self-token-stdin cannot be combined")
+	}
 
 	channel := strings.ToLower(strings.TrimSpace(*channelFlag))
 	if channel != "" && channel != "cn" && channel != "global" && channel != "self" && channel != "lan" {
@@ -210,47 +195,9 @@ func runCtl(args []string) error {
 	}
 	defer lock.Unlock()
 
-	resolvedSelfSignal := strings.TrimSpace(*selfSignalURL)
-	resolvedSelfToken := strings.TrimSpace(*selfToken)
-	if resolvedSelfToken == "" {
-		resolvedSelfToken = strings.TrimSpace(*signalToken)
-	}
-	legacyID := strings.TrimSpace(*identityURL)
-	legacyCAFile := strings.TrimSpace(*caFile)
-	legacyCAHex := strings.TrimSpace(*caHexFlag)
-	legacySig := strings.TrimSpace(*signalURL)
-	if channel == "self" {
-		if resolvedSelfSignal == "" {
-			resolvedSelfSignal = legacySig
-		}
-		legacySig = ""
-	}
-
-	slots := make(map[string]*officialSlotConfig, 2)
-	if cnSlot, err := openOfficialSlot(dir, "cn", "cn", *cnIdentityURL, *cnCAFile, *cnCAHex, *cnSignalURL); err != nil {
+	slots, resolvedSelfSignal, resolvedSelfToken, err := chFlags.resolve(dir, channel, false, os.Stdin)
+	if err != nil {
 		return err
-	} else if cnSlot != nil {
-		slots["cn"] = cnSlot
-	}
-	if globalSlot, err := openOfficialSlot(dir, "global", "global", *globalIdentityURL, *globalCAFile, *globalCAHex, *globalSignalURL); err != nil {
-		return err
-	} else if globalSlot != nil {
-		slots["global"] = globalSlot
-	}
-	if legacyID != "" || legacyCAFile != "" || legacyCAHex != "" || legacySig != "" {
-		slotName, vaultChannel := "cn", ""
-		if channel == "global" {
-			slotName, vaultChannel = "global", "global"
-		} else if channel == "cn" {
-			slotName, vaultChannel = "cn", "cn"
-		}
-		if _, exists := slots[slotName]; !exists {
-			if legacySlot, err := openOfficialSlot(dir, vaultChannel, slotName, legacyID, legacyCAFile, legacyCAHex, legacySig); err != nil {
-				return err
-			} else if legacySlot != nil {
-				slots[slotName] = legacySlot
-			}
-		}
 	}
 
 	tok := strings.TrimSpace(*tokenFlag)
@@ -335,8 +282,6 @@ func runCtl(args []string) error {
 		if err != nil {
 			return err
 		}
-		// Give pairnet.state a short moment to arrive so reverse peer info persists.
-		time.Sleep(150 * time.Millisecond)
 		if emitter != nil {
 			emitter.Emit(map[string]any{"type": "remote.paired", "peer": info})
 			return nil

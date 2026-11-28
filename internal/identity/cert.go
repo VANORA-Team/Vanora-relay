@@ -20,8 +20,10 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -135,12 +137,17 @@ type certificateClaims struct {
 // principal. Clients compare the returned Issuer, Subject and DeviceID with
 // the values they expected for the selected computer before trusting it.
 func VerifyCertificate(token string, trusted ed25519.PublicKey, now time.Time) (Principal, error) {
-	payload, err := verifyTokenSignature(token, CertificatePrefix, trusted, maxCertificateSize)
+	return VerifyCertificateWithKeys(token, []ed25519.PublicKey{trusted}, now)
+}
+
+// VerifyCertificateWithKeys accepts a certificate signed by any trusted key.
+func VerifyCertificateWithKeys(token string, keys []ed25519.PublicKey, now time.Time) (Principal, error) {
+	payload, err := verifyTokenSignature(token, CertificatePrefix, "vanc+v1", keys, maxCertificateSize)
 	if err != nil {
 		return Principal{}, err
 	}
 	var claims certificateClaims
-	if err := json.Unmarshal(payload.Claims, &claims); err != nil {
+	if err := json.Unmarshal(payload, &claims); err != nil {
 		return Principal{}, fmt.Errorf("%w: claims: %v", ErrCertificateMalformed, err)
 	}
 	if claims.Version != certificateVersion {
@@ -155,7 +162,7 @@ func VerifyCertificate(token string, trusted ed25519.PublicKey, now time.Time) (
 	if err := validateIssuerURL(claims.Issuer); err != nil {
 		return Principal{}, err
 	}
-	if !validDeviceID(claims.DeviceID) {
+	if !ValidDeviceID(claims.DeviceID) {
 		return Principal{}, fmt.Errorf("%w: invalid device id", ErrCertificateMalformed)
 	}
 	publicKey, err := base64.RawURLEncoding.Strict().DecodeString(claims.PublicKey)
@@ -185,61 +192,55 @@ func VerifyCertificate(token string, trusted ed25519.PublicKey, now time.Time) (
 	}, nil
 }
 
-// verifiedToken is the parsed signing input of a token.
-type verifiedToken struct {
-	Claims json.RawMessage
-}
-
 // verifyTokenSignature parses the compact token, verifies its Ed25519
 // signature over the exact transmitted bytes and returns the claims.
-func verifyTokenSignature(token, prefix string, trusted ed25519.PublicKey, maxSize int) (verifiedToken, error) {
-	var zero verifiedToken
-	if len(trusted) != ed25519.PublicKeySize {
-		return zero, fmt.Errorf("%w: trusted key has %d bytes", ErrCertificateSignature, len(trusted))
+func verifyTokenSignature(token, prefix, typ string, keys []ed25519.PublicKey, maxSize int) ([]byte, error) {
+	if len(keys) == 1 && len(keys[0]) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("%w: trusted key has %d bytes", ErrCertificateSignature, len(keys[0]))
 	}
 	if token == "" || len(token) > maxSize {
-		return zero, fmt.Errorf("%w: token size %d", ErrCertificateMalformed, len(token))
+		return nil, fmt.Errorf("%w: token size %d", ErrCertificateMalformed, len(token))
 	}
 	rest, ok := strings.CutPrefix(token, prefix)
 	if !ok {
-		return zero, fmt.Errorf("%w: unknown prefix", ErrCertificateMalformed)
+		return nil, fmt.Errorf("%w: unknown prefix", ErrCertificateMalformed)
 	}
 	parts := strings.Split(rest, ".")
 	if len(parts) != 3 {
-		return zero, fmt.Errorf("%w: expected 3 segments", ErrCertificateMalformed)
+		return nil, fmt.Errorf("%w: expected 3 segments", ErrCertificateMalformed)
 	}
-	for _, part := range parts[:2] {
-		if part == "" {
-			return zero, fmt.Errorf("%w: empty segment", ErrCertificateMalformed)
-		}
-		if _, err := decodeSegment(part); err != nil {
-			return zero, fmt.Errorf("%w: %v", ErrCertificateMalformed, err)
-		}
+	if parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf("%w: empty segment", ErrCertificateMalformed)
 	}
-	signature, err := decodeSegment(parts[2])
-	if err != nil || len(signature) != ed25519.SignatureSize {
-		return zero, fmt.Errorf("%w: signature", ErrCertificateMalformed)
-	}
-	signingInput := prefix + parts[0] + "." + parts[1]
-	if !ed25519.Verify(trusted, []byte(signingInput), signature) {
-		return zero, ErrCertificateSignature
-	}
-	var header certificateHeader
 	headerBytes, err := decodeSegment(parts[0])
 	if err != nil {
-		return zero, fmt.Errorf("%w: header: %v", ErrCertificateMalformed, err)
-	}
-	if err := json.Unmarshal(headerBytes, &header); err != nil {
-		return zero, fmt.Errorf("%w: header: %v", ErrCertificateMalformed, err)
-	}
-	if header.Alg != "EdDSA" {
-		return zero, fmt.Errorf("%w: alg %q", ErrCertificateMalformed, header.Alg)
+		return nil, fmt.Errorf("%w: header: %v", ErrCertificateMalformed, err)
 	}
 	claims, err := decodeSegment(parts[1])
 	if err != nil {
-		return zero, fmt.Errorf("%w: claims: %v", ErrCertificateMalformed, err)
+		return nil, fmt.Errorf("%w: claims: %v", ErrCertificateMalformed, err)
 	}
-	return verifiedToken{Claims: claims}, nil
+	signature, err := decodeSegment(parts[2])
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("%w: signature", ErrCertificateMalformed)
+	}
+	signingInput := []byte(token[:len(token)-len(parts[2])-1])
+	if !slices.ContainsFunc(keys, func(key ed25519.PublicKey) bool {
+		return len(key) == ed25519.PublicKeySize && ed25519.Verify(key, signingInput, signature)
+	}) {
+		return nil, ErrCertificateSignature
+	}
+	var header certificateHeader
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("%w: header: %v", ErrCertificateMalformed, err)
+	}
+	if header.Alg != "EdDSA" {
+		return nil, fmt.Errorf("%w: alg %q", ErrCertificateMalformed, header.Alg)
+	}
+	if header.Typ != "" && header.Typ != typ {
+		return nil, fmt.Errorf("%w: typ %q", ErrCertificateMalformed, header.Typ)
+	}
+	return claims, nil
 }
 
 func decodeSegment(s string) ([]byte, error) {
@@ -250,14 +251,25 @@ func decodeSegment(s string) ([]byte, error) {
 	return b, nil
 }
 
-// validDeviceID reports whether id has the shape dev_<26-char-base32>.
-func validDeviceID(id string) bool {
-	rest, ok := strings.CutPrefix(id, deviceIDPrefix)
+// ValidDeviceID reports whether id has the shape dev_<26-char-lowercase-base32>.
+func ValidDeviceID(id string) bool {
+	return validID(id, deviceIDPrefix)
+}
+
+// ValidRemoteUserID reports whether id has the shape usr_<26-char-lowercase-base32>.
+func ValidRemoteUserID(id string) bool {
+	return validID(id, remoteUserIDPrefix)
+}
+
+func validID(id, prefix string) bool {
+	rest, ok := strings.CutPrefix(id, prefix)
 	if !ok || len(rest) != 26 {
 		return false
 	}
-	if _, err := base32NoPad.DecodeString(strings.ToUpper(rest)); err != nil {
-		return false
+	for _, char := range rest {
+		if (char < 'a' || char > 'z') && (char < '2' || char > '7') {
+			return false
+		}
 	}
 	return true
 }
@@ -316,10 +328,42 @@ func ParsePublicKey(data []byte) (ed25519.PublicKey, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: empty", ErrPublicKey)
 	}
-	text := strings.TrimSpace(string(data))
+	if key := parseEncodedPublicKey(strings.TrimSpace(string(data))); key != nil {
+		return key, nil
+	}
+	if len(data) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(append([]byte(nil), data...)), nil
+	}
+	return nil, fmt.Errorf("%w: unrecognized public key encoding", ErrPublicKey)
+}
+
+// ParsePublicKeys parses comma- or whitespace-separated hex or base64 public
+// keys, or a single raw Ed25519 public key.
+func ParsePublicKeys(data []byte) ([]ed25519.PublicKey, error) {
+	if len(data) == ed25519.PublicKeySize {
+		return []ed25519.PublicKey{ed25519.PublicKey(append([]byte(nil), data...))}, nil
+	}
+	fields := strings.FieldsFunc(string(data), func(char rune) bool {
+		return char == ',' || unicode.IsSpace(char)
+	})
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("%w: empty", ErrPublicKey)
+	}
+	keys := make([]ed25519.PublicKey, 0, len(fields))
+	for index, field := range fields {
+		key := parseEncodedPublicKey(field)
+		if key == nil {
+			return nil, fmt.Errorf("%w: unrecognized encoding for key %d", ErrPublicKey, index+1)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func parseEncodedPublicKey(text string) ed25519.PublicKey {
 	if len(text) == ed25519.PublicKeySize*2 {
 		if decoded, err := hex.DecodeString(text); err == nil && len(decoded) == ed25519.PublicKeySize {
-			return ed25519.PublicKey(decoded), nil
+			return ed25519.PublicKey(decoded)
 		}
 	}
 	for _, encoding := range []*base64.Encoding{
@@ -329,11 +373,8 @@ func ParsePublicKey(data []byte) (ed25519.PublicKey, error) {
 		base64.RawURLEncoding,
 	} {
 		if decoded, err := encoding.DecodeString(text); err == nil && len(decoded) == ed25519.PublicKeySize {
-			return ed25519.PublicKey(decoded), nil
+			return ed25519.PublicKey(decoded)
 		}
 	}
-	if len(data) == ed25519.PublicKeySize {
-		return ed25519.PublicKey(append([]byte(nil), data...)), nil
-	}
-	return nil, fmt.Errorf("%w: unrecognized public key encoding", ErrPublicKey)
+	return nil
 }

@@ -64,6 +64,12 @@ func Dial(ctx context.Context, target Target, seed, name string, handler transpo
 }
 
 func DialWithOptions(ctx context.Context, target Target, seed, name, role, localAddr string, handler transport.Handler) (transport.Peer, func(), error) {
+	return DialWithOptionsFor(ctx, ctx, target, seed, name, role, localAddr, handler)
+}
+
+// DialWithOptionsFor bounds only the WebSocket handshake with setupCtx while
+// attaching the resulting peer's lifetime to lifetimeCtx.
+func DialWithOptionsFor(setupCtx, lifetimeCtx context.Context, target Target, seed, name, role, localAddr string, handler transport.Handler) (transport.Peer, func(), error) {
 	if role == "" {
 		role = "mobile"
 	}
@@ -122,7 +128,7 @@ func DialWithOptions(ctx context.Context, target Target, seed, name, role, local
 	if target.Token != "" {
 		header.Set(tokenHeader, target.Token)
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	dialCtx, cancel := context.WithTimeout(setupCtx, 10*time.Second)
 	defer cancel()
 	socketURL := (&url.URL{Scheme: "wss", Host: address.String(), Path: path}).String()
 	var socket *websocket.Conn
@@ -141,7 +147,7 @@ func DialWithOptions(ctx context.Context, target Target, seed, name, role, local
 		}
 		return nil, nil, err
 	}
-	p := newPeer(ctx, socket, target.Pin, pathForAddress(address.Addr()), func() bool { return true })
+	p := newPeer(lifetimeCtx, socket, target.Pin, pathForAddress(address.Addr()), func() bool { return true })
 	return p, func() { go p.run(handler, transport.MaxFrameSize) }, nil
 }
 

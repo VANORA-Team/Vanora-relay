@@ -3,7 +3,10 @@ package ice
 import (
 	"net"
 	"net/netip"
+	"time"
 )
+
+const localAddrTTL = time.Minute
 
 // blockedPeerPrefixes are additional non-public ranges that are neither
 // reported as private nor as link-local by net/netip. The goal is that a TURN
@@ -67,11 +70,11 @@ func publicPeer(peerIP net.IP) bool {
 // non-advertised secondary host interfaces (such as management or extra public
 // IPs).
 func hostInterfaceAddrs() map[netip.Addr]struct{} {
-	out := make(map[netip.Addr]struct{})
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return out
+		return nil
 	}
+	out := make(map[netip.Addr]struct{}, len(addrs))
 	for _, a := range addrs {
 		var ip net.IP
 		switch v := a.(type) {
@@ -91,8 +94,29 @@ func hostInterfaceAddrs() map[netip.Addr]struct{} {
 }
 
 func (s *Server) isLocalHostAddr(addr netip.Addr) bool {
-	_, ok := s.localAddrs[addr.Unmap()]
+	if until := s.localAddrUntil.Load(); until == nil || !time.Now().Before(*until) {
+		s.refreshLocalAddrs()
+	}
+	addrs := s.localAddrs.Load()
+	if addrs == nil {
+		return true
+	}
+	_, ok := (*addrs)[addr.Unmap().WithZone("")]
 	return ok
+}
+
+func (s *Server) refreshLocalAddrs() {
+	s.localAddrMu.Lock()
+	defer s.localAddrMu.Unlock()
+	now := time.Now()
+	if until := s.localAddrUntil.Load(); until != nil && now.Before(*until) {
+		return
+	}
+	if addrs := hostInterfaceAddrs(); addrs != nil {
+		s.localAddrs.Store(&addrs)
+	}
+	until := now.Add(localAddrTTL)
+	s.localAddrUntil.Store(&until)
 }
 
 // peerAllowed is the pion PermissionHandler. Pion calls it for both

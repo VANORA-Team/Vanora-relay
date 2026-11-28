@@ -4,16 +4,123 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 var testServiceToken = strings.Repeat("a", 32)
+
+type testRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f testRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func testEntitlementResponse(allowed bool, end time.Time) *http.Response {
+	payload := fmt.Sprintf(`{"success":true,"data":{"relay_allowed":%t,"valid_until":%d}}`, allowed, end.Unix())
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(payload))}
+}
+
+func TestLookupCacheSharesPositiveResultsAndHonorsExpiry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, lifetime := range []time.Duration{time.Second, time.Minute} {
+			end := time.Now().Truncate(time.Second).Add(lifetime)
+			calls := 0
+			client := &Client{
+				URL: "https://relay.example", Token: testServiceToken, CacheTTL: 10 * time.Second,
+				HTTP: &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
+					calls++
+					return testEntitlementResponse(calls == 1, end), nil
+				})},
+			}
+			if got, err := client.Check(t.Context(), "issuer", "subject"); err != nil || !got.Equal(end) {
+				t.Fatalf("initial Check = %v, %v, want %v", got, err, end)
+			}
+			if got, err := client.Lookup(t.Context(), "issuer", "subject"); err != nil || !got.RelayAllowed || calls != 1 {
+				t.Fatalf("cached Lookup = %+v, %v, with %d requests", got, err, calls)
+			}
+			time.Sleep(min(client.CacheTTL, lifetime))
+			if got, err := client.Check(t.Context(), "issuer", "subject"); err != nil || !got.IsZero() || calls != 2 {
+				t.Fatalf("refreshed Check = %v, %v, with %d requests", got, err, calls)
+			}
+		}
+	})
+}
+
+func TestLookupCachesDefinitiveDenialsBriefly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, ttl := range []time.Duration{4 * time.Second, time.Minute} {
+			calls := 0
+			client := &Client{
+				URL: "https://relay.example", Token: testServiceToken, CacheTTL: ttl,
+				HTTP: &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
+					calls++
+					return testEntitlementResponse(calls > 1, time.Now().Add(time.Hour)), nil
+				})},
+			}
+			negativeTTL := min(ttl/2, 5*time.Second)
+			if got, err := client.Lookup(t.Context(), "issuer", "subject"); err != nil || got.RelayAllowed {
+				t.Fatalf("initial Lookup = %+v, %v", got, err)
+			}
+			time.Sleep(negativeTTL - time.Nanosecond)
+			if got, err := client.Check(t.Context(), "issuer", "subject"); err != nil || !got.IsZero() || calls != 1 {
+				t.Fatalf("cached denial = %v, %v, with %d requests", got, err, calls)
+			}
+			time.Sleep(time.Nanosecond)
+			if got, err := client.Check(t.Context(), "issuer", "subject"); err != nil || got.IsZero() || calls != 2 {
+				t.Fatalf("expired denial = %v, %v, with %d requests", got, err, calls)
+			}
+		}
+	})
+}
+
+func TestLookupCoalescesCheckAndLookupWithIndependentCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		var calls atomic.Int32
+		client := &Client{
+			URL: "https://relay.example", Token: testServiceToken,
+			HTTP: &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				<-release
+				return testEntitlementResponse(true, time.Now().Add(time.Hour)), nil
+			})},
+		}
+		leader, cancel := context.WithCancel(t.Context())
+		checkResult := make(chan error, 1)
+		go func() {
+			_, err := client.Check(leader, "issuer", "subject")
+			checkResult <- err
+		}()
+		synctest.Wait()
+		lookupResult := make(chan error, 1)
+		go func() {
+			ent, err := client.Lookup(t.Context(), "issuer", "subject")
+			if err == nil && !ent.RelayAllowed {
+				err = errors.New("shared lookup lost its grant")
+			}
+			lookupResult <- err
+		}()
+		synctest.Wait()
+		cancel()
+		if err := <-checkResult; !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled caller returned %v", err)
+		}
+		close(release)
+		if err := <-lookupResult; err != nil {
+			t.Fatal(err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("backend got %d requests, want one shared request", got)
+		}
+	})
+}
 
 func TestCheckGrantsRelayEntitlement(t *testing.T) {
 	wantEnd := time.Now().Add(24 * time.Hour).Truncate(time.Second).UTC()

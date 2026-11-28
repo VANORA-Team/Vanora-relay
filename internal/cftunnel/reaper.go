@@ -163,6 +163,9 @@ func (r *Reaper) sweepAllocations(ctx context.Context, kind string, now time.Tim
 			if requests.Err() != nil {
 				break
 			}
+			if entry.Presence != nil && entry.Presence.Active(now) {
+				continue
+			}
 			if entry.Allocation.State == StateReady && entry.Allocation.Observation.ObservedAt.Before(now) {
 				group.Go(func() error {
 					return r.observe(requests, now, &page[index].Allocation)
@@ -282,6 +285,7 @@ func (r *Reaper) considerAllocation(ctx context.Context, kind string, entry Reap
 	switch {
 	case err == nil:
 		result.ReleaseClaims++
+		s.WakeWorker()
 	case errors.Is(err, ErrGenerationConflict), errors.Is(err, ErrInvalidTransition), errors.Is(err, ErrOperationInProgress),
 		errors.Is(err, ErrPresenceActive):
 		return nil

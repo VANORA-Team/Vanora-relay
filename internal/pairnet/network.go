@@ -15,6 +15,12 @@ type Store interface {
 	Save(string) error
 }
 
+const (
+	epochLimit       = 1 << 53
+	maxEpochAdvance  = 1000
+	incomingMaxValue = epochLimit - 2
+)
+
 type Member struct {
 	ID      string `json:"id"`
 	Role    string `json:"role"`
@@ -32,7 +38,7 @@ func (m Member) valid() bool {
 	pin, err := base64.RawURLEncoding.Strict().DecodeString(m.Pin)
 	return err == nil && len(pin) == 32 && m.ID != "" && len(m.ID) <= 128 &&
 		(m.Role == "desktop" || m.Role == "mobile") && len(m.Owner) <= 128 &&
-		len(m.Name) <= 128 && len(m.Address) <= 256 && m.Epoch > 0 && m.Epoch < 1<<53 && m.Change < 1<<53
+		len(m.Name) <= 128 && len(m.Address) <= 256 && m.Epoch > 0 && m.Epoch < epochLimit && m.Change < epochLimit
 }
 
 type Roster map[string]Member
@@ -111,7 +117,7 @@ func (db *Database) Load() (string, error) {
 
 func (db *Database) write(next stored) error {
 	value := next.Identity
-	if len(next.Groups) != 0 {
+	if len(next.Groups) != 0 || next.Connection != (Profile{}) {
 		raw, err := json.Marshal(next)
 		if err != nil {
 			return err
@@ -180,7 +186,10 @@ func (g *Group) GrantExpired(id string, localEpoch, peerEpoch uint64) bool {
 		peer.Epoch != 0 && peer.Epoch != max(1, peerEpoch)
 }
 
-var ErrRemoved = errors.New("device removed from pairing network")
+var (
+	ErrRemoved             = errors.New("device removed from pairing network")
+	errNetworkCounterLimit = errors.New("pairing network member counter limit reached")
+)
 
 func (g *Group) update(fn func(Roster) error) (bool, error) {
 	g.db.mu.Lock()
@@ -226,6 +235,9 @@ func (g *Group) Admit(local, peer Member, invited bool) error {
 				if old.Epoch != 0 && !invited {
 					return ErrRemoved
 				}
+				if member.Epoch >= epochLimit-2 {
+					return errNetworkCounterLimit
+				}
 				member.Epoch++
 			}
 			if old.Epoch != 0 && (member.Pin != old.Pin || member.Role != old.Role || member.Owner != old.Owner) {
@@ -241,6 +253,9 @@ func (g *Group) Admit(local, peer Member, invited bool) error {
 				return errors.New("invalid pairing member")
 			}
 			if member != old {
+				if member.Change >= epochLimit-1 {
+					return errNetworkCounterLimit
+				}
 				member.Change++
 				r[member.ID] = member
 			}
@@ -270,6 +285,9 @@ func (g *Group) UpdateSelf(member Member) error {
 			return errors.New("invalid pairing member")
 		}
 		if next != old {
+			if next.Change >= epochLimit-1 {
+				return errNetworkCounterLimit
+			}
 			next.Change++
 			r[g.self] = next
 		}
@@ -289,6 +307,9 @@ func (g *Group) Remove(ids ...string) error {
 				return errors.New("unknown network member")
 			}
 			if member.Active() {
+				if member.Epoch >= epochLimit-1 {
+					return errNetworkCounterLimit
+				}
 				member.Epoch++
 				r[id] = member
 			}
@@ -309,6 +330,15 @@ func (g *Group) Merge(sender string, incoming Roster) (bool, error) {
 		if incoming[sender].Epoch < r[sender].Epoch {
 			return nil
 		}
+		for id, next := range incoming {
+			old := r[id]
+			if id != next.ID || !next.valid() || next.Epoch >= incomingMaxValue || next.Change >= incomingMaxValue ||
+				next.Epoch > old.Epoch+maxEpochAdvance || next.Change > old.Change+maxEpochAdvance ||
+				old.Epoch == 0 && !next.Active() ||
+				(old.Epoch != 0 && (old.Pin != next.Pin || old.Owner != next.Owner || old.Role != next.Role)) {
+				return errors.New("invalid pairing network update")
+			}
+		}
 		// Desktop members own the highest tier of roster authority: a
 		// rejoin wipe (clearing the whole roster on epoch bump) is only
 		// accepted from a desktop. Introducing members, name/address
@@ -325,11 +355,8 @@ func (g *Group) Merge(sender string, incoming Roster) (bool, error) {
 		}
 		for id, next := range incoming {
 			old := r[id]
-			if id != next.ID || !next.valid() || (old.Epoch != 0 && (old.Pin != next.Pin || old.Owner != next.Owner || old.Role != next.Role)) {
-				return errors.New("invalid pairing network update")
-			}
 			if next.Epoch > old.Epoch || next.Epoch == old.Epoch && (next.Change > old.Change ||
-				next.Change == old.Change && strings.Compare(next.Name+"\x00"+next.Address, old.Name+"\x00"+old.Address) > 0) {
+				next.Change == old.Change && (id == sender || strings.Compare(next.Name+"\x00"+next.Address, old.Name+"\x00"+old.Address) > 0)) {
 				r[id] = next
 			}
 		}
@@ -339,7 +366,7 @@ func (g *Group) Merge(sender string, incoming Roster) (bool, error) {
 
 func (g *Group) ReceiveRemoval(sender string, own bool, epoch uint64) (bool, error) {
 	return g.update(func(r Roster) error {
-		if epoch == 0 || epoch%2 != 0 || epoch >= 1<<53 || !r[sender].Active() {
+		if epoch == 0 || epoch%2 != 0 || epoch >= incomingMaxValue || !r[sender].Active() {
 			return ErrRemoved
 		}
 		id := sender
@@ -347,6 +374,9 @@ func (g *Group) ReceiveRemoval(sender string, own bool, epoch uint64) (bool, err
 			id = g.self
 		}
 		member := r[id]
+		if member.Epoch == 0 || epoch > member.Epoch+maxEpochAdvance {
+			return ErrRemoved
+		}
 		if member.Epoch < epoch {
 			member.Epoch = epoch
 			r[id] = member

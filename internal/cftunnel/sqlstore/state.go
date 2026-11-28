@@ -92,7 +92,7 @@ func (s *Store) markRecoveryEnabled(ctx context.Context, tx *sql.Tx, key cftunne
 
 func (s *Store) ConsumeProof(ctx context.Context, proof cftunnel.ProofUse, now time.Time) error {
 	return s.transact(ctx, func(tx *sql.Tx) error {
-		if err := s.lockScope(ctx, tx, proof.ScopeID); err != nil {
+		if err := s.checkScope(ctx, tx, proof.ScopeID, false); err != nil {
 			return err
 		}
 		return s.consumeProof(ctx, tx, proof, now)
@@ -322,7 +322,7 @@ func (s *Store) SetOwnerOverride(ctx context.Context, scopeID, ownerID string, o
 		slots, expires = override.MaxTunnels, stamp(override.ExpiresAt)
 	}
 	return s.transact(ctx, func(tx *sql.Tx) error {
-		if err := s.lockScope(ctx, tx, scopeID); err != nil {
+		if err := s.checkScope(ctx, tx, scopeID, false); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, s.bind(`INSERT INTO cf_owner (scope_id, id, override_slots, override_expires_at)
@@ -354,7 +354,7 @@ func (s *Store) PruneExpired(ctx context.Context, scopeID string, now time.Time)
 		return cftunnel.ErrInvalidClaim
 	}
 	return s.transact(ctx, func(tx *sql.Tx) error {
-		if err := s.lockScope(ctx, tx, scopeID); err != nil {
+		if err := s.checkScope(ctx, tx, scopeID, false); err != nil {
 			return err
 		}
 		expiredRows := []string{

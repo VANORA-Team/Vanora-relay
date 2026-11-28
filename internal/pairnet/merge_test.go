@@ -2,6 +2,8 @@ package pairnet
 
 import (
 	"encoding/base64"
+	"errors"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -193,5 +195,164 @@ func TestMergeDesktopCanAdvanceThirdPartyEpoch(t *testing.T) {
 	}
 	if !changed || db.state.Groups[key][guestB].Epoch != 2 {
 		t.Fatal("desktop must retain full roster authority")
+	}
+}
+
+func TestMergeRejectsInvalidCountersAndUnknownTombstones(t *testing.T) {
+	const self, sender = "self", "sender"
+	for _, test := range []struct {
+		name   string
+		id     string
+		epoch  uint64
+		change uint64
+	}{
+		{name: "epoch jump", id: sender, epoch: 1003},
+		{name: "epoch limit", id: sender, epoch: epochLimit - 1},
+		{name: "change jump", id: sender, epoch: 1, change: 1001},
+		{name: "change limit", id: sender, epoch: 1, change: epochLimit - 2},
+		{name: "unknown tombstone", id: "unknown", epoch: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := seedRoster(self, sender)
+			db := newTestDB(t, self, before)
+			group := db.Group("net", self)
+			incoming := maps.Clone(before)
+			member := testMember(test.id, "mobile", test.epoch)
+			member.Change = test.change
+			incoming[test.id] = member
+			if changed, err := group.Merge(sender, incoming); changed || err == nil {
+				t.Fatalf("Merge = %v, %v, want error without changes", changed, err)
+			}
+			if !maps.Equal(group.Snapshot(), before) {
+				t.Fatal("rejected merge changed the roster")
+			}
+			if err := group.Remove(sender); err != nil || group.Allows(sender) {
+				t.Fatalf("sender removal failed after rejected update: %v", err)
+			}
+		})
+	}
+}
+
+func TestMergeValidatesBeforeDesktopRejoinWipesRoster(t *testing.T) {
+	const self, sender, third = "self", "sender", "third"
+	before := seedRoster(sender, self, third)
+	group := newTestDB(t, self, before).Group("net", self)
+	incoming := maps.Clone(before)
+	incoming[self] = testMember(self, "mobile", 3)
+	incoming[third] = testMember(third, "mobile", 1)
+	altered := incoming[third]
+	altered.Owner = "new owner"
+	incoming[third] = altered
+	if changed, err := group.Merge(sender, incoming); changed || err == nil || !maps.Equal(group.Snapshot(), before) {
+		t.Fatalf("invalid rejoin = %v, %v, roster %v", changed, err, group.Snapshot())
+	}
+}
+
+func TestMergeCounterTiesPreferSenderMetadata(t *testing.T) {
+	const self, sender, third = "self", "sender", "third"
+	before := seedRoster(self, sender, third)
+	for _, id := range []string{sender, third} {
+		member := before[id]
+		member.Change = 7
+		member.Name = "Zoe"
+		member.Address = "address-z"
+		before[id] = member
+	}
+	group := newTestDB(t, self, before).Group("net", self)
+	incoming := maps.Clone(before)
+	for _, id := range []string{sender, third} {
+		member := incoming[id]
+		member.Name = "Alice"
+		member.Address = "address-a"
+		incoming[id] = member
+	}
+	if changed, err := group.Merge(sender, incoming); !changed || err != nil {
+		t.Fatalf("Merge = %v, %v, want sender metadata update", changed, err)
+	}
+	after := group.Snapshot()
+	if after[sender] != incoming[sender] || after[third] != before[third] {
+		t.Fatalf("unexpected metadata after merge: %v", after)
+	}
+}
+
+func TestLocalMutationsGuardCounterOverflow(t *testing.T) {
+	const self, peer = "self", "peer"
+	for _, test := range []struct {
+		name   string
+		epoch  uint64
+		change uint64
+		mutate func(*Group, Member, Member) error
+	}{
+		{"remove epoch", epochLimit - 1, 0, func(group *Group, _, peer Member) error {
+			return group.Remove(peer.ID)
+		}},
+		{"admit epoch", epochLimit - 2, 0, func(group *Group, local, peer Member) error {
+			return group.Admit(local, peer, true)
+		}},
+		{"admit change", 1, epochLimit - 1, func(group *Group, local, peer Member) error {
+			peer.Name = "new name"
+			return group.Admit(local, peer, false)
+		}},
+		{"update self change", 1, epochLimit - 1, func(group *Group, local, _ Member) error {
+			local.Name = "new name"
+			return group.UpdateSelf(local)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local := testMember(self, "desktop", 1)
+			local.Change = epochLimit - 1
+			member := testMember(peer, "mobile", test.epoch)
+			member.Change = test.change
+			before := Roster{self: local, peer: member}
+			group := newTestDB(t, self, before).Group("net", self)
+			if err := test.mutate(group, local, member); !errors.Is(err, errNetworkCounterLimit) {
+				t.Fatalf("%s returned %v, want counter limit error", test.name, err)
+			}
+			if !maps.Equal(group.Snapshot(), before) {
+				t.Fatal("rejected mutation changed the roster")
+			}
+		})
+	}
+}
+
+func TestReceiveRemovalRejectsCounterPoisoning(t *testing.T) {
+	const self, sender = "self", "sender"
+	before := seedRoster(self, sender)
+	group := newTestDB(t, self, before).Group("net", self)
+	for _, epoch := range []uint64{1002, epochLimit - 2} {
+		if changed, err := group.ReceiveRemoval(sender, true, epoch); changed || !errors.Is(err, ErrRemoved) {
+			t.Fatalf("ReceiveRemoval(%d) = %v, %v", epoch, changed, err)
+		}
+	}
+	if !maps.Equal(group.Snapshot(), before) {
+		t.Fatal("rejected removal changed the roster")
+	}
+	if changed, err := group.ReceiveRemoval(sender, true, 2); !changed || err != nil || group.Allows(self) {
+		t.Fatalf("valid removal = %v, %v", changed, err)
+	}
+}
+
+func TestProfilePersistsBeforeAnyGroupExists(t *testing.T) {
+	store := &memStore{data: "legacy identity"}
+	db, err := Open(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{Service: "https://relay.example", Name: "saved relay"}
+	if err := db.SetProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Profile(); got != profile || len(reopened.state.Groups) != 0 {
+		t.Fatalf("reopened profile = %+v, groups = %v", got, reopened.state.Groups)
+	}
+	if got, err := reopened.Load(); err != nil || got != "legacy identity" {
+		t.Fatalf("reopened identity = %q, %v", got, err)
+	}
+	if err := reopened.SetProfile(Profile{}); err != nil || store.data != "legacy identity" {
+		t.Fatalf("clearing last profile kept unexpected on-disk state: %q, %v", store.data, err)
 	}
 }

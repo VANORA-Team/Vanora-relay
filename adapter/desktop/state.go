@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 )
 
@@ -81,6 +83,9 @@ type persistedSession struct {
 	Runs          map[string]runRecord          `json:"runs,omitempty"`
 	GuestRequests map[string]guestRequestRecord `json:"guest_requests,omitempty"`
 	PendingGuest  []GuestRequestInfo            `json:"pending_guest,omitempty"`
+
+	cachedEventBytes int64
+	bytesReady       bool
 }
 
 type storedEvent struct {
@@ -223,6 +228,7 @@ func newPersistedSession() *persistedSession {
 		Requests:      make(map[string]requestRecord),
 		Runs:          make(map[string]runRecord),
 		GuestRequests: make(map[string]guestRequestRecord),
+		bytesReady:    true,
 	}
 }
 
@@ -293,6 +299,7 @@ func (ps *persistedSession) validateAndNormalize() error {
 		}
 	}
 	sort.Slice(ps.Events, func(i, j int) bool { return ps.Events[i].Seq < ps.Events[j].Seq })
+	var totalBytes int64
 	for i := range ps.Events {
 		e := &ps.Events[i]
 		if e.Seq <= 0 {
@@ -310,10 +317,13 @@ func (ps *persistedSession) validateAndNormalize() error {
 		if e.Seq > ps.LastSeq {
 			ps.LastSeq = e.Seq
 		}
+		totalBytes += estimateEventBytes(*e)
 	}
 	if ps.LastSeq < 0 {
 		return errors.New("negative last_seq")
 	}
+	ps.cachedEventBytes = totalBytes
+	ps.bytesReady = true
 	ps.recalculateFirstSeq()
 	return nil
 }
@@ -327,10 +337,15 @@ func (ps *persistedSession) recalculateFirstSeq() {
 }
 
 func (ps *persistedSession) eventBytes() int64 {
+	if ps.bytesReady {
+		return ps.cachedEventBytes
+	}
 	var n int64
 	for _, e := range ps.Events {
 		n += estimateEventBytes(e)
 	}
+	ps.cachedEventBytes = n
+	ps.bytesReady = true
 	return n
 }
 
@@ -339,27 +354,183 @@ func estimateEventBytes(e storedEvent) int64 {
 }
 
 func (ps *persistedSession) appendEvent(e storedEvent) {
+	if !ps.bytesReady {
+		_ = ps.eventBytes()
+	}
 	ps.Events = append(ps.Events, e)
+	ps.cachedEventBytes += estimateEventBytes(e)
 	ps.LastSeq = e.Seq
 	if ps.FirstSeq == 0 {
 		ps.FirstSeq = e.Seq
 	}
 }
 
+// rollbackEvents truncates events appended after origLen in O(k) without
+// cloning the entire slice up front.
+func (ps *persistedSession) rollbackEvents(origLen int, origLastSeq, origFirstSeq int64) {
+	if origLen < 0 || origLen > len(ps.Events) {
+		return
+	}
+	if ps.bytesReady {
+		for i := origLen; i < len(ps.Events); i++ {
+			ps.cachedEventBytes -= estimateEventBytes(ps.Events[i])
+		}
+		if ps.cachedEventBytes < 0 {
+			ps.bytesReady = false
+		}
+	}
+	clear(ps.Events[origLen:])
+	ps.Events = ps.Events[:origLen]
+	ps.LastSeq = origLastSeq
+	ps.FirstSeq = origFirstSeq
+}
+
+func (ps *persistedSession) compactEventsIfSparse() {
+	if len(ps.Events) == 0 {
+		ps.Events = nil
+		ps.cachedEventBytes = 0
+		ps.bytesReady = true
+		return
+	}
+	if cap(ps.Events) > 64 && len(ps.Events)*2 <= cap(ps.Events) {
+		compacted := make([]storedEvent, len(ps.Events))
+		copy(compacted, ps.Events)
+		ps.Events = compacted
+	}
+}
+
 func (ps *persistedSession) trim(ret RetentionConfig) {
 	if len(ps.Events) == 0 {
 		ps.FirstSeq = 0
+		ps.cachedEventBytes = 0
+		ps.bytesReady = true
 		return
 	}
 	total := ps.eventBytes()
-	for len(ps.Events) > 1 && (len(ps.Events) > ret.MaxEvents || total > ret.MaxBytes) {
-		total -= estimateEventBytes(ps.Events[0])
-		ps.Events = ps.Events[1:]
+	trimmed := 0
+	for len(ps.Events)-trimmed > 1 && (len(ps.Events)-trimmed > ret.MaxEvents || total > ret.MaxBytes) {
+		total -= estimateEventBytes(ps.Events[trimmed])
+		trimmed++
+	}
+	if trimmed > 0 {
+		clear(ps.Events[:trimmed])
+		ps.Events = ps.Events[trimmed:]
+		ps.cachedEventBytes = max(0, total)
+		ps.compactEventsIfSparse()
 	}
 	ps.recalculateFirstSeq()
 	trimMap(ps.Requests, ret.MaxRequests, func(r requestRecord) int64 { return r.Created })
 	trimMap(ps.Runs, ret.MaxRequests, func(r runRecord) int64 { return r.Created })
 	trimMap(ps.GuestRequests, ret.MaxRequests, func(r guestRequestRecord) int64 { return r.Created })
+}
+
+func (ps *persistedSession) evictEventsToFree(bytesToFree int64, keepOne bool) int64 {
+	if bytesToFree <= 0 || len(ps.Events) == 0 {
+		return 0
+	}
+	minLen := 0
+	if keepOne {
+		minLen = 1
+	}
+	var freed int64
+	trimmed := 0
+	total := ps.eventBytes()
+	for len(ps.Events)-trimmed > minLen && freed < bytesToFree {
+		sz := estimateEventBytes(ps.Events[trimmed])
+		total -= sz
+		freed += sz
+		trimmed++
+	}
+	if trimmed > 0 {
+		clear(ps.Events[:trimmed])
+		ps.Events = ps.Events[trimmed:]
+		ps.cachedEventBytes = max(0, total)
+		ps.compactEventsIfSparse()
+		ps.recalculateFirstSeq()
+	}
+	return freed
+}
+
+// enforceGlobalBudget trims oldest retained events across sessions (inactive
+// sessions first, then active sessions) when aggregate retained event bytes
+// approach the 32 MiB persistence ceiling, preserving LastSeq so disconnected
+// clients gracefully fall back to snapshot_required instead of bricking saves.
+func (st *persistedState) enforceGlobalBudget(activeSessionIDs map[string]bool, softLimit int64) {
+	if st == nil || softLimit <= 0 {
+		return
+	}
+	var total int64
+	type candidate struct {
+		id     string
+		ps     *persistedSession
+		active bool
+		bytes  int64
+	}
+	candidates := make([]candidate, 0, len(st.Sessions))
+	for id, ps := range st.Sessions {
+		if ps == nil {
+			continue
+		}
+		b := ps.eventBytes()
+		total += b
+		if b > 0 {
+			candidates = append(candidates, candidate{id: id, ps: ps, active: activeSessionIDs[id], bytes: b})
+		}
+	}
+	if total <= softLimit {
+		return
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].active != candidates[j].active {
+			return !candidates[i].active
+		}
+		if candidates[i].bytes != candidates[j].bytes {
+			return candidates[i].bytes > candidates[j].bytes
+		}
+		return candidates[i].id < candidates[j].id
+	})
+	excess := total - softLimit
+	for _, c := range candidates {
+		if excess <= 0 {
+			break
+		}
+		freed := c.ps.evictEventsToFree(excess, c.active)
+		excess -= freed
+	}
+}
+
+// cloneForSave creates an isolated structural snapshot safe to marshal and
+// write to disk outside Adapter.mu. storedEvent.Data slices are immutable once
+// created, so copying slice headers avoids duplicating event JSON payloads.
+func (st *persistedState) cloneForSave() *persistedState {
+	if st == nil {
+		return nil
+	}
+	out := &persistedState{
+		Version:         st.Version,
+		Sessions:        make(map[string]*persistedSession, len(st.Sessions)),
+		CreatedSessions: make(map[string]createdSessionRecord, len(st.CreatedSessions)),
+		CreateRequests:  maps.Clone(st.CreateRequests),
+	}
+	for id, rec := range st.CreatedSessions {
+		rec.ToolsLimit = slices.Clone(rec.ToolsLimit)
+		out.CreatedSessions[id] = rec
+	}
+	for id, ps := range st.Sessions {
+		if ps == nil {
+			continue
+		}
+		out.Sessions[id] = &persistedSession{
+			LastSeq:       ps.LastSeq,
+			FirstSeq:      ps.FirstSeq,
+			Events:        slices.Clone(ps.Events),
+			Requests:      maps.Clone(ps.Requests),
+			Runs:          maps.Clone(ps.Runs),
+			GuestRequests: maps.Clone(ps.GuestRequests),
+			PendingGuest:  slices.Clone(ps.PendingGuest),
+		}
+	}
+	return out
 }
 
 func trimMap[V any](m map[string]V, max int, created func(V) int64) {
@@ -388,7 +559,10 @@ func trimMap[V any](m map[string]V, max int, created func(V) int64) {
 // maxPersistedStateBytes bounds state.json writes. It sits at half the
 // 64 MiB load-time ceiling, so no write path can push startup into the
 // "state.json is too large" refusal.
-const maxPersistedStateBytes = 32 << 20
+const (
+	maxPersistedStateBytes = 32 << 20
+	softPersistedEventCap  = 24 << 20
+)
 
 func saveState(dir string, st *persistedState) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {

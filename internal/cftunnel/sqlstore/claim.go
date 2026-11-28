@@ -48,9 +48,13 @@ func (s *Store) lockScopeConfig(ctx context.Context, tx *sql.Tx, scopeID string)
 	return scope, err
 }
 
-func (s *Store) lockScope(ctx context.Context, tx *sql.Tx, scopeID string) error {
+func (s *Store) checkScope(ctx context.Context, tx *sql.Tx, scopeID string, lock bool) error {
+	query := "SELECT id FROM cf_scope WHERE id = ?"
+	if lock && s.postgres {
+		query += " FOR NO KEY UPDATE"
+	}
 	var id string
-	return notFound(tx.QueryRowContext(ctx, s.bind(s.forUpdate("SELECT id FROM cf_scope WHERE id = ?")), scopeID).Scan(&id))
+	return notFound(tx.QueryRowContext(ctx, s.bind(query), scopeID).Scan(&id))
 }
 
 func (s *Store) lockOwner(ctx context.Context, tx *sql.Tx, scopeID, ownerID string) (*cftunnel.OwnerOverride, error) {
@@ -149,7 +153,8 @@ func (s *Store) Claim(ctx context.Context, command cftunnel.ClaimCommand, policy
 
 func (s *Store) claim(ctx context.Context, tx *sql.Tx, cmd cftunnel.ClaimCommand, policy cftunnel.ClaimPolicy) (cftunnel.Operation, error) {
 	var op cftunnel.Operation
-	if err := s.lockScope(ctx, tx, cmd.ScopeID); err != nil {
+	budgetClaim := cmd.Type == cftunnel.OpProvision || cmd.Type == cftunnel.OpRecover || cmd.Type == cftunnel.OpResume
+	if err := s.checkScope(ctx, tx, cmd.ScopeID, budgetClaim); err != nil {
 		return op, err
 	}
 	override, err := s.lockOwner(ctx, tx, cmd.ScopeID, cmd.OwnerID)
@@ -228,6 +233,9 @@ func (s *Store) claim(ctx context.Context, tx *sql.Tx, cmd cftunnel.ClaimCommand
 		}
 	}
 	if next.BudgetHeld && !current.BudgetHeld {
+		if !budgetClaim {
+			return op, cftunnel.ErrInvalidTransition
+		}
 		if err := s.checkCapacity(ctx, tx, cmd, policy, override); err != nil {
 			return op, err
 		}

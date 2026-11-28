@@ -4,8 +4,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"net"
 	"net/url"
 	"strings"
+
+	"vanora-relay/internal/identity"
 )
 
 type Official struct {
@@ -34,7 +37,10 @@ func ParseOfficial(raw, relay string) (Official, error) {
 		return Official{}, ErrInvalid
 	}
 	fields, err := url.ParseQuery(u.Fragment)
-	if err != nil || fields.Get("relay") != relay || fields.Get("owner") == "" || fields.Get("device") == "" {
+	device, owner := fields.Get("device"), fields.Get("owner")
+	wantRelay := normalizeRelayURL(relay)
+	if err != nil || wantRelay == "" || normalizeRelayURL(fields.Get("relay")) != wantRelay ||
+		!identity.ValidDeviceID(device) || !identity.ValidRemoteUserID(owner) {
 		return Official{}, ErrInvalid
 	}
 	pin, err := base64.RawURLEncoding.Strict().DecodeString(fields.Get("pin"))
@@ -45,5 +51,37 @@ func ParseOfficial(raw, relay string) (Official, error) {
 	if err != nil || len(token) != 32 {
 		return Official{}, ErrInvalid
 	}
-	return Official{u.Path[1:], relay, fields.Get("device"), fields.Get("owner"), pin, token}, nil
+	return Official{u.Path[1:], relay, device, owner, pin, token}, nil
+}
+
+func normalizeRelayURL(raw string) string {
+	relay, err := url.Parse(raw)
+	if err != nil || relay.Hostname() == "" || relay.User != nil || relay.Fragment != "" {
+		return ""
+	}
+	relay.Scheme = strings.ToLower(relay.Scheme)
+	host, port := strings.ToLower(relay.Hostname()), relay.Port()
+	switch relay.Scheme {
+	case "https", "wss":
+		if port == "443" {
+			port = ""
+		}
+	case "http", "ws":
+		if port == "80" {
+			port = ""
+		}
+	default:
+		return ""
+	}
+	switch {
+	case port != "":
+		relay.Host = net.JoinHostPort(host, port)
+	case strings.Contains(host, ":"):
+		relay.Host = "[" + host + "]"
+	default:
+		relay.Host = host
+	}
+	relay.RawPath = strings.TrimRight(relay.EscapedPath(), "/")
+	relay.Path, _ = url.PathUnescape(relay.RawPath)
+	return relay.String()
 }

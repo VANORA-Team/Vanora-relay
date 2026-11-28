@@ -45,12 +45,17 @@ type leaseClaims struct {
 // VerifyLease checks the lease signature, audience, validity window and claim
 // shapes and returns the parsed lease.
 func VerifyLease(token string, trusted ed25519.PublicKey, now time.Time) (Lease, error) {
-	payload, err := verifyTokenSignature(token, LeasePrefix, trusted, maxLeaseSize)
+	return VerifyLeaseWithKeys(token, []ed25519.PublicKey{trusted}, now)
+}
+
+// VerifyLeaseWithKeys accepts a liveness lease signed by any trusted key.
+func VerifyLeaseWithKeys(token string, keys []ed25519.PublicKey, now time.Time) (Lease, error) {
+	payload, err := verifyTokenSignature(token, LeasePrefix, "vanl+v1", keys, maxLeaseSize)
 	if err != nil {
 		return Lease{}, mapLeaseError(err)
 	}
 	var claims leaseClaims
-	if err := json.Unmarshal(payload.Claims, &claims); err != nil {
+	if err := json.Unmarshal(payload, &claims); err != nil {
 		return Lease{}, fmt.Errorf("%w: claims: %v", ErrLeaseMalformed, err)
 	}
 	if claims.Version != leaseVersion {
@@ -59,10 +64,10 @@ func VerifyLease(token string, trusted ed25519.PublicKey, now time.Time) (Lease,
 	if claims.Audience != CertificateAudience {
 		return Lease{}, fmt.Errorf("%w: audience %q", ErrLeaseMalformed, claims.Audience)
 	}
-	if !validRemoteUserID(claims.RemoteUserID) {
+	if !ValidRemoteUserID(claims.RemoteUserID) {
 		return Lease{}, fmt.Errorf("%w: remote user id", ErrLeaseMalformed)
 	}
-	if !validDeviceID(claims.DeviceID) {
+	if !ValidDeviceID(claims.DeviceID) {
 		return Lease{}, fmt.Errorf("%w: device id", ErrLeaseMalformed)
 	}
 	if _, err := base64.RawURLEncoding.Strict().DecodeString(claims.CertificateHash); err != nil {
@@ -99,10 +104,15 @@ func VerifyLease(token string, trusted ed25519.PublicKey, now time.Time) (Lease,
 // specific endpoint and certificate. It returns the lease expiry. Callers must
 // also have verified certificate themselves and pass the resulting principal.
 func VerifyEndpointLease(token string, trusted ed25519.PublicKey, now time.Time, certificate string, principal Principal) (time.Time, error) {
-	if principal.Subject == "" || !validDeviceID(principal.DeviceID) {
+	return VerifyEndpointLeaseWithKeys(token, []ed25519.PublicKey{trusted}, now, certificate, principal)
+}
+
+// VerifyEndpointLeaseWithKeys verifies the endpoint binding with any trusted key.
+func VerifyEndpointLeaseWithKeys(token string, keys []ed25519.PublicKey, now time.Time, certificate string, principal Principal) (time.Time, error) {
+	if principal.Subject == "" || !ValidDeviceID(principal.DeviceID) {
 		return time.Time{}, fmt.Errorf("%w: incomplete principal", ErrLeaseMalformed)
 	}
-	lease, err := VerifyLease(token, trusted, now)
+	lease, err := VerifyLeaseWithKeys(token, keys, now)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -115,6 +125,9 @@ func VerifyEndpointLease(token string, trusted ed25519.PublicKey, now time.Time,
 	expectedHash := sha256.Sum256([]byte(certificate))
 	if subtle.ConstantTimeCompare([]byte(lease.CertificateHash), []byte(base64.RawURLEncoding.EncodeToString(expectedHash[:]))) != 1 {
 		return time.Time{}, fmt.Errorf("%w: certificate binding", ErrLeaseMalformed)
+	}
+	if lease.Expires.After(principal.Expires) {
+		return time.Time{}, fmt.Errorf("%w: expires after certificate", ErrLeaseMalformed)
 	}
 	return lease.Expires, nil
 }
@@ -130,15 +143,6 @@ func mapLeaseError(err error) error {
 	}
 }
 
-func validRemoteUserID(id string) bool {
-	rest, ok := cutPrefix(id, remoteUserIDPrefix)
-	if !ok || len(rest) != 26 {
-		return false
-	}
-	_, err := base32NoPad.DecodeString(toUpperASCII(rest))
-	return err == nil
-}
-
 func validNonce(nonce string) bool {
 	if len(nonce) < 22 || len(nonce) > 128 {
 		return false
@@ -148,21 +152,4 @@ func validNonce(nonce string) bool {
 		return false
 	}
 	return len(decoded) >= 16 && len(decoded) <= 64
-}
-
-func cutPrefix(s, prefix string) (string, bool) {
-	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
-		return s, false
-	}
-	return s[len(prefix):], true
-}
-
-func toUpperASCII(s string) string {
-	out := []byte(s)
-	for i, c := range out {
-		if c >= 'a' && c <= 'z' {
-			out[i] = c - 'a' + 'A'
-		}
-	}
-	return string(out)
 }

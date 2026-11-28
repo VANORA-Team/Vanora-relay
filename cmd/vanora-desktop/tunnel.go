@@ -15,11 +15,15 @@ import (
 )
 
 type tunnelSession struct {
-	ctx     context.Context
-	channel string
-	slot    *officialSlot
-	options func(context.Context) (cftunnel.HostOptions, error)
-	host    atomic.Pointer[cftunnel.HostManager]
+	ctx        context.Context
+	channel    string
+	slot       *officialSlot
+	deviceID   string
+	ownerID    string
+	socket     atomic.Pointer[transport.Client]
+	options    func(context.Context) (cftunnel.HostOptions, error)
+	host       atomic.Pointer[cftunnel.HostManager]
+	graceTimer *time.Timer
 }
 
 func (s *tunnelSession) routeSignal(msg protocol.Message) {
@@ -36,20 +40,24 @@ func (m *accessManager) currentTunnelHost() *cftunnel.HostManager {
 }
 
 func (m *accessManager) tunnelStatus() cftunnel.HostStatus {
-	m.tunnelMu.Lock()
-	defer m.tunnelMu.Unlock()
-	return m.tunnelStatusLocked()
-}
-
-func (m *accessManager) tunnelStatusLocked() cftunnel.HostStatus {
 	if host := m.currentTunnelHost(); host != nil {
 		return host.Status()
 	}
-	status := cftunnel.HostStatus{Enabled: m.tunnelEnabled, State: "disabled"}
+	m.tunnelMu.Lock()
+	enabled := m.tunnelEnabled
+	m.tunnelMu.Unlock()
+	status := cftunnel.HostStatus{Enabled: enabled, State: "disabled"}
 	if status.Enabled {
 		status.State = "unavailable"
 	}
 	return status
+}
+
+func (m *accessManager) isTunnelEnabled() bool {
+	m.tunnelMu.Lock()
+	enabled := m.tunnelEnabled
+	m.tunnelMu.Unlock()
+	return enabled
 }
 
 func (m *accessManager) emitTunnelStatus(channel string, status cftunnel.HostStatus) {
@@ -58,7 +66,7 @@ func (m *accessManager) emitTunnelStatus(channel string, status cftunnel.HostSta
 
 func (m *accessManager) startTunnelLocked() error {
 	session := m.tunnelSession.Load()
-	if !m.tunnelEnabled || session == nil || session.ctx.Err() != nil || session.host.Load() != nil {
+	if !m.isTunnelEnabled() || session == nil || session.ctx.Err() != nil || session.host.Load() != nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(session.ctx, 15*time.Second)
@@ -89,8 +97,8 @@ func (m *accessManager) tunnelStartFailed(channel string) error {
 }
 
 func (m *accessManager) setTunnelSession(session *tunnelSession) {
-	m.tunnelMu.Lock()
-	defer m.tunnelMu.Unlock()
+	m.tunnelOpMu.Lock()
+	defer m.tunnelOpMu.Unlock()
 	if session.ctx.Err() != nil {
 		return
 	}
@@ -101,6 +109,10 @@ func (m *accessManager) setTunnelSession(session *tunnelSession) {
 
 func (m *accessManager) stopTunnelLocked() {
 	if session := m.tunnelSession.Load(); session != nil {
+		if session.graceTimer != nil {
+			session.graceTimer.Stop()
+			session.graceTimer = nil
+		}
 		if host := session.host.Swap(nil); host != nil {
 			host.Stop()
 		}
@@ -108,8 +120,8 @@ func (m *accessManager) stopTunnelLocked() {
 }
 
 func (m *accessManager) stopTunnelChannel(channel string) {
-	m.tunnelMu.Lock()
-	defer m.tunnelMu.Unlock()
+	m.tunnelOpMu.Lock()
+	defer m.tunnelOpMu.Unlock()
 	if session := m.tunnelSession.Load(); session != nil && session.channel == channel {
 		m.stopTunnelLocked()
 		m.tunnelSession.Store(nil)
@@ -117,12 +129,29 @@ func (m *accessManager) stopTunnelChannel(channel string) {
 }
 
 func (m *accessManager) endTunnelSession(session *tunnelSession) {
-	m.tunnelMu.Lock()
-	defer m.tunnelMu.Unlock()
+	m.tunnelOpMu.Lock()
+	defer m.tunnelOpMu.Unlock()
 	if session != nil && m.tunnelSession.Load() == session {
 		m.stopTunnelLocked()
 		m.tunnelSession.Store(nil)
 	}
+}
+
+func (m *accessManager) deferEndTunnelSession(session *tunnelSession, grace time.Duration) {
+	if session == nil {
+		return
+	}
+	m.tunnelOpMu.Lock()
+	defer m.tunnelOpMu.Unlock()
+	if m.tunnelSession.Load() != session {
+		return
+	}
+	if session.graceTimer != nil {
+		session.graceTimer.Stop()
+	}
+	session.graceTimer = time.AfterFunc(grace, func() {
+		m.endTunnelSession(session)
+	})
 }
 
 func (m *accessManager) tunnelCommand(cmd accessCommand, result map[string]any) error {
@@ -133,18 +162,21 @@ func (m *accessManager) tunnelCommand(cmd accessCommand, result map[string]any) 
 		if cmd.Enabled == nil {
 			return errors.New("enabled is required")
 		}
+		m.tunnelOpMu.Lock()
+		hadHost := m.currentTunnelHost() != nil
 		m.tunnelMu.Lock()
 		changed := m.tunnelEnabled != *cmd.Enabled
-		hadHost := m.currentTunnelHost() != nil
 		m.tunnelEnabled = *cmd.Enabled
+		enabled := m.tunnelEnabled
+		m.tunnelMu.Unlock()
 		var err error
-		if m.tunnelEnabled {
+		if enabled {
 			err = m.startTunnelLocked()
 		} else {
 			m.stopTunnelLocked()
 		}
-		status := m.tunnelStatusLocked()
-		m.tunnelMu.Unlock()
+		status := m.tunnelStatus()
+		m.tunnelOpMu.Unlock()
 		if changed && !hadHost && (status.State == "unavailable" || status.State == "disabled") && err == nil {
 			m.emitTunnelStatus("", status)
 		}
@@ -229,16 +261,17 @@ func (m *accessManager) setSelfTunnelHooks(server *selfrelay.Server) {
 				}
 			}
 		},
+		OnNetworkChange: func() {
+			if session := m.selfTunnelSession(); session != nil {
+				if host := session.host.Load(); host != nil {
+					host.RecheckPeers()
+				}
+			}
+		},
 	})
 }
 
-func (m *accessManager) setOfficialTunnelHooks(ctx context.Context, slot *officialSlot, socket *transport.Client) *tunnelSession {
-	if socket.TunnelScope() == "" {
-		return nil
-	}
-	slot.updateTunnelGuests(m.config(), socket.UserID())
-	socket.SetPairedTunnelAuthorizer(slot.authorizeTunnel)
-	session := &tunnelSession{ctx: ctx, channel: slot.name, slot: slot}
+func bindOfficialSocketTunnelHooks(socket *transport.Client, session *tunnelSession) {
 	socket.SetTunnelHooks(transport.TunnelHooks{
 		OnMessage: session.routeSignal,
 		OnRevokeDevice: func(id string) {
@@ -267,27 +300,78 @@ func (m *accessManager) setOfficialTunnelHooks(ctx context.Context, slot *offici
 			}
 		},
 	})
+}
+
+func (m *accessManager) setOfficialTunnelHooks(ctx context.Context, slot *officialSlot, socket *transport.Client) *tunnelSession {
+	if socket.TunnelScope() == "" {
+		return nil
+	}
+	slot.updateTunnelGuests(m.config(), socket.UserID())
+	socket.SetPairedTunnelAuthorizer(slot.authorizeTunnel)
+
+	m.tunnelOpMu.Lock()
+	defer m.tunnelOpMu.Unlock()
+	if cur := m.tunnelSession.Load(); cur != nil && cur.channel == slot.name && cur.slot == slot &&
+		cur.deviceID == socket.DeviceID() && cur.ownerID == socket.UserID() && cur.ctx.Err() == nil {
+		if cur.graceTimer != nil {
+			cur.graceTimer.Stop()
+			cur.graceTimer = nil
+		}
+		cur.socket.Store(socket)
+		bindOfficialSocketTunnelHooks(socket, cur)
+		if host := cur.host.Load(); host != nil {
+			host.ReattachSignal(socket.TunnelScope(), socket.SendTunnel)
+			return cur
+		}
+		_ = m.startTunnelLocked()
+		return cur
+	}
+
+	session := &tunnelSession{
+		ctx:      ctx,
+		channel:  slot.name,
+		slot:     slot,
+		deviceID: socket.DeviceID(),
+		ownerID:  socket.UserID(),
+	}
+	session.socket.Store(socket)
+	bindOfficialSocketTunnelHooks(socket, session)
 	session.options = func(ctx context.Context) (cftunnel.HostOptions, error) {
-		origin, err := cftunnel.ControlOriginFromSignalURL(socket.SignalURL())
+		sock := session.socket.Load()
+		if sock == nil {
+			return cftunnel.HostOptions{}, transport.ErrPeerClosed
+		}
+		origin, err := cftunnel.ControlOriginFromSignalURL(sock.SignalURL())
 		if err != nil {
 			return cftunnel.HostOptions{}, err
 		}
-		creds, _, err := socket.CurrentLease(ctx)
+		creds, _, err := sock.CurrentLease(ctx)
 		if err != nil {
 			return cftunnel.HostOptions{}, err
 		}
 		return cftunnel.HostOptions{
-			Channel: slot.name, Scope: socket.TunnelScope(), ControlOrigin: origin, DeviceID: socket.DeviceID(),
-			OwnerID: socket.UserID(), PrivateKey: creds.PrivateKey(), CA: slot.ca, Handler: socket.TunnelHandler(),
-			SendSignal: socket.SendTunnel, LeaseSource: func(ctx context.Context) (endpoint.LeaseProof, error) {
-				_, proof, err := socket.CurrentLease(ctx)
+			Channel: slot.name, Scope: sock.TunnelScope(), ControlOrigin: origin, DeviceID: sock.DeviceID(),
+			OwnerID: sock.UserID(), PrivateKey: creds.PrivateKey(), CA: slot.ca, Handler: sock.TunnelHandler(),
+			SendSignal: func(msg protocol.Message) error {
+				if cur := session.socket.Load(); cur != nil {
+					return cur.SendTunnel(msg)
+				}
+				return transport.ErrPeerClosed
+			},
+			LeaseSource: func(ctx context.Context) (endpoint.LeaseProof, error) {
+				cur := session.socket.Load()
+				if cur == nil {
+					return endpoint.LeaseProof{}, transport.ErrPeerClosed
+				}
+				_, proof, err := cur.CurrentLease(ctx)
 				return proof, err
 			},
 			AuthorizeOffer: func(req cftunnel.OfferRequest) (cftunnel.OfferDecision, error) {
 				user := req.Principal.RemoteUserID()
 				allows := func() bool {
+					cur := session.socket.Load()
 					allowed := slot.tunnelGuests.Load()
-					return allowed != nil && (*allowed)[user] && socket.AuthorizePairedTunnel(req.ConnectionID, req.Principal, req.Role)
+					return cur != nil && allowed != nil && (*allowed)[user] && cur.AuthorizePairedTunnel(req.ConnectionID, req.Principal, req.Role)
 				}
 				if !allows() {
 					return cftunnel.OfferDecision{}, transport.ErrUnauthorized
@@ -296,7 +380,12 @@ func (m *accessManager) setOfficialTunnelHooks(ctx context.Context, slot *offici
 			},
 		}, nil
 	}
-	m.setTunnelSession(session)
+	if session.ctx.Err() != nil {
+		return nil
+	}
+	m.stopTunnelLocked()
+	m.tunnelSession.Store(session)
+	_ = m.startTunnelLocked()
 	return session
 }
 
@@ -314,8 +403,6 @@ func (slot *officialSlot) updateTunnelGuests(cfg *desktop.Config, owner string) 
 }
 
 func (m *accessManager) reloadTunnelACL(cfg *desktop.Config) {
-	m.tunnelMu.Lock()
-	defer m.tunnelMu.Unlock()
 	if session := m.tunnelSession.Load(); session != nil && session.slot != nil {
 		slot := session.slot
 		slot.updateTunnelGuests(cfg, slot.account.UserID())

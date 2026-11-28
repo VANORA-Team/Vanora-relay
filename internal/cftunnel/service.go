@@ -69,7 +69,7 @@ func NewService(cfg Config, scope Scope, store Store, cf Cloudflare, crypto *Cry
 	return &Service{cfg: cfg, scope: scope, store: store, cf: cf, crypto: crypto, now: opts.Clock,
 		metrics: opts.Metrics, logger: opts.Logger, lease: opts.WorkerLease, poll: opts.PollInterval,
 		runtimeChecker: opts.RuntimeChecker, membership: opts.Membership, edgeCanaryOrigin: opts.edgeCanaryOrigin,
-		workWake: make(chan struct{}, 1)}, nil
+		workWake: make(chan struct{}, 16)}, nil
 }
 
 type DeviceBinding struct {
@@ -216,11 +216,8 @@ func (s *Service) claim(ctx context.Context, req ManagementRequest, kind Operati
 	policy := req.Policy
 	policy.AccountCap = s.cfg.AccountCap
 	op, err := s.store.Claim(ctx, cmd, policy)
-	if err == nil && op.ID != "" && op.CompletedAt.IsZero() && s.workWake != nil {
-		select {
-		case s.workWake <- struct{}{}:
-		default:
-		}
+	if err == nil && op.ID != "" && op.CompletedAt.IsZero() {
+		s.WakeWorker()
 	}
 	return op, err
 }

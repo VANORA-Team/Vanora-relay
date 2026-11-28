@@ -1,9 +1,12 @@
 package identity_test
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,5 +89,62 @@ func TestLeaseExpiry(t *testing.T) {
 	}
 	if _, err := identity.VerifyEndpointLease(lease, auth.PublicKey(), now.Add(time.Minute), certificate, principal); !errors.Is(err, identity.ErrLeaseExpired) {
 		t.Fatalf("expired lease = %v", err)
+	}
+}
+
+func TestEndpointLeaseKeyRotationAndCertificateExpiry(t *testing.T) {
+	previous, current := identitytest.NewAuthority(time.Minute), identitytest.NewAuthority(time.Minute)
+	keys := []ed25519.PublicKey{current.PublicKey(), previous.PublicKey()}
+	publicKey, _ := testEndpointKey(t)
+	now := time.Now().Truncate(time.Second)
+	certificate, err := previous.IssueWithKey(testIssuer, "subject-1", publicKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := identity.VerifyCertificateWithKeys(certificate, keys, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, _, err := current.IssueLease(principal, certificate, testNonce(t), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expiry, err := identity.VerifyEndpointLeaseWithKeys(lease, keys, now, certificate, principal); err != nil || !expiry.Equal(principal.Expires) {
+		t.Fatalf("lease signed by rotated key = %v, %v", expiry, err)
+	}
+	if _, err := identity.VerifyLeaseWithKeys(lease, keys[1:], now); !errors.Is(err, identity.ErrLeaseSignature) {
+		t.Fatalf("lease with untrusted signer = %v", err)
+	}
+
+	hash := sha256.Sum256([]byte(certificate))
+	claims := map[string]any{
+		"v": 1, "aud": identity.CertificateAudience, "uid": principal.RemoteUserID(),
+		"dev": principal.DeviceID, "ch": base64.RawURLEncoding.EncodeToString(hash[:]),
+		"n": testNonce(t), "iat": now.Add(time.Second).Unix(), "exp": principal.Expires.Add(time.Second).Unix(),
+	}
+	header := map[string]string{"alg": "EdDSA", "typ": "vanl+v1"}
+	lease, err = current.SignRaw(identity.LeasePrefix, header, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := identity.VerifyLease(lease, current.PublicKey(), now); err != nil {
+		t.Fatalf("unbound lease verification = %v", err)
+	}
+	if _, err := identity.VerifyEndpointLease(lease, current.PublicKey(), now, certificate, principal); !errors.Is(err, identity.ErrLeaseMalformed) {
+		t.Fatalf("accepted lease that outlived its certificate: %v", err)
+	}
+
+	for _, test := range []struct{ typ, owner string }{
+		{"vanc+v1", principal.RemoteUserID()},
+		{"vanl+v1", "usr_" + strings.ToUpper(strings.TrimPrefix(principal.RemoteUserID(), "usr_"))},
+	} {
+		header["typ"], claims["uid"] = test.typ, test.owner
+		lease, err := current.SignRaw(identity.LeasePrefix, header, claims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := identity.VerifyLease(lease, current.PublicKey(), now); !errors.Is(err, identity.ErrLeaseMalformed) {
+			t.Fatalf("lease with typ %q and owner %q = %v", test.typ, test.owner, err)
+		}
 	}
 }
